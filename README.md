@@ -1,5 +1,5 @@
 # DDRO: Direct Document Relevance Optimization for Generative Information Retrieval
-
+[![SIGIR 2025](https://img.shields.io/badge/SIGIR-2026-blue)](https://sigir2025.dei.unipd.it/call-full-papers.html)
 [![Paper](https://img.shields.io/badge/Paper-arXiv%3A2504.05181-b31b1b.svg)](https://arxiv.org/abs/2504.05181)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 [![HuggingFace](https://img.shields.io/badge/HF-Datasets-blueviolet)](https://huggingface.co/kiyam)
