@@ -5,24 +5,18 @@
 [![HuggingFace](https://img.shields.io/badge/HF-Datasets-blueviolet)](https://huggingface.co/kiyam)
 
 This repository contains the official implementation of our SIGIR 2025 paper:  
-📄 **[Lightweight and Direct Document Relevance Optimization for Generative IR (DDRO)](https://arxiv.org/abs/2504.05181)**
- -  Optimizing Generative Retrieval with Ranking-Aligned Objectives 
-<!-- --- -->
-<!-- 
-### 🚧 Repository Under Development
-
-This repository is actively under development. Thanks for your patience, changes and improvements may be applied frequently. Stay tuned for updates! -->
+**[Lightweight and Direct Document Relevance Optimization for Generative IR (DDRO)](https://arxiv.org/abs/2504.05181)**
+Optimizing Generative Retrieval with Ranking-Aligned Objectives
 
 ---
-## 📑 Table of Contents
+## Table of Contents
 
 - [Motivation](#motivation)
 - [What DDRO Does](#what-ddro-does)
 - [Learning Objectives](#learning-objectives-in-ddro)
-- [🛠️ Setup & Dependencies - Steps to Reproduce 🎯](#1-install-environment)
+- [Setup & Dependencies](#setup--dependencies)
 - [Preprocessed Data & Model Checkpoints](#preprocessed-data--model-checkpoints)
-- [🔬 Evaluate Pre-trained Models from HuggingFace
-](#model-evaluation)
+- [Evaluate Pre-trained Models from HuggingFace](#model-evaluation)
 - [Citation](#citation)
 
 
@@ -31,8 +25,8 @@ This repository is actively under development. Thanks for your patience, changes
 **Misalignment in Learning Objectives:**  
 Gen-IR models are typically trained via next-token prediction (cross-entropy loss) over docid tokens.  
 While effective for language modeling, this objective:
-- 🎯 Optimizes **token-level generation**
-- ❌ Not designed for **document-level ranking**
+- Optimizes **token-level generation**
+- Not designed for **document-level ranking**
 
 As a result, Gen-IR models are not directly optimized for **learning-to-rank**, which is the core requirement in IR systems.
 
@@ -47,7 +41,7 @@ In this work, we ask:
 We propose **DDRO**:  
 **Lightweight and Direct Document Relevance Optimization for Gen-IR**
 
-### ✅ Key Contributions:
+### Key Contributions
 - Aligns training objective with ranking by using **pairwise preference learning**
 - Trains the model to **prefer relevant documents over non-relevant ones**
 - Bridges the gap between **autoregressive training** and **ranking-based optimization**
@@ -62,7 +56,7 @@ We optimize DDRO in two phases:
 
 ---
 
-#### 📘 Phase 1: Supervised Fine-Tuning (SFT)
+#### Phase 1: Supervised Fine-Tuning (SFT)
 
 Learn to generate the correct **docid** sequence given a query by minimizing the autoregressive token-level cross-entropy loss:
 <!-- 
@@ -86,7 +80,7 @@ $$ -->
  - <img src="src/arc_images/objective_ntp.png" alt="DDRO Image" width="300"/>
 ---
 
-#### 📗 Phase 2: Pairwise Ranking Optimization (DDRO Loss)
+#### Phase 2: Pairwise Ranking Optimization (DDRO Loss)
 
 This phase improves the **ranking quality** of generated document identifiers by applying a **pairwise learning-to-rank objective** inspired by **Direct Preference Optimization (DPO)**.
 
@@ -103,7 +97,7 @@ This phase improves the **ranking quality** of generated document identifiers by
 $$ -->
  - <img src="src/arc_images/dpo_loss.png" alt="DDRO Image" width="600"/>
 
-### 📖 Description
+#### Description
 
 This **Direct Document Relevance Optimization (DDRO)** loss guides the model to **prefer relevant documents (`docid⁺`) over non-relevant ones (`docid⁻`)** by comparing how both the current model and a frozen reference model score each document:
 
@@ -128,13 +122,13 @@ Encourage the model to rank relevant docid⁺ higher than non-relevant docid⁻:
 $$ -->
  - <img src="src/arc_images/dpo_objective.png" alt="DDRO Image" width="500"/>
 
-### ✅ Usage
+#### Usage
 
 The DPO loss is used **after** the SFT phase to **fine-tune the ranking behavior** of the model. Instead of just generating `docid`, the model now **learns to rank `docid⁺` higher than `docid⁻`** in a relevance/preference-aligned manner.
 
 ---
 
-### ✅ Why It Works
+#### Why It Works
 
 - Directly **encourages higher generation scores for relevant documents**
 - Uses **contrastive ranking** rather than token-level generation
@@ -144,7 +138,7 @@ The DPO loss is used **after** the SFT phase to **fine-tune the ranking behavior
 ---
 
 
-### 💡 Why DDRO is Different from Standard DPO
+#### 💡 Why DDRO is Different from Standard DPO
 
 While our optimization is inspired by the DPO framework [Rafailov et al., 2023](https://arxiv.org/abs/2305.18290), its adaptation to **Generative Document Retrieval** is **non-trivial**:
 
@@ -154,7 +148,7 @@ While our optimization is inspired by the DPO framework [Rafailov et al., 2023](
 
 This required **novel integration** of preference optimization into **retrieval-specific pipelines**, making DDRO uniquely suited for GenIR.
 
-## 📁 Project Structure
+## Project Structure
 
 ```bash
 src/
@@ -162,18 +156,19 @@ src/
 ├── pretrain/            # DDRO model training and evaluation logic (incl. ddro)
 ├── scripts/             # Entry-point shell scripts for SFT, ddro, BM25, and preprocessing
 ├── utils/               # Core utilities (tokenization, trie, metrics, trainers)
-├── ddro.yml             # Conda environment (for training DDRO)
+├── ddro_env.yml         # Conda environment (for training DDRO)
 ├── pyserini.yml         # Conda environment (for BM25 retrieval with Pyserini)
 ├── README.md            # You're here!
 └── requirements.txt     # Additional Python dependencies
 ```
+
 ### 📌 Important
   <!-- - <h5><span style="color:Yellow;">➡️ Each subdirectory includes a detailed README.md with instructions.</span></h5> -->
   > 🔎 **Each subdirectory includes a detailed `README.md` with instructions.**
 
 ---
 
-## 🛠️ Setup & Dependencies
+## Setup & Dependencies
 
 ### 1. Install Environment
 
@@ -197,13 +192,12 @@ To download them, run the following commands from the project root (ddro/):
    bash   ./src/data/download/download_nq_datasets.sh
    python ./src/data/download/download_t5_model.py
    ```
-📂 For details and download links, refer to: [src/data/download/README.md](https://github.com/kidist-amde/ddro/tree/main/src/data/download#readme)
+For details and download links, refer to: [src/data/download/README.md](https://github.com/kidist-amde/ddro/tree/main/src/data/download#readme)
 
-## 3. Data Preparation
+### 3. Data Preparation
 DDRO evaluated both on **Natural Questions (NQ)** and **MS MARCO** datasets. 
 
-✅ Sample Top-300K MS MARCO Subset
-Run the following script to preprocess and extract the top-300K most relevant MS MARCO documents based on qrels:
+**Sample Top-300K MS MARCO Subset:** run the following script to preprocess and extract the top-300K most relevant MS MARCO documents based on qrels:
 
 ```bash
 bash scripts/preprocess/sample_top_docs.sh
@@ -243,7 +237,7 @@ resources/
 
 ## Training Pipeline
 
-### 📘 Phase 1: Supervised Fine-Tuning (SFT)
+### Phase 1: Supervised Fine-Tuning (SFT)
 
 We first train a **Supervised Fine-Tuning (SFT) model** using **next-token prediction** across three stages:
 
@@ -256,13 +250,13 @@ This results in a **seed model** trained to autoregressively generate document i
 You can run all stages with a single command:
 
 ```bash
-bash ddro/src/scripts/sft/launch_SFT_training.sh
+bash src/scripts/sft/launch_SFT_training.sh
 ```
 
-📍 The \--encoding flag in the script supports id formats like pq, url.
+> 📍 The `--encoding` flag supports id formats: `pq`, `url`.
 ---
 
-## 🔧 Phase 2: DDRO Training (Pairwise Optimization)
+### Phase 2: DDRO Training (Pairwise Optimization)
 
 After training the SFT model (Phase 1), we apply **Phase 2: Direct Document Relevance Optimization**, which fine-tunes the model using a **pairwise ranking objective**, that trains the model to prefer relevant documents over non-relevant ones.
 
@@ -279,13 +273,10 @@ bash scripts/ddro/slurm_submit_ddro_eval.sh
 ```
 
 ---
-**TL;DR:** Here’s a drop-in replacement for your README “Model Evaluation” section that uses the new HF artifacts + launcher, no local files.
-
----
 
 ## Model Evaluation
 
-### 🔬 Evaluate Pre-trained Models from Hugging Face
+### Evaluate Pre-trained Models from Hugging Face
 
 You can evaluate our published models **directly from HF** (no local preprocessing).
 
@@ -370,7 +361,7 @@ python src/pretrain/hf_eval/eval_hf_docid_ranking.py \
 
 ---
 
-### 🔧 Notes & tips
+### Notes & tips
 
 * **Tokenizer stack:** we recommend `transformers==4.37.2`, `tokenizers==0.15.2`.
 * **DocID namespace:**
@@ -380,21 +371,14 @@ python src/pretrain/hf_eval/eval_hf_docid_ranking.py \
     Ensure the test set `query_id` matches the DocID table’s LHS namespace.
 * **Beams:** NQ-PQ (100), NQ-TU (50), MS MARCO-PQ (80) are good defaults (the launcher sets these).
 
+---
 
-📂 Evaluation logs and metrics are saved to:
+Evaluation logs and metrics are saved to:
 ```
 logs/<dataset>/dpo_*.log
 logs/<dataset>/dpo_*.csv
 ```
 ---
-
-## 📚 Datasets Used
-
-We evaluate DDRO on two standard retrieval benchmarks:
-
-- 📘 [MS MARCO Document Ranking](https://microsoft.github.io/msmarco/Datasets.html#document-ranking-dataset)
-- 📗 [Natural Questions (NQ)](https://ai.google.com/research/NaturalQuestions)
-
 
 ## Preprocessed Data & Model Checkpoints
 
@@ -404,7 +388,7 @@ All datasets, pseudo queries, docid encodings, and model checkpoints are availab
 
 ---
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
 We gratefully acknowledge the following open-source projects:
 
@@ -415,7 +399,7 @@ We gratefully acknowledge the following open-source projects:
 
 ---
 
-## 📄 License
+## License
 
 This project is licensed under the [Apache 2.0 License](LICENSE).
 
