@@ -29,11 +29,11 @@ Official implementation of our SIGIR 2025 paper:
 
 ## Motivation
 
-Generative IR models are typically trained via next-token prediction (cross-entropy loss) over docid tokens. While effective for language modeling, this objective optimizes **token-level generation** ,  not **document-level ranking**, which is the core requirement in IR systems.
 
-DDRO addresses this misalignment by directly optimizing the model for document-level ranking using pairwise preference learning, without reinforcement learning or reward modeling.
-
----
+> [!TIP]
+> Generative IR models are typically trained via next-token prediction (cross-entropy loss) over docid tokens. While effective for language modeling, this objective optimizes **token-level generation** ,  not **document-level ranking**, which is the core requirement in IR systems
+> 
+> DDRO addresses this misalignment by directly optimizing the model for document-level ranking using pairwise preference learning, without reinforcement learning or reward modeling.
 
 ## Method
 
