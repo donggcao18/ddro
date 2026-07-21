@@ -21,9 +21,9 @@ TRAIN_ARGS=(
   --max_prompt_length 128
   --max_target_length 32
   --num_train_epochs 2
-  --per_device_train_batch_size 16
-  --per_device_eval_batch_size 8
-  --gradient_accumulation_steps 2
+  --per_device_train_batch_size 32
+  --per_device_eval_batch_size 32
+  --gradient_accumulation_steps 1
   --learning_rate 1e-6
   --beta 0.4
   --eval_steps 2000
