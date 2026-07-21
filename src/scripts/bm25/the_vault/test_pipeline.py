@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import random
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
 from common import iter_json_records
-from mine_dpo_negatives import mine
+from mine_dpo_negatives import mine, stratified_sample
 from prepare_bm25 import prepare
 
 
@@ -20,6 +21,34 @@ def write_rows(path: Path, rows: list[dict]) -> None:
 
 
 class VaultPipelineTest(unittest.TestCase):
+    def test_vault_rank_bucket_allocation(self) -> None:
+        candidates = [
+            {"text_id": f"doc-{rank}", "rank": rank, "score": None}
+            for rank in range(1, 201)
+        ]
+        selected = stratified_sample(
+            candidates,
+            8,
+            [(1, 20), (21, 100), (101, 200)],
+            random.Random(42),
+            rank_quotas=[3, 2, 3],
+        )
+        self.assertEqual(sum(item["rank"] <= 20 for item in selected), 3)
+        self.assertEqual(sum(21 <= item["rank"] <= 100 for item in selected), 2)
+        self.assertEqual(sum(item["rank"] >= 101 for item in selected), 3)
+
+        undersupplied = [item for item in candidates if item["rank"] <= 102]
+        self.assertEqual(
+            stratified_sample(
+                undersupplied[:111],
+                8,
+                [(1, 20), (21, 100), (101, 200)],
+                random.Random(42),
+                rank_quotas=[3, 2, 3],
+            ),
+            [],
+        )
+
     def test_numeric_mapping_and_multilabel_filtering(self) -> None:
         with tempfile.TemporaryDirectory() as temp_directory:
             root = Path(temp_directory)
@@ -81,10 +110,12 @@ class VaultPipelineTest(unittest.TestCase):
                     document_metadata=str(work / "document_metadata.jsonl"),
                     output=str(dpo_output),
                     triples_output=None,
-                    negatives_per_query=3,
-                    rank_ranges=[(1, 100), (101, 500), (501, 1000)],
+                    negatives_per_query=1,
+                    rank_ranges=[(1, 100)],
                     seed=42,
                     pair_all_positives=False,
+                    fill_shortfall=False,
+                    rank_quotas=None,
                 )
             )
             self.assertEqual(mine_stats["filtered_multi_label_or_target_hits"], 2)

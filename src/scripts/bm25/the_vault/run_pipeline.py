@@ -6,12 +6,15 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
 def run(command: list[str]) -> None:
     print("Running:", " ".join(command), flush=True)
+    started = time.perf_counter()
     subprocess.run(command, check=True)
+    print(f"Completed in {(time.perf_counter() - started) / 60:.1f} minutes", flush=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -21,12 +24,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--augmentation", required=True)
     parser.add_argument("--work-dir", required=True)
     parser.add_argument("--threads", type=int, default=16)
-    parser.add_argument("--hits", type=int, default=1000)
-    parser.add_argument("--negatives-per-query", type=int, default=12)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--hits", type=int, default=200)
+    parser.add_argument("--negatives-per-query", type=int, default=8)
+    parser.add_argument("--rank-ranges", default="1:20,21:100,101:200")
+    parser.add_argument("--rank-quotas", default="3,2,3")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--code-only", action="store_true")
     parser.add_argument("--strict", action="store_true")
+    parser.add_argument(
+        "--reuse-index",
+        action="store_true",
+        help="Skip Lucene indexing when WORK_DIR/index already contains an index.",
+    )
     parser.add_argument("--pair-all-positives", action="store_true")
+    parser.add_argument(
+        "--fill-shortfall",
+        action="store_true",
+        help="Use non-original fallback sampling when a rank band is undersupplied.",
+    )
     return parser
 
 
@@ -56,8 +72,9 @@ def main() -> None:
 
     index_dir = work_dir / "index"
     run_file = work_dir / "bm25_run.txt"
-    run(
-        [
+    if not (args.reuse_index and index_dir.is_dir() and any(index_dir.iterdir())):
+        run(
+            [
             sys.executable,
             "-m",
             "pyserini.index.lucene",
@@ -74,8 +91,10 @@ def main() -> None:
             "--storePositions",
             "--storeDocvectors",
             "--storeRaw",
-        ]
-    )
+            ]
+        )
+    else:
+        print(f"Reusing existing Lucene index: {index_dir}", flush=True)
     run(
         [
             sys.executable,
@@ -98,6 +117,8 @@ def main() -> None:
             "0.68",
             "--threads",
             str(args.threads),
+            "--batch-size",
+            str(args.batch_size),
         ]
     )
 
@@ -116,9 +137,15 @@ def main() -> None:
         str(args.negatives_per_query),
         "--seed",
         str(args.seed),
+        "--rank-ranges",
+        args.rank_ranges,
+        "--rank-quotas",
+        args.rank_quotas,
     ]
     if args.pair_all_positives:
         mine_command.append("--pair-all-positives")
+    if args.fill_shortfall:
+        mine_command.append("--fill-shortfall")
     run(mine_command)
 
     print(f"DPO-ready data: {work_dir / 'dpo_pairs.jsonl'}")
