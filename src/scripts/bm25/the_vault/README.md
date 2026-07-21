@@ -46,8 +46,8 @@ python src/scripts/bm25/the_vault/run_pipeline.py \
   --train-original /home/users/congthanh_le/scratch/east/CodeGR/data/original_indexed_data_RQ_8_16_decoder_start/Ruby_train_r32.0.json \
   --test-original /home/users/congthanh_le/scratch/east/CodeGR/data/original_indexed_data_RQ_8_16_decoder_start/Ruby_test_r32.0.json \
   --augmentation /home/users/congthanh_le/scratch/east/CodeGR/data/original_indexed_data_RQ_8_16_decoder_start/Ruby_ready_to_feed_numeric.jsonl \
-  --work-dir /data/vault_bm25 \
-  --negatives-per-query 12
+  --work-dir /home/users/congthanh_le/scratch/east/ddro/data/vault_bm25 \
+  --negatives-per-query 8
 ```
 
 The final output is `/data/vault_bm25/dpo_pairs.jsonl`. The following sections
@@ -74,12 +74,12 @@ Use `--strict` after checking the data once if every augmentation row must map.
 By default searchable documents contain repository, path, identifier, parameters,
 URL-based ID, and source code. Add `--code-only` to index only the `Code:` body.
 
-## 2. Build the index and retrieve top 1,000
+## 2. Build the index and retrieve top 200
 
 Activate the repository's `pyserini` environment, then run:
 
 ```bash
-bash src/scripts/bm25/the_vault/run_bm25.sh /data/vault_bm25 16 1000
+bash src/scripts/bm25/the_vault/run_bm25.sh /data/vault_bm25 16 200
 ```
 
 This creates `/data/vault_bm25/bm25_run.txt`.
@@ -92,16 +92,50 @@ python src/scripts/bm25/the_vault/mine_dpo_negatives.py \
   --query-metadata /data/vault_bm25/query_metadata.jsonl \
   --document-metadata /data/vault_bm25/document_metadata.jsonl \
   --output /data/vault_bm25/dpo_pairs.jsonl \
-  --negatives-per-query 12
+  --negatives-per-query 8
 ```
 
 For each pseudo-query the miner removes the current target and every `text_id` in
-its normalized-query multi-label group. It then samples across ranks 1-100,
-101-500, and 501-1000, matching the DDRO repository's hard/medium/lower strategy.
+its normalized-query multi-label group. The Vault defaults are:
+
+- BM25 retrieves the top 200 with `k1=0.82` and `b=0.68`.
+- 8 negatives are requested per query with random seed 42.
+- 3 are sampled from ranks 1-20, 2 from ranks 21-100, and 3 from ranks 101-200.
+- A query is skipped if filtering leaves too few candidates to satisfy a rank
+  bucket.
+
+`--fill-shortfall` is available as an explicit non-original fallback, but is
+disabled by default.
 
 The default creates pairs only for the augmentation row's mapped target. Add
 `--pair-all-positives` if every valid multi-label target should also be emitted as
 a `chosen` response.
+
+## Performance on large augmentation files
+
+With 200,000 pseudo-queries and `--hits 200`, Pyserini may write 40 million
+result rows. This output volume, not CodeT5, is normally the dominant cost. The
+postprocessor streams one query group at a time and writes DPO pairs immediately,
+so its memory usage is bounded by roughly one query's 200 hits rather than the
+complete run.
+
+The search defaults retain the original settings: 16 threads and batch size 16.
+Set `--threads` to the CPUs actually allocated by the scheduler. A larger
+`--batch-size` such as 64 or 128 can improve throughput on machines with enough
+memory without changing BM25 scores; benchmark it on a small shard first.
+
+When rerunning the same corpus, avoid rebuilding Lucene:
+
+```bash
+python src/scripts/bm25/the_vault/run_pipeline.py \
+  ... \
+  --reuse-index \
+  --threads 32 \
+  --batch-size 64
+```
+
+Keep the work directory on node-local SSD/scratch rather than network storage,
+because both the index and the 40-million-line run are I/O intensive.
 
 Alongside `dpo_pairs.jsonl`, the miner writes:
 
