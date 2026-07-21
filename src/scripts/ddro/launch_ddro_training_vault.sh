@@ -5,7 +5,7 @@ set -euo pipefail
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-/home/users/congthanh_le/scratch/east/CodeGR/model/DSI_QG_Ruby_t5-base_multilabel_RQ_8_16_decoder_start/checkpoint-196000}"
 TRAIN_FILE="${TRAIN_FILE:-/home/users/congthanh_le/scratch/east/ddro/data/vault_bm25/dpo_pairs.jsonl}"
 OUTPUT_DIR="${OUTPUT_DIR:-/home/users/congthanh_le/scratch/east/ddro/outputs/vault-ruby-ddro}"
-NUM_GPUS="${NUM_GPUS:-1}"
+NUM_GPUS="${NUM_GPUS:-2}"
 PRECISION="${PRECISION:-bf16}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
