@@ -5,7 +5,7 @@ set -euo pipefail
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-/home/users/congthanh_le/scratch/east/CodeGR/model/DSI_QG_Ruby_t5-base_multilabel_RQ_8_16_decoder_start/checkpoint-196000}"
 TRAIN_FILE="${TRAIN_FILE:-/home/users/congthanh_le/scratch/east/ddro/data/vault_bm25/dpo_pairs.jsonl}"
 OUTPUT_DIR="${OUTPUT_DIR:-/home/users/congthanh_le/scratch/east/ddro/outputs/vault-ruby-ddro}"
-NUM_GPUS="${NUM_GPUS:-2}"
+NUM_GPUS="${NUM_GPUS:-1}"
 PRECISION="${PRECISION:-bf16}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,13 +21,13 @@ TRAIN_ARGS=(
   --max_prompt_length 128
   --max_target_length 32
   --num_train_epochs 2
-  --per_device_train_batch_size 4
+  --per_device_train_batch_size 16
   --per_device_eval_batch_size 8
-  --gradient_accumulation_steps 8
+  --gradient_accumulation_steps 2
   --learning_rate 1e-6
   --beta 0.4
-  --eval_steps 500
-  --save_steps 500
+  --eval_steps 2000
+  --save_steps 2000
   --gradient_checkpointing
 )
 
