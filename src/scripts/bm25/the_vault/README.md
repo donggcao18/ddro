@@ -142,6 +142,27 @@ Alongside `dpo_pairs.jsonl`, the miner writes:
 - `dpo_pairs.tsv`: `query_key<TAB>chosen_text_id<TAB>rejected_text_id`.
 - `dpo_pairs.stats.json`: filtering and output counts.
 
+## Convert an existing DPO file to URL targets
+
+BM25 does not need to be rerun when `dpo_pairs.jsonl` has already been mined.
+Convert its final decoder targets with:
+
+```bash
+python src/scripts/bm25/the_vault/postprocess_dpo_urls.py \
+  --input /data/vault_bm25/dpo_pairs.jsonl \
+  --document-metadata /data/vault_bm25/document_metadata.jsonl \
+  --output /data/vault_bm25/dpo_pairs_url.jsonl
+```
+
+The converter changes only `chosen` and `rejected` to the corresponding scalar
+`url_based_id`. It preserves `chosen_text_id` and `rejected_text_id` for audit,
+and adds `chosen_url_based_id` and `rejected_url_based_id`. By default it fails
+if either target has no URL or has multiple URLs. Use
+`--on-mapping-error skip` only when dropping such rows is intentional. Pairs
+whose chosen and rejected IDs resolve to the same URL are always dropped because
+they are not valid preference pairs. Conversion counts are written beside the
+output as `dpo_pairs_url.stats.json`.
+
 ## Important validation checks
 
 - `unmapped_queries.jsonl` should be empty for the full dataset.

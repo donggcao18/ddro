@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 from common import iter_json_records
 from mine_dpo_negatives import mine, stratified_sample
+from postprocess_dpo_urls import convert
 from prepare_bm25 import prepare
 
 
@@ -21,6 +22,87 @@ def write_rows(path: Path, rows: list[dict]) -> None:
 
 
 class VaultPipelineTest(unittest.TestCase):
+    def test_postprocesses_mined_pairs_to_url_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            root = Path(temp_directory)
+            metadata = root / "document_metadata.jsonl"
+            mined = root / "dpo_text_ids.jsonl"
+            output = root / "dpo_urls.jsonl"
+
+            write_rows(
+                metadata,
+                [
+                    {"text_id": "target-a", "url_based_ids": ["repo/a.rb/a()"]},
+                    {"text_id": "target-c", "url_based_ids": ["repo/c.rb/c()"]},
+                ],
+            )
+            write_rows(
+                mined,
+                [
+                    {
+                        "prompt": "find a",
+                        "chosen": "target-a",
+                        "rejected": "target-c",
+                        "chosen_text_id": "target-a",
+                        "rejected_text_id": "target-c",
+                        "bm25_rank": 3,
+                    }
+                ],
+            )
+
+            stats = convert(
+                SimpleNamespace(
+                    input=str(mined),
+                    document_metadata=str(metadata),
+                    output=str(output),
+                    stats_output=None,
+                    on_mapping_error="error",
+                )
+            )
+
+            self.assertEqual(stats["input_rows"], 1)
+            self.assertEqual(stats["output_rows"], 1)
+            pair = next(iter_json_records(output))
+            self.assertEqual(pair["chosen"], "repo/a.rb/a()")
+            self.assertEqual(pair["rejected"], "repo/c.rb/c()")
+            self.assertEqual(pair["chosen_text_id"], "target-a")
+            self.assertEqual(pair["rejected_text_id"], "target-c")
+            self.assertEqual(pair["bm25_rank"], 3)
+
+    def test_postprocessor_can_skip_an_invalid_referenced_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            root = Path(temp_directory)
+            metadata = root / "document_metadata.jsonl"
+            mined = root / "dpo_text_ids.jsonl"
+            output = root / "dpo_urls.jsonl"
+
+            write_rows(
+                metadata,
+                [
+                    {"text_id": "target-a", "url_based_ids": ["repo/a.rb/a()"]},
+                    {"text_id": "target-c", "url_based_ids": []},
+                ],
+            )
+            write_rows(
+                mined,
+                [{"prompt": "find a", "chosen": "target-a", "rejected": "target-c"}],
+            )
+
+            stats = convert(
+                SimpleNamespace(
+                    input=str(mined),
+                    document_metadata=str(metadata),
+                    output=str(output),
+                    stats_output=None,
+                    on_mapping_error="skip",
+                )
+            )
+
+            self.assertEqual(stats["output_rows"], 0)
+            self.assertEqual(stats["skipped_mapping_errors"], 1)
+            self.assertEqual(stats["invalid_document_url_mappings"], 1)
+            self.assertEqual(list(iter_json_records(output)), [])
+
     def test_vault_rank_bucket_allocation(self) -> None:
         candidates = [
             {"text_id": f"doc-{rank}", "rank": rank, "score": None}
