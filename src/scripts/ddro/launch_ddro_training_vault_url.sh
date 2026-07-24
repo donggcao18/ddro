@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # Override any of these paths/settings as environment variables when launching.
-CHECKPOINT_PATH="${CHECKPOINT_PATH:-/home/users/congthanh_le/scratch/east/CodeGR/model/DSI_QG_Ruby_t5-base_multilabel_RQ_8_16_decoder_start/checkpoint-196000}"
-TRAIN_FILE="${TRAIN_FILE:-/home/users/congthanh_le/scratch/east/ddro/data/vault_bm25/dpo_pairs.jsonl}"
-OUTPUT_DIR="${OUTPUT_DIR:-/home/users/congthanh_le/scratch/east/ddro/outputs/vault-ruby-ddro-prompt256-id20}"
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-/home/users/congthanh_le/scratch/veil/CodeGR/outputs/DSI_Ruby_url/checkpoint-630000}"
+TRAIN_FILE="${TRAIN_FILE:-/home/users/congthanh_le/scratch/east/ddro/data/vault_bm25/dpo_pairs_url.jsonl}"
+OUTPUT_DIR="${OUTPUT_DIR:-/home/users/congthanh_le/scratch/east/ddro/outputs/vault-ruby-ddro-url}"
 NUM_GPUS="${NUM_GPUS:-1}"
 PRECISION="${PRECISION:-bf16}"
 
@@ -19,7 +19,7 @@ TRAIN_ARGS=(
   --output_dir "${OUTPUT_DIR}"
   --validation_split 0.01
   --max_prompt_length 256
-  --max_target_length 20
+  --max_target_length 64
   --num_train_epochs 2
   --per_device_train_batch_size 32
   --per_device_eval_batch_size 32
