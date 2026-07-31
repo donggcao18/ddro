@@ -29,6 +29,7 @@ MINING_DEVICE="${MINING_DEVICE:-auto}"
 LIMIT_QUERIES="${LIMIT_QUERIES:-}"
 PRECISION="${PRECISION:-bf16}"
 TARGET_COLLISION_POLICY="${TARGET_COLLISION_POLICY:-skip}"
+TARGET_LENGTH_POLICY="${TARGET_LENGTH_POLICY:-skip}"
 
 
 require_file() {
@@ -56,6 +57,7 @@ MINING_ARGS=(
   src/scripts/bm25/the_vault/mine_model_confusion_negatives.py
   --target-type url
   --target-collision-policy "${TARGET_COLLISION_POLICY}"
+  --target-length-policy "${TARGET_LENGTH_POLICY}"
   --checkpoint-path "${CHECKPOINT_PATH}"
   --query-metadata "${QUERY_METADATA}"
   --document-metadata "${DOCUMENT_METADATA}"

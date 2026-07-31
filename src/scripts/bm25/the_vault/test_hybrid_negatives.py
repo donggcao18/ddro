@@ -95,7 +95,7 @@ class ModelConfusionHelperTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "same tokenizer target sequence"):
             build_target_index(tokenizer, ["a", "b"], max_target_length=4)
 
-        encoded, mapping, excluded, groups = build_target_index(
+        encoded, mapping, excluded, groups, overlong = build_target_index(
             tokenizer,
             ["a", "b", "c"],
             max_target_length=4,
@@ -105,10 +105,23 @@ class ModelConfusionHelperTest(unittest.TestCase):
         self.assertEqual(mapping, {(11, 1): "c"})
         self.assertEqual(excluded, {"a", "b"})
         self.assertEqual(groups, [["a", "b"]])
+        self.assertEqual(overlong, [])
 
         tokenizer = FakeTokenizer({"a": [10, 11, 12, 1]})
         with self.assertRaisesRegex(ValueError, "must not be truncated"):
             build_target_index(tokenizer, ["a"], max_target_length=3)
+
+        encoded, mapping, excluded, groups, overlong = build_target_index(
+            FakeTokenizer({"short": [10, 1], "long": [10, 11, 12, 1]}),
+            ["short", "long"],
+            max_target_length=3,
+            length_policy="skip",
+        )
+        self.assertEqual(encoded, [[10, 1]])
+        self.assertEqual(mapping, {(10, 1): "short"})
+        self.assertEqual(excluded, {"long"})
+        self.assertEqual(groups, [])
+        self.assertEqual(overlong, [(4, "long")])
 
     def test_builds_unique_url_targets_and_tracks_invalid_mappings(self) -> None:
         text_id_to_target, target_to_text_id, invalid = build_document_targets(

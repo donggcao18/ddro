@@ -304,20 +304,23 @@ miner writes `model_confusion_pairs_url.excluded_text_ids.json`, and the hybrid
 combiner removes those DocIDs as both chosen and rejected targets. Set
 `TARGET_COLLISION_POLICY=error` to restore fail-fast behavior for auditing.
 
-URL targets must not be truncated. If the miner reports targets longer than 64
-tokens, set the same larger value for preprocessing and DPO training. For
-example:
+URL targets longer than `MAX_TARGET_LENGTH` are omitted from the constrained
+model-confusion candidate trie by default (`TARGET_LENGTH_POLICY=skip`). They
+are recorded under `overlength_targets` and
+`model_mining_excluded_text_ids` in the same manifest, but they are not added
+to its downstream `excluded_text_ids` list. Therefore, the hybrid combiner does
+not remove existing BM25/DDRO rows merely because their URL target is long.
+Queries whose correct target is long are still processed and can receive valid,
+shorter model-confusion negatives. Set `TARGET_LENGTH_POLICY=error` to restore
+fail-fast length auditing.
+
+For example, this keeps a 96-token model-generation budget while ignoring
+longer generation candidates:
 
 ```bash
 MAX_TARGET_LENGTH=96 \
 bash src/scripts/ddro/prepare_vault_url_hybrid_negatives.sh
-
-MAX_TARGET_LENGTH=96 \
-bash src/scripts/ddro/launch_ddro_training_vault_url_hybrid.sh
 ```
-
-The miner reports the corpus-wide maximum target length and several longest
-examples, so use at least that reported maximum rather than repeatedly guessing.
 
 To mine and train in one command, use:
 

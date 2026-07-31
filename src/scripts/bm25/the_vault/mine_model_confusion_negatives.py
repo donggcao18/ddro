@@ -90,13 +90,15 @@ def build_target_index(
     targets: Iterable[str],
     max_target_length: int,
     collision_policy: str = "error",
+    length_policy: str = "error",
 ) -> tuple[
     list[list[int]],
     dict[tuple[int, ...], str],
     set[str],
     list[list[str]],
+    list[tuple[int, str]],
 ]:
-    """Build unique target sequences and identify tokenizer collisions."""
+    """Build unique target sequences and identify unusable decoder targets."""
     sequence_groups: dict[tuple[int, ...], list[str]] = {}
     overlong_targets: list[tuple[int, str]] = []
     for target in sorted(set(targets)):
@@ -107,8 +109,8 @@ def build_target_index(
             overlong_targets.append((len(sequence), target))
             continue
         sequence_groups.setdefault(sequence, []).append(target)
-    if overlong_targets:
-        overlong_targets.sort(reverse=True)
+    overlong_targets.sort(reverse=True)
+    if overlong_targets and length_policy == "error":
         maximum_length = overlong_targets[0][0]
         examples = "; ".join(
             f"{length} tokens: {target!r}"
@@ -134,8 +136,11 @@ def build_target_index(
             "to exclude all affected DocIDs from mining and hybrid data."
         )
 
-    excluded_targets = {
+    collision_targets = {
         target for group in collision_groups for target in group
+    }
+    mining_excluded_targets = collision_targets | {
+        target for _, target in overlong_targets
     }
     sequence_to_target = {
         sequence: group[0]
@@ -145,7 +150,13 @@ def build_target_index(
     encoded_targets = [list(sequence) for sequence in sequence_to_target]
     if not encoded_targets:
         raise ValueError("No valid document targets were found")
-    return encoded_targets, sequence_to_target, excluded_targets, collision_groups
+    return (
+        encoded_targets,
+        sequence_to_target,
+        mining_excluded_targets,
+        collision_groups,
+        overlong_targets,
+    )
 
 
 def build_document_targets(
@@ -323,17 +334,33 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
     (
         encoded_targets,
         sequence_to_target,
-        excluded_targets,
+        mining_excluded_targets,
         collision_groups,
+        overlong_targets,
     ) = build_target_index(
         tokenizer,
         text_id_to_target.values(),
         args.max_target_length,
         args.target_collision_policy,
+        args.target_length_policy,
     )
-    excluded_text_ids = {
+    collision_targets = {
+        target for group in collision_groups for target in group
+    }
+    overlength_targets = {target for _, target in overlong_targets}
+    collision_excluded_text_ids = {
         target_to_text_id[target]
-        for target in excluded_targets
+        for target in collision_targets
+        if target in target_to_text_id
+    }
+    overlength_excluded_text_ids = {
+        target_to_text_id[target]
+        for target in overlength_targets
+        if target in target_to_text_id
+    }
+    mining_excluded_text_ids = {
+        target_to_text_id[target]
+        for target in mining_excluded_targets
         if target in target_to_text_id
     }
     docid_trie = Trie(
@@ -374,6 +401,8 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
             {
                 "target_type": args.target_type,
                 "collision_policy": args.target_collision_policy,
+                "length_policy": args.target_length_policy,
+                "max_target_length": args.max_target_length,
                 "collision_groups": [
                     {
                         "targets": group,
@@ -381,8 +410,26 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                     }
                     for group in collision_groups
                 ],
-                "excluded_targets": sorted(excluded_targets),
-                "excluded_text_ids": sorted(excluded_text_ids),
+                "overlength_targets": [
+                    {
+                        "target": target,
+                        "text_id": target_to_text_id[target],
+                        "token_length": length,
+                    }
+                    for length, target in overlong_targets
+                ],
+                # Only tokenizer collisions must be removed from final hybrid
+                # DPO data. Overlength targets are excluded from constrained
+                # model generation only; the DDRO trainer owns its truncation
+                # policy for chosen/rejected rows.
+                "excluded_targets": sorted(collision_targets),
+                "excluded_text_ids": sorted(collision_excluded_text_ids),
+                "model_mining_excluded_targets": sorted(
+                    mining_excluded_targets
+                ),
+                "model_mining_excluded_text_ids": sorted(
+                    mining_excluded_text_ids
+                ),
             },
             handle,
             indent=2,
@@ -408,9 +455,11 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                 eligible_queries: list[dict[str, Any]] = []
                 for query in query_batch:
                     query_target_id = as_text_id(query.get("target_text_id"))
-                    if query_target_id in excluded_text_ids:
+                    if query_target_id in collision_excluded_text_ids:
                         stats["queries_skipped_target_collision"] += 1
                         continue
+                    if query_target_id in overlength_excluded_text_ids:
+                        stats["queries_with_overlength_target_processed"] += 1
                     eligible_queries.append(query)
                 query_batch = eligible_queries
                 if not query_batch:
@@ -470,7 +519,8 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                         text_id_to_target[positive_id]
                         for positive_id in positive_ids
                         if positive_id in text_id_to_target
-                        and text_id_to_target[positive_id] not in excluded_targets
+                        and text_id_to_target[positive_id]
+                        not in mining_excluded_targets
                     }
                     if target_text_id not in text_id_to_target:
                         raise ValueError(
@@ -504,7 +554,7 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                     )
                     for chosen_id in chosen_ids:
                         chosen_target = text_id_to_target.get(chosen_id)
-                        if chosen_id in excluded_text_ids:
+                        if chosen_id in collision_excluded_text_ids:
                             stats["chosen_targets_skipped_collision"] += 1
                             continue
                         if chosen_target is None:
@@ -555,9 +605,16 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
             "tokenized_docid_sequences": len(sequence_to_target),
             "target_type": args.target_type,
             "target_collision_policy": args.target_collision_policy,
+            "target_length_policy": args.target_length_policy,
+            "max_target_length": args.max_target_length,
             "tokenizer_collision_groups": len(collision_groups),
-            "excluded_collision_targets": len(excluded_targets),
-            "excluded_collision_text_ids": len(excluded_text_ids),
+            "excluded_collision_targets": len(collision_targets),
+            "excluded_collision_text_ids": len(collision_excluded_text_ids),
+            "excluded_overlength_targets": len(overlength_targets),
+            "excluded_overlength_text_ids": len(overlength_excluded_text_ids),
+            "model_mining_excluded_targets": len(mining_excluded_targets),
+            "model_mining_excluded_text_ids": len(mining_excluded_text_ids),
+            "exclusions_output": str(exclusions_path),
             "collision_exclusions_output": str(exclusions_path),
             "checkpoint": str(checkpoint_path),
             "device": str(device),
@@ -594,6 +651,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Fail on tokenizer-identical targets (default), or exclude every "
             "affected target and write an exclusion manifest beside the output."
+        ),
+    )
+    parser.add_argument(
+        "--target-length-policy",
+        choices=["error", "skip"],
+        default="error",
+        help=(
+            "How to handle decoder targets longer than --max-target-length. "
+            "Use skip to remove them from the constrained model-generation "
+            "candidate trie without excluding them from downstream DDRO data."
         ),
     )
     parser.add_argument("--negatives-per-query", type=int, default=4)

@@ -38,6 +38,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="error",
     )
     parser.add_argument(
+        "--target-length-policy",
+        choices=["error", "skip"],
+        default="error",
+    )
+    parser.add_argument(
         "--bm25-python",
         default=sys.executable,
         help="Python executable for the Pyserini BM25 pipeline.",
@@ -185,6 +190,8 @@ def main() -> None:
         args.target_type,
         "--target-collision-policy",
         args.target_collision_policy,
+        "--target-length-policy",
+        args.target_length_policy,
         "--negatives-per-query",
         str(args.model_negatives_per_query),
         "--num-beams",
