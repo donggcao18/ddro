@@ -279,6 +279,25 @@ This reads `query_metadata.jsonl` and `document_metadata.jsonl` from
 `model_confusion_pairs_url.stats.json`. Set `LIMIT_QUERIES=100` only for a
 smoke test; omit it for the complete dataset.
 
+To generate both the URL model-confusion file and the final hybrid URL dataset
+from an existing `dpo_pairs_url.jsonl`, use the preprocessing-only script:
+
+```bash
+conda activate ddro_env
+
+WORK_DIR=/mnt/beegfs/scratch/congthanh_le/east/ddro/data/vault_bm25 \
+CHECKPOINT_PATH=/home/users/congthanh_le/scratch/veil/CodeGR/outputs/DSI_Ruby_url/checkpoint-630000 \
+NUM_BEAMS=8 \
+BATCH_SIZE=64 \
+bash src/scripts/ddro/prepare_vault_url_hybrid_negatives.sh
+```
+
+This script never invokes Pyserini and never starts training. It requires
+`dpo_pairs_url.jsonl`, `query_metadata.jsonl`, and `document_metadata.jsonl`,
+then creates `model_confusion_pairs_url.jsonl` and
+`dpo_pairs_hybrid_url.jsonl`. Set `RUN_MODEL_MINING=0` to recombine an existing
+model-confusion file without rerunning the model.
+
 To mine and train in one command, use:
 
 ```bash
