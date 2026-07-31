@@ -142,6 +142,147 @@ Alongside `dpo_pairs.jsonl`, the miner writes:
 - `dpo_pairs.tsv`: `query_key<TAB>chosen_text_id<TAB>rejected_text_id`.
 - `dpo_pairs.stats.json`: filtering and output counts.
 
+## Hybrid BM25 + model-confusion negatives
+
+The model-confusion path is additive: the existing BM25 pipeline and its
+`dpo_pairs.jsonl` output are not modified. Constrained beam search is run against
+the frozen SFT checkpoint, then a separate combiner creates
+`dpo_pairs_hybrid.jsonl`.
+
+The default hybrid allocation is at most 4 model-confusion negatives and enough
+unique BM25 negatives to retain 8 pairs per query. When fewer than 4 valid model
+predictions remain after multi-label filtering, BM25 fills the shortfall.
+
+Run all stages with:
+
+```bash
+python src/scripts/bm25/the_vault/run_hybrid_pipeline.py \
+  --train-original /data/Ruby_train_r32.0.json \
+  --test-original /data/Ruby_test_r32.0.json \
+  --augmentation /data/Ruby_ready_to_feed_numeric.jsonl \
+  --checkpoint-path /models/vault-sft/checkpoint-196000 \
+  --work-dir /data/vault_bm25 \
+  --bf16
+```
+
+For a cheap checkpoint smoke test, reuse existing BM25 output and mine only 100
+queries:
+
+```bash
+python src/scripts/bm25/the_vault/run_hybrid_pipeline.py \
+  --train-original /data/Ruby_train_r32.0.json \
+  --augmentation /data/Ruby_ready_to_feed_numeric.jsonl \
+  --checkpoint-path /models/vault-sft/checkpoint-196000 \
+  --work-dir /data/vault_bm25 \
+  --reuse-bm25-output \
+  --limit-queries 100 \
+  --bf16
+```
+
+This smoke-test output uses BM25 fallback for queries beyond the first 100. Use
+`--require-exact-mix` if such queries should instead be omitted.
+
+The same stages can be run separately:
+
+```bash
+python src/scripts/bm25/the_vault/mine_model_confusion_negatives.py \
+  --checkpoint-path /models/vault-sft/checkpoint-196000 \
+  --query-metadata /data/vault_bm25/query_metadata.jsonl \
+  --document-metadata /data/vault_bm25/document_metadata.jsonl \
+  --output /data/vault_bm25/model_confusion_pairs.jsonl \
+  --negatives-per-query 4 \
+  --num-beams 8 \
+  --batch-size 64 \
+  --max-prompt-length 256 \
+  --max-target-length 20 \
+  --bf16
+
+python src/scripts/bm25/the_vault/combine_hybrid_dpo.py \
+  --bm25-input /data/vault_bm25/dpo_pairs.jsonl \
+  --model-input /data/vault_bm25/model_confusion_pairs.jsonl \
+  --document-metadata /data/vault_bm25/document_metadata.jsonl \
+  --output /data/vault_bm25/dpo_pairs_hybrid.jsonl \
+  --model-per-query 4 \
+  --total-per-query 8 \
+  --seed 42
+```
+
+The model miner uses only valid `text_id` target sequences from
+`document_metadata.jsonl`. It fails rather than truncating a DocID or accepting
+two DocIDs with the same tokenizer sequence. Audit counts are written to
+`model_confusion_pairs.stats.json` and `dpo_pairs_hybrid.stats.json`.
+
+Train the hybrid file with
+`src/scripts/ddro/launch_ddro_training_vault_hybrid.sh`, or pass
+`dpo_pairs_hybrid.jsonl` to `train_ddro_vault.py` directly.
+
+For a URL-DocID SFT checkpoint, first convert the final hybrid pairs and then
+use the URL-specific hybrid launcher:
+
+```bash
+python src/scripts/bm25/the_vault/postprocess_dpo_urls.py \
+  --input /data/vault_bm25/dpo_pairs_hybrid.jsonl \
+  --document-metadata /data/vault_bm25/document_metadata.jsonl \
+  --output /data/vault_bm25/dpo_pairs_hybrid_url.jsonl
+
+bash src/scripts/ddro/launch_ddro_training_vault_url_hybrid.sh
+```
+
+The launcher defaults to `max_target_length=64` and the same URL checkpoint as
+`launch_ddro_training_vault_url.sh`. Override `CHECKPOINT_PATH`, `TRAIN_FILE`,
+`OUTPUT_DIR`, `NUM_GPUS`, or `PRECISION` through environment variables.
+
+For the complete URL workflow—including data preparation, BM25 retrieval, BM25
+URL conversion, URL-checkpoint model-confusion generation, hybrid combination,
+the trainer dry run, and DPO training—use:
+
+```bash
+CHECKPOINT_PATH=/models/DSI_Ruby_url/checkpoint-630000 \
+TRAIN_ORIGINAL=/data/Ruby_train_r32.0.json \
+TEST_ORIGINAL=/data/Ruby_test_r32.0.json \
+AUGMENTATION=/data/Ruby_ready_to_feed_numeric.jsonl \
+WORK_DIR=/scratch/vault_url_hybrid \
+DPO_OUTPUT_DIR=/scratch/models/vault-url-ddro-hybrid \
+BM25_PYTHON_BIN=/envs/pyserini/bin/python \
+DPO_PYTHON_BIN=/envs/ddro/bin/python \
+NUM_GPUS=2 \
+bash src/scripts/ddro/run_vault_url_hybrid_mining_and_dpo.sh
+```
+
+This produces:
+
+```text
+dpo_pairs.jsonl                    # unchanged BM25 text-ID baseline
+dpo_pairs_url.jsonl                # BM25 pairs converted to URL targets
+model_confusion_pairs_url.jsonl    # wrong URL DocIDs predicted by URL SFT
+dpo_pairs_hybrid_url.jsonl         # final URL-target 4+4/fallback DPO data
+```
+
+Set `RUN_BM25=0` to reuse prepared BM25 files, `MINE_LIMIT_QUERIES=100`
+for a smoke test, or `RUN_TRAINING=0` to stop after URL dataset validation.
+
+To mine and train in one command, use:
+
+```bash
+bash src/scripts/ddro/run_vault_hybrid_mining_and_dpo.sh
+```
+
+All paths and training settings are environment-variable overrides. For example:
+
+```bash
+CHECKPOINT_PATH=/models/vault-sft/checkpoint-196000 \
+WORK_DIR=/scratch/vault_hybrid \
+DPO_OUTPUT_DIR=/scratch/models/vault-ddro-hybrid \
+BM25_PYTHON_BIN=/envs/pyserini/bin/python \
+DPO_PYTHON_BIN=/envs/ddro/bin/python \
+NUM_GPUS=2 \
+bash src/scripts/ddro/run_vault_hybrid_mining_and_dpo.sh
+```
+
+Set `RUN_BM25=0` to reuse existing BM25 files, `MINE_LIMIT_QUERIES=100`
+for a mining smoke test, or `RUN_TRAINING=0` to create and validate the hybrid
+dataset without starting DPO training.
+
 ## Convert an existing DPO file to URL targets
 
 BM25 does not need to be rerun when `dpo_pairs.jsonl` has already been mined.
