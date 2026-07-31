@@ -8,6 +8,7 @@ TRAIN_FILE="${TRAIN_FILE:-/home/users/congthanh_le/scratch/east/ddro/data/vault_
 OUTPUT_DIR="${OUTPUT_DIR:-/home/users/congthanh_le/scratch/east/ddro/outputs/vault-ruby-ddro-url-hybrid}"
 NUM_GPUS="${NUM_GPUS:-1}"
 PRECISION="${PRECISION:-bf16}"
+MAX_TARGET_LENGTH="${MAX_TARGET_LENGTH:-96}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
@@ -30,7 +31,7 @@ TRAIN_ARGS=(
   --output_dir "${OUTPUT_DIR}"
   --validation_split 0.01
   --max_prompt_length 256
-  --max_target_length 64
+  --max_target_length "${MAX_TARGET_LENGTH}"
   --num_train_epochs 2
   --per_device_train_batch_size 32
   --per_device_eval_batch_size 32

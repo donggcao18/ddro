@@ -93,15 +93,14 @@ def build_target_index(
     """Build unique target sequences and fail on truncation-like ambiguities."""
     encoded_targets: list[list[int]] = []
     sequence_to_target: dict[tuple[int, ...], str] = {}
+    overlong_targets: list[tuple[int, str]] = []
     for target in sorted(set(targets)):
         sequence = encode_target(tokenizer, target)
         if not sequence:
             raise ValueError(f"Tokenizer produced no target tokens for target={target!r}")
         if len(sequence) > max_target_length:
-            raise ValueError(
-                f"Tokenized target={target!r} has {len(sequence)} tokens, exceeding "
-                f"--max-target-length={max_target_length}. Targets must not be truncated."
-            )
+            overlong_targets.append((len(sequence), target))
+            continue
         previous = sequence_to_target.get(sequence)
         if previous is not None and previous != target:
             raise ValueError(
@@ -110,6 +109,20 @@ def build_target_index(
             )
         sequence_to_target[sequence] = target
         encoded_targets.append(list(sequence))
+    if overlong_targets:
+        overlong_targets.sort(reverse=True)
+        maximum_length = overlong_targets[0][0]
+        examples = "; ".join(
+            f"{length} tokens: {target!r}"
+            for length, target in overlong_targets[:3]
+        )
+        raise ValueError(
+            f"{len(overlong_targets)} decoder targets exceed "
+            f"--max-target-length={max_target_length}; the corpus maximum is "
+            f"{maximum_length} tokens. Targets must not be truncated. Increase "
+            f"--max-target-length to at least {maximum_length}. Longest examples: "
+            f"{examples}"
+        )
     if not encoded_targets:
         raise ValueError("No valid document targets were found")
     return encoded_targets, sequence_to_target

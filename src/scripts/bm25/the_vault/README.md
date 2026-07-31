@@ -298,6 +298,21 @@ then creates `model_confusion_pairs_url.jsonl` and
 `dpo_pairs_hybrid_url.jsonl`. Set `RUN_MODEL_MINING=0` to recombine an existing
 model-confusion file without rerunning the model.
 
+URL targets must not be truncated. If the miner reports targets longer than 64
+tokens, set the same larger value for preprocessing and DPO training. For
+example:
+
+```bash
+MAX_TARGET_LENGTH=96 \
+bash src/scripts/ddro/prepare_vault_url_hybrid_negatives.sh
+
+MAX_TARGET_LENGTH=96 \
+bash src/scripts/ddro/launch_ddro_training_vault_url_hybrid.sh
+```
+
+The miner reports the corpus-wide maximum target length and several longest
+examples, so use at least that reported maximum rather than repeatedly guessing.
+
 To mine and train in one command, use:
 
 ```bash
