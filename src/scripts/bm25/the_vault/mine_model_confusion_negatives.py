@@ -89,10 +89,15 @@ def build_target_index(
     tokenizer: Any,
     targets: Iterable[str],
     max_target_length: int,
-) -> tuple[list[list[int]], dict[tuple[int, ...], str]]:
-    """Build unique target sequences and fail on truncation-like ambiguities."""
-    encoded_targets: list[list[int]] = []
-    sequence_to_target: dict[tuple[int, ...], str] = {}
+    collision_policy: str = "error",
+) -> tuple[
+    list[list[int]],
+    dict[tuple[int, ...], str],
+    set[str],
+    list[list[str]],
+]:
+    """Build unique target sequences and identify tokenizer collisions."""
+    sequence_groups: dict[tuple[int, ...], list[str]] = {}
     overlong_targets: list[tuple[int, str]] = []
     for target in sorted(set(targets)):
         sequence = encode_target(tokenizer, target)
@@ -101,14 +106,7 @@ def build_target_index(
         if len(sequence) > max_target_length:
             overlong_targets.append((len(sequence), target))
             continue
-        previous = sequence_to_target.get(sequence)
-        if previous is not None and previous != target:
-            raise ValueError(
-                "Two Vault targets have the same tokenizer target sequence: "
-                f"{previous!r} and {target!r}. They cannot form distinguishable DPO targets."
-            )
-        sequence_to_target[sequence] = target
-        encoded_targets.append(list(sequence))
+        sequence_groups.setdefault(sequence, []).append(target)
     if overlong_targets:
         overlong_targets.sort(reverse=True)
         maximum_length = overlong_targets[0][0]
@@ -123,9 +121,31 @@ def build_target_index(
             f"--max-target-length to at least {maximum_length}. Longest examples: "
             f"{examples}"
         )
+
+    collision_groups = [
+        group for group in sequence_groups.values() if len(group) > 1
+    ]
+    if collision_groups and collision_policy == "error":
+        first_group = collision_groups[0]
+        raise ValueError(
+            "Two Vault targets have the same tokenizer target sequence: "
+            f"{first_group[0]!r} and {first_group[1]!r}. They cannot form "
+            "distinguishable DPO targets. Use --target-collision-policy skip "
+            "to exclude all affected DocIDs from mining and hybrid data."
+        )
+
+    excluded_targets = {
+        target for group in collision_groups for target in group
+    }
+    sequence_to_target = {
+        sequence: group[0]
+        for sequence, group in sequence_groups.items()
+        if len(group) == 1
+    }
+    encoded_targets = [list(sequence) for sequence in sequence_to_target]
     if not encoded_targets:
         raise ValueError("No valid document targets were found")
-    return encoded_targets, sequence_to_target
+    return encoded_targets, sequence_to_target, excluded_targets, collision_groups
 
 
 def build_document_targets(
@@ -300,11 +320,22 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
     text_id_to_target, target_to_text_id, invalid_url_mappings = (
         build_document_targets(document_rows, args.target_type)
     )
-    encoded_targets, sequence_to_target = build_target_index(
+    (
+        encoded_targets,
+        sequence_to_target,
+        excluded_targets,
+        collision_groups,
+    ) = build_target_index(
         tokenizer,
         text_id_to_target.values(),
         args.max_target_length,
+        args.target_collision_policy,
     )
+    excluded_text_ids = {
+        target_to_text_id[target]
+        for target in excluded_targets
+        if target in target_to_text_id
+    }
     docid_trie = Trie(
         [
             [int(config.decoder_start_token_id)] + target_tokens
@@ -337,6 +368,27 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    exclusions_path = output_path.with_suffix(".excluded_text_ids.json")
+    with exclusions_path.open("w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "target_type": args.target_type,
+                "collision_policy": args.target_collision_policy,
+                "collision_groups": [
+                    {
+                        "targets": group,
+                        "text_ids": [target_to_text_id[target] for target in group],
+                    }
+                    for group in collision_groups
+                ],
+                "excluded_targets": sorted(excluded_targets),
+                "excluded_text_ids": sorted(excluded_text_ids),
+            },
+            handle,
+            indent=2,
+            ensure_ascii=False,
+        )
+        handle.write("\n")
     temporary_output = atomic_output_path(output_path)
     stats: Counter[str] = Counter()
     candidate_count_distribution: Counter[int] = Counter()
@@ -353,6 +405,17 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                 batched(query_iterator, args.batch_size),
                 desc="Mining model-confusion negatives",
             ):
+                eligible_queries: list[dict[str, Any]] = []
+                for query in query_batch:
+                    query_target_id = as_text_id(query.get("target_text_id"))
+                    if query_target_id in excluded_text_ids:
+                        stats["queries_skipped_target_collision"] += 1
+                        continue
+                    eligible_queries.append(query)
+                query_batch = eligible_queries
+                if not query_batch:
+                    continue
+
                 prompts = [str(row.get("prompt", "")).strip() for row in query_batch]
                 if any(not prompt for prompt in prompts):
                     raise ValueError("query_metadata contains an empty prompt")
@@ -407,6 +470,7 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                         text_id_to_target[positive_id]
                         for positive_id in positive_ids
                         if positive_id in text_id_to_target
+                        and text_id_to_target[positive_id] not in excluded_targets
                     }
                     if target_text_id not in text_id_to_target:
                         raise ValueError(
@@ -440,6 +504,9 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                     )
                     for chosen_id in chosen_ids:
                         chosen_target = text_id_to_target.get(chosen_id)
+                        if chosen_id in excluded_text_ids:
+                            stats["chosen_targets_skipped_collision"] += 1
+                            continue
                         if chosen_target is None:
                             raise ValueError(
                                 f"Chosen text_id={chosen_id!r} has no usable "
@@ -483,10 +550,15 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
     result.update(
         {
             "documents": len(document_rows),
-            "usable_decoder_targets": len(text_id_to_target),
+            "usable_decoder_targets": len(sequence_to_target),
             "invalid_document_url_mappings": invalid_url_mappings,
             "tokenized_docid_sequences": len(sequence_to_target),
             "target_type": args.target_type,
+            "target_collision_policy": args.target_collision_policy,
+            "tokenizer_collision_groups": len(collision_groups),
+            "excluded_collision_targets": len(excluded_targets),
+            "excluded_collision_text_ids": len(excluded_text_ids),
+            "collision_exclusions_output": str(exclusions_path),
             "checkpoint": str(checkpoint_path),
             "device": str(device),
             "num_beams": args.num_beams,
@@ -514,6 +586,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["text_id", "url"],
         default="text_id",
         help="Decoder target namespace. The default preserves the original text_id behavior.",
+    )
+    parser.add_argument(
+        "--target-collision-policy",
+        choices=["error", "skip"],
+        default="error",
+        help=(
+            "Fail on tokenizer-identical targets (default), or exclude every "
+            "affected target and write an exclusion manifest beside the output."
+        ),
     )
     parser.add_argument("--negatives-per-query", type=int, default=4)
     parser.add_argument("--num-beams", type=int, default=8)

@@ -33,6 +33,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Decoder target namespace for model mining and the final hybrid file.",
     )
     parser.add_argument(
+        "--target-collision-policy",
+        choices=["error", "skip"],
+        default="error",
+    )
+    parser.add_argument(
         "--bm25-python",
         default=sys.executable,
         help="Python executable for the Pyserini BM25 pipeline.",
@@ -178,6 +183,8 @@ def main() -> None:
         str(model_output),
         "--target-type",
         args.target_type,
+        "--target-collision-policy",
+        args.target_collision_policy,
         "--negatives-per-query",
         str(args.model_negatives_per_query),
         "--num-beams",
@@ -225,6 +232,9 @@ def main() -> None:
         "--seed",
         str(args.seed),
     ]
+    exclusions_path = model_output.with_suffix(".excluded_text_ids.json")
+    if exclusions_path.is_file():
+        combine_command.extend(["--excluded-text-ids", str(exclusions_path)])
     if args.require_exact_mix:
         combine_command.append("--require-exact-mix")
     run(combine_command)

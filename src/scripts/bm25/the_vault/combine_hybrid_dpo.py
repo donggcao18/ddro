@@ -248,6 +248,19 @@ def atomic_output_path(path: Path) -> Path:
     return path.with_name(path.name + f".tmp.{os.getpid()}")
 
 
+def load_excluded_text_ids(path: str | Path | None) -> set[str]:
+    """Load a model-miner collision manifest or a plain JSON list."""
+    if not path:
+        return set()
+    source = Path(path)
+    with source.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    values = payload.get("excluded_text_ids", []) if isinstance(payload, dict) else payload
+    if not isinstance(values, list):
+        raise ValueError(f"{source} must contain an excluded_text_ids list")
+    return {as_text_id(value) for value in values if as_text_id(value)}
+
+
 def combine(args: argparse.Namespace) -> dict[str, Any]:
     if args.model_per_query < 0:
         raise ValueError("--model-per-query cannot be negative")
@@ -263,6 +276,9 @@ def combine(args: argparse.Namespace) -> dict[str, Any]:
     }
     if not known_documents:
         raise ValueError("document_metadata contains no valid text_id values")
+    excluded_text_ids = load_excluded_text_ids(
+        getattr(args, "excluded_text_ids", None)
+    )
 
     bm25_groups = iter(iter_pair_groups(args.bm25_input))
     model_groups = iter(iter_pair_groups(args.model_input))
@@ -287,6 +303,29 @@ def combine(args: argparse.Namespace) -> dict[str, Any]:
                 else:
                     model_rows = []
                     stats["bm25_groups_without_model"] += 1
+
+                if bm25_key[1] in excluded_text_ids:
+                    stats["groups_skipped_excluded_chosen"] += 1
+                    continue
+                original_bm25_count = len(bm25_rows)
+                original_model_count = len(model_rows)
+                bm25_rows = [
+                    row for row in bm25_rows
+                    if rejected_id(row) not in excluded_text_ids
+                ]
+                model_rows = [
+                    row for row in model_rows
+                    if rejected_id(row) not in excluded_text_ids
+                ]
+                stats["bm25_rejections_filtered_by_exclusion"] += (
+                    original_bm25_count - len(bm25_rows)
+                )
+                stats["model_rejections_filtered_by_exclusion"] += (
+                    original_model_count - len(model_rows)
+                )
+                if not bm25_rows:
+                    stats["groups_skipped_after_exclusion"] += 1
+                    continue
 
                 selected, group_stats = combine_group(
                     bm25_key,
@@ -332,6 +371,8 @@ def combine(args: argparse.Namespace) -> dict[str, Any]:
             "model_per_query": args.model_per_query,
             "total_per_query": args.total_per_query,
             "require_exact_mix": args.require_exact_mix,
+            "excluded_text_ids": len(excluded_text_ids),
+            "exclusions_input": getattr(args, "excluded_text_ids", None),
             "bm25_input": str(args.bm25_input),
             "model_input": str(args.model_input),
             "output": str(output_path),
@@ -352,6 +393,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-input", required=True)
     parser.add_argument("--document-metadata", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--excluded-text-ids",
+        help="Optional collision manifest written by the model-confusion miner.",
+    )
     parser.add_argument("--model-per-query", type=int, default=4)
     parser.add_argument("--total-per-query", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)

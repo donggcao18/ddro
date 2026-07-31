@@ -40,6 +40,7 @@ MAX_TARGET_LENGTH="${MAX_TARGET_LENGTH:-96}"
 MINING_DEVICE="${MINING_DEVICE:-auto}"
 MINE_LIMIT_QUERIES="${MINE_LIMIT_QUERIES:-}"
 REQUIRE_EXACT_MIX="${REQUIRE_EXACT_MIX:-0}"
+TARGET_COLLISION_POLICY="${TARGET_COLLISION_POLICY:-skip}"
 SEED="${SEED:-42}"
 
 # Training
@@ -111,6 +112,7 @@ MINING_ARGS=(
   --work-dir "${WORK_DIR}"
   --checkpoint-path "${CHECKPOINT_PATH}"
   --target-type url
+  --target-collision-policy "${TARGET_COLLISION_POLICY}"
   --bm25-python "${BM25_PYTHON_BIN}"
   --model-python "${DPO_PYTHON_BIN}"
   --threads "${BM25_THREADS}"

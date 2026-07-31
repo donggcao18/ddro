@@ -298,6 +298,12 @@ then creates `model_confusion_pairs_url.jsonl` and
 `dpo_pairs_hybrid_url.jsonl`. Set `RUN_MODEL_MINING=0` to recombine an existing
 model-confusion file without rerunning the model.
 
+URL targets that collapse to the same tokenizer sequence (for example, two
+different Unicode symbols both becoming `<unk>`) are excluded by default. The
+miner writes `model_confusion_pairs_url.excluded_text_ids.json`, and the hybrid
+combiner removes those DocIDs as both chosen and rejected targets. Set
+`TARGET_COLLISION_POLICY=error` to restore fail-fast behavior for auditing.
+
 URL targets must not be truncated. If the miner reports targets longer than 64
 tokens, set the same larger value for preprocessing and DPO training. For
 example:

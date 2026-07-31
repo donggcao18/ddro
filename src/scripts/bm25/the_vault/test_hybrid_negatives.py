@@ -91,9 +91,20 @@ class ModelConfusionHelperTest(unittest.TestCase):
         self.assertEqual(stats["queries_with_top1_positive"], 1)
 
     def test_rejects_tokenizer_collisions_and_long_docids(self) -> None:
-        tokenizer = FakeTokenizer({"a": [10, 1], "b": [10, 1]})
+        tokenizer = FakeTokenizer({"a": [10, 1], "b": [10, 1], "c": [11, 1]})
         with self.assertRaisesRegex(ValueError, "same tokenizer target sequence"):
             build_target_index(tokenizer, ["a", "b"], max_target_length=4)
+
+        encoded, mapping, excluded, groups = build_target_index(
+            tokenizer,
+            ["a", "b", "c"],
+            max_target_length=4,
+            collision_policy="skip",
+        )
+        self.assertEqual(encoded, [[11, 1]])
+        self.assertEqual(mapping, {(11, 1): "c"})
+        self.assertEqual(excluded, {"a", "b"})
+        self.assertEqual(groups, [["a", "b"]])
 
         tokenizer = FakeTokenizer({"a": [10, 11, 12, 1]})
         with self.assertRaisesRegex(ValueError, "must not be truncated"):
@@ -275,6 +286,38 @@ class HybridCombinerTest(unittest.TestCase):
             self.assertTrue(all(row["chosen"].startswith("repo/") for row in rows))
             self.assertTrue(all(row["rejected"].startswith("repo/") for row in rows))
             self.assertTrue(all(row["rejected_text_id"] for row in rows))
+
+    def test_combiner_excludes_tokenizer_collision_docids(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            root = Path(temp_directory)
+            bm25, model, metadata = self.make_inputs(
+                root,
+                ["model-1", "model-2", "model-3", "model-4"],
+            )
+            exclusions = root / "excluded.json"
+            exclusions.write_text(
+                json.dumps({"excluded_text_ids": ["bm25-1", "model-1"]}),
+                encoding="utf-8",
+            )
+            output = root / "hybrid.jsonl"
+            stats = combine(
+                SimpleNamespace(
+                    bm25_input=str(bm25),
+                    model_input=str(model),
+                    document_metadata=str(metadata),
+                    output=str(output),
+                    excluded_text_ids=str(exclusions),
+                    model_per_query=4,
+                    total_per_query=8,
+                    seed=42,
+                    require_exact_mix=False,
+                )
+            )
+            rows = list(iter_json_records(output))
+            self.assertEqual(len(rows), 8)
+            self.assertNotIn("bm25-1", {row["rejected_text_id"] for row in rows})
+            self.assertNotIn("model-1", {row["rejected_text_id"] for row in rows})
+            self.assertEqual(stats["excluded_text_ids"], 2)
 
 
 if __name__ == "__main__":

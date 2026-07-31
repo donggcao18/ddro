@@ -24,6 +24,7 @@ QUERY_METADATA="${QUERY_METADATA:-${WORK_DIR}/query_metadata.jsonl}"
 DOCUMENT_METADATA="${DOCUMENT_METADATA:-${WORK_DIR}/document_metadata.jsonl}"
 MODEL_URL_PAIRS="${MODEL_URL_PAIRS:-${WORK_DIR}/model_confusion_pairs_url.jsonl}"
 HYBRID_URL_PAIRS="${HYBRID_URL_PAIRS:-${WORK_DIR}/dpo_pairs_hybrid_url.jsonl}"
+COLLISION_EXCLUSIONS="${COLLISION_EXCLUSIONS:-${WORK_DIR}/model_confusion_pairs_url.excluded_text_ids.json}"
 
 RUN_MODEL_MINING="${RUN_MODEL_MINING:-1}"
 MODEL_NEGATIVES="${MODEL_NEGATIVES:-4}"
@@ -35,6 +36,7 @@ MAX_TARGET_LENGTH="${MAX_TARGET_LENGTH:-96}"
 MINING_DEVICE="${MINING_DEVICE:-auto}"
 LIMIT_QUERIES="${LIMIT_QUERIES:-}"
 REQUIRE_EXACT_MIX="${REQUIRE_EXACT_MIX:-0}"
+TARGET_COLLISION_POLICY="${TARGET_COLLISION_POLICY:-skip}"
 PRECISION="${PRECISION:-bf16}"
 SEED="${SEED:-42}"
 
@@ -76,6 +78,7 @@ if [[ "${RUN_MODEL_MINING}" == "1" ]]; then
   MODEL_ARGS=(
     src/scripts/bm25/the_vault/mine_model_confusion_negatives.py
     --target-type url
+    --target-collision-policy "${TARGET_COLLISION_POLICY}"
     --checkpoint-path "${CHECKPOINT_PATH}"
     --query-metadata "${QUERY_METADATA}"
     --document-metadata "${DOCUMENT_METADATA}"
@@ -105,6 +108,7 @@ else
   echo "=== Stage 1/2: Reusing existing URL model-confusion pairs ==="
 fi
 require_file "${MODEL_URL_PAIRS}"
+require_file "${COLLISION_EXCLUSIONS}"
 
 COMBINE_ARGS=(
   src/scripts/bm25/the_vault/combine_hybrid_dpo.py
@@ -112,6 +116,7 @@ COMBINE_ARGS=(
   --model-input "${MODEL_URL_PAIRS}"
   --document-metadata "${DOCUMENT_METADATA}"
   --output "${HYBRID_URL_PAIRS}"
+  --excluded-text-ids "${COLLISION_EXCLUSIONS}"
   --model-per-query "${MODEL_NEGATIVES}"
   --total-per-query "${TOTAL_NEGATIVES}"
   --seed "${SEED}"
@@ -125,5 +130,6 @@ echo "=== Stage 2/2: Combining URL model and BM25 negatives ==="
 
 echo "BM25 URL pairs:       ${BM25_URL_PAIRS}"
 echo "Model-confusion pairs: ${MODEL_URL_PAIRS}"
+echo "Collision exclusions:  ${COLLISION_EXCLUSIONS}"
 echo "Hybrid URL pairs:     ${HYBRID_URL_PAIRS}"
 echo "Hybrid statistics:    ${HYBRID_URL_PAIRS%.jsonl}.stats.json"

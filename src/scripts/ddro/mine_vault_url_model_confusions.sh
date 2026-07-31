@@ -28,6 +28,7 @@ MAX_TARGET_LENGTH="${MAX_TARGET_LENGTH:-96}"
 MINING_DEVICE="${MINING_DEVICE:-auto}"
 LIMIT_QUERIES="${LIMIT_QUERIES:-}"
 PRECISION="${PRECISION:-bf16}"
+TARGET_COLLISION_POLICY="${TARGET_COLLISION_POLICY:-skip}"
 
 
 require_file() {
@@ -54,6 +55,7 @@ mkdir -p "$(dirname -- "${OUTPUT_FILE}")"
 MINING_ARGS=(
   src/scripts/bm25/the_vault/mine_model_confusion_negatives.py
   --target-type url
+  --target-collision-policy "${TARGET_COLLISION_POLICY}"
   --checkpoint-path "${CHECKPOINT_PATH}"
   --query-metadata "${QUERY_METADATA}"
   --document-metadata "${DOCUMENT_METADATA}"
@@ -90,3 +92,4 @@ echo "Precision:         ${PRECISION}"
 
 echo "Model-confusion pairs: ${OUTPUT_FILE}"
 echo "Mining statistics:     ${OUTPUT_FILE%.jsonl}.stats.json"
+echo "Collision exclusions:  ${OUTPUT_FILE%.jsonl}.excluded_text_ids.json"
