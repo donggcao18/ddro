@@ -261,6 +261,24 @@ dpo_pairs_hybrid_url.jsonl         # final URL-target 4+4/fallback DPO data
 Set `RUN_BM25=0` to reuse prepared BM25 files, `MINE_LIMIT_QUERIES=100`
 for a smoke test, or `RUN_TRAINING=0` to stop after URL dataset validation.
 
+After running BM25 preparation separately, URL model-confusion generation alone
+can be launched from `ddro_env` with:
+
+```bash
+conda activate ddro_env
+
+WORK_DIR=/mnt/beegfs/scratch/congthanh_le/east/ddro/data/vault_bm25 \
+CHECKPOINT_PATH=/home/users/congthanh_le/scratch/veil/CodeGR/outputs/DSI_Ruby_url/checkpoint-630000 \
+NUM_BEAMS=8 \
+BATCH_SIZE=64 \
+bash src/scripts/ddro/mine_vault_url_model_confusions.sh
+```
+
+This reads `query_metadata.jsonl` and `document_metadata.jsonl` from
+`WORK_DIR`, then writes `model_confusion_pairs_url.jsonl` and
+`model_confusion_pairs_url.stats.json`. Set `LIMIT_QUERIES=100` only for a
+smoke test; omit it for the complete dataset.
+
 To mine and train in one command, use:
 
 ```bash
