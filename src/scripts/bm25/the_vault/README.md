@@ -171,6 +171,12 @@ mining also rejects ambiguous structure targets, tokenizer collisions, and
 targets longer than `MAX_TARGET_LENGTH` unless the corresponding policy is set
 to `skip`.
 
+BM25 mining permits multiple legacy `text_id` documents to share one decoder
+target. Such documents remain usable, negative targets are deduplicated, and the
+many-to-one mappings are reported in the mining stats as
+`duplicate_decoder_targets`, `text_ids_in_duplicate_decoder_targets`, and
+`extra_text_ids_sharing_decoder_targets`.
+
 ## Performance on large augmentation files
 
 With 200,000 pseudo-queries and `--hits 200`, Pyserini may write 40 million

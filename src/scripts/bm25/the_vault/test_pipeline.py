@@ -316,6 +316,71 @@ class VaultPipelineTest(unittest.TestCase):
             self.assertEqual(pair["chosen_text_id"], "target-a")
             self.assertEqual(pair["rejected_text_id"], "target-c")
 
+    def test_duplicate_structure_targets_are_counted_and_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            root = Path(temp_directory)
+            query_metadata = root / "query_metadata.jsonl"
+            document_metadata = root / "document_metadata.jsonl"
+            run = root / "run.txt"
+            output = root / "dpo_structure.jsonl"
+
+            write_rows(
+                query_metadata,
+                [
+                    {
+                        "query_key": "vault-000000000",
+                        "prompt": "create the artist table",
+                        "target_text_id": "target-a",
+                        "positive_text_ids": ["target-a"],
+                        "positive_structure_id_v3s": ["shared|args|path"],
+                    }
+                ],
+            )
+            write_rows(
+                document_metadata,
+                [
+                    {"text_id": "target-a", "structure_id_v3s": ["shared|args|path"]},
+                    {"text_id": "target-b", "structure_id_v3s": ["shared|args|path"]},
+                    {"text_id": "target-c", "structure_id_v3s": ["different|args|path"]},
+                ],
+            )
+            run.write_text(
+                "\n".join(
+                    [
+                        "vault-000000000 Q0 target-a 1 10.0 test",
+                        "vault-000000000 Q0 target-b 2 9.0 test",
+                        "vault-000000000 Q0 target-c 3 8.0 test",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            stats = mine(
+                SimpleNamespace(
+                    run=str(run),
+                    query_metadata=str(query_metadata),
+                    document_metadata=str(document_metadata),
+                    output=str(output),
+                    triples_output=None,
+                    negatives_per_query=1,
+                    rank_ranges=[(1, 100)],
+                    seed=42,
+                    pair_all_positives=False,
+                    fill_shortfall=False,
+                    rank_quotas=None,
+                    target_type="structure_id_v3",
+                )
+            )
+
+            self.assertEqual(stats["duplicate_decoder_targets"], 1)
+            self.assertEqual(stats["text_ids_in_duplicate_decoder_targets"], 2)
+            self.assertEqual(stats["extra_text_ids_sharing_decoder_targets"], 1)
+            self.assertEqual(stats["filtered_multi_label_or_target_hits"], 2)
+            pair = next(iter_json_records(output))
+            self.assertEqual(pair["chosen"], "shared|args|path")
+            self.assertEqual(pair["rejected"], "different|args|path")
+
 
 if __name__ == "__main__":
     unittest.main()

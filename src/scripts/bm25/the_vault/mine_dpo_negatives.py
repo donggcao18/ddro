@@ -14,10 +14,10 @@ from common import as_text_id, document_targets, iter_json_records
 
 def build_document_target_map(
     document_rows: dict[str, dict[str, Any]], target_type: str
-) -> tuple[dict[str, str], int]:
-    """Map canonical text IDs to one usable decoder target."""
+) -> tuple[dict[str, str], int, dict[str, int]]:
+    """Map text IDs to decoder targets and summarize many-to-one collisions."""
     mapping: dict[str, str] = {}
-    target_to_text_id: dict[str, str] = {}
+    target_to_text_ids: dict[str, list[str]] = {}
     invalid = 0
     for text_id, row in document_rows.items():
         targets = document_targets(row, target_type)
@@ -25,15 +25,22 @@ def build_document_target_map(
             invalid += 1
             continue
         target = targets[0]
-        previous_text_id = target_to_text_id.get(target)
-        if previous_text_id is not None and previous_text_id != text_id:
-            raise ValueError(
-                f"Decoder target {target!r} maps to multiple text IDs: "
-                f"{previous_text_id!r} and {text_id!r}"
-            )
         mapping[text_id] = target
-        target_to_text_id[target] = text_id
-    return mapping, invalid
+        target_to_text_ids.setdefault(target, []).append(text_id)
+
+    duplicate_groups = [
+        text_ids for text_ids in target_to_text_ids.values() if len(text_ids) > 1
+    ]
+    collision_stats = {
+        "duplicate_decoder_targets": len(duplicate_groups),
+        "text_ids_in_duplicate_decoder_targets": sum(
+            len(text_ids) for text_ids in duplicate_groups
+        ),
+        "extra_text_ids_sharing_decoder_targets": sum(
+            len(text_ids) - 1 for text_ids in duplicate_groups
+        ),
+    }
+    return mapping, invalid, collision_stats
 
 
 def iter_run_groups(
@@ -189,9 +196,11 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
         row["text_id"]: row for row in iter_json_records(args.document_metadata)
     }
     target_type = getattr(args, "target_type", "text_id")
-    text_id_to_target, invalid_target_mappings = build_document_target_map(
-        document_rows, target_type
-    )
+    (
+        text_id_to_target,
+        invalid_target_mappings,
+        target_collision_stats,
+    ) = build_document_target_map(document_rows, target_type)
     rng = random.Random(args.seed)
 
     queries_without_negatives = 0
@@ -309,6 +318,7 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
         "filtered_multi_label_or_target_hits": filtered_positive_hits,
         "filtered_unknown_document_hits": filtered_unknown_hits,
         "invalid_document_target_mappings": invalid_target_mappings,
+        **target_collision_stats,
         "target_type": target_type,
         "dpo_pairs": dpo_pair_count,
         "output": str(args.output),
