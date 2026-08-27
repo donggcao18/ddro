@@ -69,6 +69,54 @@ class MergeStructureIdV3Test(unittest.TestCase):
             )
             self.assertEqual(rows[0]["legacy_text_ids"], ["legacy-a", "legacy-b"])
 
+    def test_skip_mode_counts_and_logs_unmapped_positives(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            root = Path(temp_directory)
+            original = root / "original.jsonl"
+            structures = root / "structures.jsonl"
+            current = root / "current.jsonl"
+            output = root / "output.jsonl"
+            write_rows(
+                original,
+                [
+                    {"numeric_id": "1", "text_id": "legacy-a"},
+                    {"numeric_id": "2", "text_id": "legacy-missing"},
+                ],
+            )
+            write_rows(
+                structures,
+                [{"numeric_id": "1", "structure_id_v3": "structure a"}],
+            )
+            write_rows(
+                current,
+                [
+                    {
+                        "numeric_id": "1",
+                        "text_id": ["legacy-a", "legacy-missing"],
+                        "text": "shared query",
+                    }
+                ],
+            )
+
+            stats = merge(
+                SimpleNamespace(
+                    input=str(current),
+                    structure_source=str(structures),
+                    original=[str(original)],
+                    output=str(output),
+                    structure_id_field="structure_id_v3",
+                    output_target_field="text_id",
+                    expand_multilabel=True,
+                    on_missing="skip",
+                )
+            )
+            self.assertEqual(stats["output_rows"], 1)
+            self.assertEqual(stats["rows_with_unmapped_positive_text_ids"], 1)
+            self.assertEqual(stats["unmapped_positive_text_ids"], 1)
+            self.assertEqual(stats["unique_unmapped_positive_text_ids"], 1)
+            missing_rows = list(iter_json_records(stats["missing_log"]))
+            self.assertEqual(missing_rows[0]["text_ids"], ["legacy-missing"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -112,9 +112,13 @@ def merge(args: argparse.Namespace) -> dict[str, Any]:
     )
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    missing_log_path = output_path.with_suffix(".missing.jsonl")
     counters = defaultdict(int, stats)
+    unique_unmapped_positive_ids: set[str] = set()
 
-    with output_path.open("w", encoding="utf-8") as output_handle:
+    with output_path.open("w", encoding="utf-8") as output_handle, missing_log_path.open(
+        "w", encoding="utf-8"
+    ) as missing_handle:
         for row_number, row in enumerate(iter_json_records(args.input), start=1):
             counters["input_rows"] += 1
             numeric_id = string_value(row.get("numeric_id"))
@@ -126,6 +130,17 @@ def merge(args: argparse.Namespace) -> dict[str, Any]:
                         f"No {args.structure_id_field} mapping for numeric_id="
                         f"{numeric_id!r} at {args.input}:{row_number}"
                     )
+                missing_handle.write(
+                    json.dumps(
+                        {
+                            "row_number": row_number,
+                            "numeric_id": numeric_id,
+                            "reason": "missing_target_structure_id_v3",
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
                 continue
 
             positive_legacy_ids = id_list(row.get("text_id"))
@@ -149,11 +164,24 @@ def merge(args: argparse.Namespace) -> dict[str, Any]:
             if unmapped_legacy_ids:
                 counters["rows_with_unmapped_positive_text_ids"] += 1
                 counters["unmapped_positive_text_ids"] += len(unmapped_legacy_ids)
+                unique_unmapped_positive_ids.update(unmapped_legacy_ids)
                 if args.on_missing == "error":
                     raise ValueError(
                         f"No {args.structure_id_field} mapping for positive text IDs "
                         f"{unmapped_legacy_ids!r} at {args.input}:{row_number}"
                     )
+                missing_handle.write(
+                    json.dumps(
+                        {
+                            "row_number": row_number,
+                            "numeric_id": numeric_id,
+                            "reason": "unmapped_positive_text_ids",
+                            "text_ids": unmapped_legacy_ids,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
 
             targets = positive_structures if args.expand_multilabel else [target_structure]
             for target in targets:
@@ -172,6 +200,8 @@ def merge(args: argparse.Namespace) -> dict[str, Any]:
         {
             "legacy_numeric_ids": len(numeric_to_legacy),
             "legacy_text_ids_with_structure": len(legacy_to_structures),
+            "unique_unmapped_positive_text_ids": len(unique_unmapped_positive_ids),
+            "missing_log": str(missing_log_path),
             "output": str(output_path),
         }
     )
