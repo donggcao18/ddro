@@ -63,7 +63,7 @@ as a numeric ID, and an already-quantized `text_id`.
 python src/scripts/bm25/the_vault/prepare_bm25.py \
   --train-original /data/Ruby_train_r32.0.json \
   --test-original /data/Ruby_test_r32.0.json \
-  --augmentation /data/Ruby_ready_to_feed_numeric.jsonl \
+  --augmentation /data/Ruby_ready_to_feed_multilabel.jsonl \
   --output-dir /data/vault_bm25
 ```
 
