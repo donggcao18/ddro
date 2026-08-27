@@ -23,6 +23,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-original", action="append", default=[])
     parser.add_argument("--augmentation", required=True)
     parser.add_argument("--work-dir", required=True)
+    parser.add_argument(
+        "--structure-id-source",
+        action="append",
+        default=[],
+        help="JSON/JSONL containing numeric_id -> structure_id_v3 mappings.",
+    )
+    parser.add_argument(
+        "--target-type",
+        choices=["text_id", "structure_id_v3"],
+        default="text_id",
+        help="Decoder target namespace for the mined DPO pairs.",
+    )
     parser.add_argument("--threads", type=int, default=16)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--hits", type=int, default=200)
@@ -64,6 +76,12 @@ def main() -> None:
     ]
     for test_path in args.test_original:
         prepare_command.extend(["--test-original", test_path])
+    for structure_path in args.structure_id_source:
+        prepare_command.extend(["--structure-id-source", structure_path])
+    if args.target_type == "structure_id_v3" and not args.structure_id_source:
+        raise ValueError(
+            "--target-type structure_id_v3 requires --structure-id-source"
+        )
     if args.code_only:
         prepare_command.append("--code-only")
     if args.strict:
@@ -122,6 +140,12 @@ def main() -> None:
         ]
     )
 
+    output_name = (
+        "dpo_pairs_structure_id_v3.jsonl"
+        if args.target_type == "structure_id_v3"
+        else "dpo_pairs.jsonl"
+    )
+    output_path = work_dir / output_name
     mine_command = [
         sys.executable,
         str(script_dir / "mine_dpo_negatives.py"),
@@ -132,7 +156,9 @@ def main() -> None:
         "--document-metadata",
         str(work_dir / "document_metadata.jsonl"),
         "--output",
-        str(work_dir / "dpo_pairs.jsonl"),
+        str(output_path),
+        "--target-type",
+        args.target_type,
         "--negatives-per-query",
         str(args.negatives_per_query),
         "--seed",
@@ -148,7 +174,7 @@ def main() -> None:
         mine_command.append("--fill-shortfall")
     run(mine_command)
 
-    print(f"DPO-ready data: {work_dir / 'dpo_pairs.jsonl'}")
+    print(f"DPO-ready data: {output_path}")
 
 
 if __name__ == "__main__":

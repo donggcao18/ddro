@@ -3,9 +3,9 @@
 
 This is intentionally independent from the existing BM25 miner.  It loads the
 same Hugging Face checkpoint format as ``train_ddro_vault.py``, constrains beam
-search to tokenizer encodings of known Vault ``text_id`` values, filters every
+search to tokenizer encodings of known Vault decoder targets, filters every
 known positive, and writes zero to ``--negatives-per-query`` model-confusion
-pairs for each query.  A later combiner can fill any shortfall with BM25 pairs.
+pairs for each query. A later combiner can fill any shortfall with BM25 pairs.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
-from common import as_text_id, iter_json_records
+from common import as_text_id, document_targets, iter_json_records
 
 
 SRC_DIR = Path(__file__).resolve().parents[3]
@@ -166,24 +166,14 @@ def build_document_targets(
     """Map corpus text IDs to unique decoder targets and back."""
     text_id_to_target: dict[str, str] = {}
     target_to_text_id: dict[str, str] = {}
-    invalid_url_mappings = 0
+    invalid_target_mappings = 0
 
     for text_id, row in document_rows.items():
-        if target_type == "text_id":
-            target = text_id
-        else:
-            raw_urls = row.get("url_based_ids", [])
-            if not isinstance(raw_urls, list):
-                raw_urls = [raw_urls]
-            urls: list[str] = []
-            for raw_url in raw_urls:
-                url = str(raw_url or "").strip()
-                if url and url not in urls:
-                    urls.append(url)
-            if len(urls) != 1:
-                invalid_url_mappings += 1
-                continue
-            target = urls[0]
+        targets = document_targets(row, target_type)
+        if len(targets) != 1:
+            invalid_target_mappings += 1
+            continue
+        target = targets[0]
 
         previous_text_id = target_to_text_id.get(target)
         if previous_text_id is not None and previous_text_id != text_id:
@@ -196,7 +186,7 @@ def build_document_targets(
 
     if not text_id_to_target:
         raise ValueError(f"No usable {target_type} decoder targets were found")
-    return text_id_to_target, target_to_text_id, invalid_url_mappings
+    return text_id_to_target, target_to_text_id, invalid_target_mappings
 
 
 def canonical_generated_tokens(
@@ -328,7 +318,7 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
         text_id = as_text_id(row.get("text_id"))
         if text_id:
             document_rows[text_id] = row
-    text_id_to_target, target_to_text_id, invalid_url_mappings = (
+    text_id_to_target, target_to_text_id, invalid_target_mappings = (
         build_document_targets(document_rows, args.target_type)
     )
     (
@@ -583,6 +573,12 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                                     "url_based_ids", []
                                 ),
                             }
+                            if args.target_type == "structure_id_v3":
+                                output_row["chosen_structure_id_v3"] = chosen_target
+                                output_row["rejected_structure_id_v3"] = rejected_target
+                                output_row["positive_structure_id_v3s"] = sorted(
+                                    positive_targets
+                                )
                             output_handle.write(
                                 json.dumps(output_row, ensure_ascii=False) + "\n"
                             )
@@ -601,7 +597,10 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
         {
             "documents": len(document_rows),
             "usable_decoder_targets": len(sequence_to_target),
-            "invalid_document_url_mappings": invalid_url_mappings,
+            "invalid_document_target_mappings": invalid_target_mappings,
+            "invalid_document_url_mappings": (
+                invalid_target_mappings if args.target_type == "url" else 0
+            ),
             "tokenized_docid_sequences": len(sequence_to_target),
             "target_type": args.target_type,
             "target_collision_policy": args.target_collision_policy,
@@ -640,7 +639,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True)
     parser.add_argument(
         "--target-type",
-        choices=["text_id", "url"],
+        choices=["text_id", "url", "structure_id_v3"],
         default="text_id",
         help="Decoder target namespace. The default preserves the original text_id behavior.",
     )

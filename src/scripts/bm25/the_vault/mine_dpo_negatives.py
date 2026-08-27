@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Filter Vault BM25 results and export quantized-text_id DPO pairs."""
+"""Filter Vault BM25 results and export target-namespace DPO pairs."""
 
 from __future__ import annotations
 
@@ -9,7 +9,31 @@ import random
 from pathlib import Path
 from typing import Any, Iterator
 
-from common import iter_json_records
+from common import as_text_id, document_targets, iter_json_records
+
+
+def build_document_target_map(
+    document_rows: dict[str, dict[str, Any]], target_type: str
+) -> tuple[dict[str, str], int]:
+    """Map canonical text IDs to one usable decoder target."""
+    mapping: dict[str, str] = {}
+    target_to_text_id: dict[str, str] = {}
+    invalid = 0
+    for text_id, row in document_rows.items():
+        targets = document_targets(row, target_type)
+        if len(targets) != 1:
+            invalid += 1
+            continue
+        target = targets[0]
+        previous_text_id = target_to_text_id.get(target)
+        if previous_text_id is not None and previous_text_id != text_id:
+            raise ValueError(
+                f"Decoder target {target!r} maps to multiple text IDs: "
+                f"{previous_text_id!r} and {text_id!r}"
+            )
+        mapping[text_id] = target
+        target_to_text_id[target] = text_id
+    return mapping, invalid
 
 
 def iter_run_groups(
@@ -164,6 +188,10 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
     document_rows = {
         row["text_id"]: row for row in iter_json_records(args.document_metadata)
     }
+    target_type = getattr(args, "target_type", "text_id")
+    text_id_to_target, invalid_target_mappings = build_document_target_map(
+        document_rows, target_type
+    )
     rng = random.Random(args.seed)
 
     queries_without_negatives = 0
@@ -187,14 +215,33 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
 
             positive_ids = set(query.get("positive_text_ids", []))
             positive_ids.add(query["target_text_id"])
+            positive_targets = {
+                text_id_to_target[positive_id]
+                for positive_id in positive_ids
+                if positive_id in text_id_to_target
+            }
+            positive_targets.update(
+                as_text_id(value)
+                for value in query.get("positive_structure_id_v3s", [])
+                if target_type == "structure_id_v3" and as_text_id(value)
+            )
             usable: list[dict[str, Any]] = []
+            seen_candidate_targets: set[str] = set()
             for candidate in candidates:
                 if candidate["text_id"] in positive_ids:
                     filtered_positive_hits += 1
                     continue
-                if candidate["text_id"] not in document_rows:
+                candidate_target = text_id_to_target.get(candidate["text_id"])
+                if candidate["text_id"] not in document_rows or not candidate_target:
                     filtered_unknown_hits += 1
                     continue
+                if candidate_target in positive_targets:
+                    filtered_positive_hits += 1
+                    continue
+                if candidate_target in seen_candidate_targets:
+                    continue
+                seen_candidate_targets.add(candidate_target)
+                candidate["target"] = candidate_target
                 usable.append(candidate)
 
             negatives = stratified_sample(
@@ -214,25 +261,42 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                 if args.pair_all_positives
                 else [query["target_text_id"]]
             )
+            seen_chosen_targets: set[str] = set()
             for chosen_id in chosen_ids:
+                chosen_target = text_id_to_target.get(chosen_id)
+                if not chosen_target:
+                    raise ValueError(
+                        f"Chosen text_id={chosen_id!r} has no unique {target_type} mapping"
+                    )
+                if chosen_target in seen_chosen_targets:
+                    continue
+                seen_chosen_targets.add(chosen_target)
                 for negative in negatives:
                     rejected_id = negative["text_id"]
+                    rejected_target = negative["target"]
                     rejected_metadata = document_rows[rejected_id]
                     dpo_row = {
                         "prompt": query["prompt"],
-                        "chosen": chosen_id,
-                        "rejected": rejected_id,
+                        "chosen": chosen_target,
+                        "rejected": rejected_target,
                         "query_key": query_key,
                         "numeric_id": query.get("numeric_id", ""),
                         "chosen_text_id": chosen_id,
                         "rejected_text_id": rejected_id,
                         "positive_text_ids": sorted(positive_ids),
+                        "target_type": target_type,
                         "bm25_rank": negative["rank"],
                         "bm25_score": negative["score"],
                         "rejected_url_based_ids": rejected_metadata.get("url_based_ids", []),
                     }
+                    if target_type == "structure_id_v3":
+                        dpo_row["chosen_structure_id_v3"] = chosen_target
+                        dpo_row["rejected_structure_id_v3"] = rejected_target
+                        dpo_row["positive_structure_id_v3s"] = sorted(positive_targets)
                     dpo_handle.write(json.dumps(dpo_row, ensure_ascii=False) + "\n")
-                    triples_handle.write(f"{query_key}\t{chosen_id}\t{rejected_id}\n")
+                    triples_handle.write(
+                        f"{query_key}\t{chosen_target}\t{rejected_target}\n"
+                    )
                     dpo_pair_count += 1
 
     queries_without_run = len(set(query_rows) - seen_run_queries)
@@ -244,6 +308,8 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
         "queries_without_usable_negatives": queries_without_negatives,
         "filtered_multi_label_or_target_hits": filtered_positive_hits,
         "filtered_unknown_document_hits": filtered_unknown_hits,
+        "invalid_document_target_mappings": invalid_target_mappings,
+        "target_type": target_type,
         "dpo_pairs": dpo_pair_count,
         "output": str(args.output),
         "triples_output": str(triples_output),
@@ -263,6 +329,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--query-metadata", required=True)
     parser.add_argument("--document-metadata", required=True)
     parser.add_argument("--output", required=True, help="DPO-ready JSONL output")
+    parser.add_argument(
+        "--target-type",
+        choices=["text_id", "structure_id_v3"],
+        default="text_id",
+        help="Write chosen/rejected in this decoder target namespace.",
+    )
     parser.add_argument("--triples-output", help="Optional qid/chosen/rejected TSV output")
     parser.add_argument(
         "--negatives-per-query",

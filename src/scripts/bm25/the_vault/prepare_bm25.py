@@ -16,13 +16,53 @@ from common import (
     as_text_id_list,
     clean_code,
     clean_prompt,
+    document_targets,
     iter_json_records,
     normalize_query,
     write_jsonl,
 )
 
 
-def build_original_indexes(paths: list[Path]) -> dict[str, Any]:
+def load_structure_id_map(
+    paths: list[Path], field: str
+) -> tuple[dict[str, str], dict[str, int]]:
+    """Load a validated numeric_id -> structure target mapping."""
+    numeric_to_structure: dict[str, str] = {}
+    rows = 0
+    missing_numeric_id = 0
+    missing_structure_id = 0
+
+    for path in paths:
+        for row_number, row in enumerate(iter_json_records(path), start=1):
+            rows += 1
+            numeric_id = as_text_id(row.get("numeric_id"))
+            structure_id = as_text_id(row.get(field)).strip()
+            if not numeric_id:
+                missing_numeric_id += 1
+                continue
+            if not structure_id:
+                missing_structure_id += 1
+                continue
+            previous = numeric_to_structure.get(numeric_id)
+            if previous is not None and previous != structure_id:
+                raise ValueError(
+                    f"numeric_id {numeric_id!r} maps to multiple {field} values: "
+                    f"{previous!r} and {structure_id!r} ({path}:{row_number})"
+                )
+            numeric_to_structure[numeric_id] = structure_id
+
+    return numeric_to_structure, {
+        "structure_source_rows": rows,
+        "structure_source_numeric_ids": len(numeric_to_structure),
+        "structure_source_rows_missing_numeric_id": missing_numeric_id,
+        "structure_source_rows_missing_target": missing_structure_id,
+    }
+
+
+def build_original_indexes(
+    paths: list[Path],
+    numeric_to_structure: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """Index Vault metadata and reproduce its normalized-query multi-label map."""
     numeric_to_target: dict[str, str] = {}
     target_metadata: dict[str, dict[str, Any]] = {}
@@ -97,6 +137,16 @@ def build_original_indexes(paths: list[Path]) -> dict[str, Any]:
 
     for text_id in target_metadata:
         target_to_positives[text_id].add(text_id)
+
+    if numeric_to_structure:
+        for metadata in target_metadata.values():
+            metadata["structure_id_v3s"] = sorted(
+                {
+                    numeric_to_structure[numeric_id]
+                    for numeric_id in metadata["numeric_ids"]
+                    if numeric_id in numeric_to_structure
+                }
+            )
 
     return {
         "numeric_to_target": numeric_to_target,
@@ -180,7 +230,14 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     corpus_dir = output_dir / "corpus"
     corpus_dir.mkdir(parents=True, exist_ok=True)
 
-    indexes = build_original_indexes(original_paths)
+    structure_sources = [
+        Path(path) for path in getattr(args, "structure_id_source", [])
+    ]
+    structure_field = getattr(args, "structure_id_field", "structure_id_v3")
+    numeric_to_structure, structure_stats = load_structure_id_map(
+        structure_sources, structure_field
+    )
+    indexes = build_original_indexes(original_paths, numeric_to_structure)
     code_rows = indexes["code_rows"]
     target_metadata = indexes["target_metadata"]
     target_to_positives = indexes["target_to_positives"]
@@ -236,18 +293,39 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         if target not in corpus_targets:
             missing_positive_corpus += 1
 
-        query_metadata.append(
-            {
-                "query_key": query_key,
-                "prompt": prompt,
-                "target_text_id": target,
-                "positive_text_ids": positive_ids,
-                "numeric_id": numeric_id,
-                "url_based_id": row.get("url_based_id", row.get("url_id", "")),
-                "is_original": bool(row.get("is_original", False)),
-                "augmentation_row": row_number,
-            }
-        )
+        metadata_row = {
+            "query_key": query_key,
+            "prompt": prompt,
+            "target_text_id": target,
+            "positive_text_ids": positive_ids,
+            "numeric_id": numeric_id,
+            "url_based_id": row.get("url_based_id", row.get("url_id", "")),
+            "is_original": bool(row.get("is_original", False)),
+            "augmentation_row": row_number,
+        }
+        if numeric_to_structure:
+            positive_structure_ids = sorted(
+                {
+                    structure_id
+                    for positive_id in positive_ids
+                    for structure_id in document_targets(
+                        target_metadata.get(positive_id, {}), "structure_id_v3"
+                    )
+                }
+            )
+            target_structure_id = numeric_to_structure.get(numeric_id, "")
+            if not target_structure_id:
+                target_values = document_targets(
+                    target_metadata.get(target, {}), "structure_id_v3"
+                )
+                if len(target_values) == 1:
+                    target_structure_id = target_values[0]
+            if target_structure_id and target_structure_id not in positive_structure_ids:
+                positive_structure_ids.append(target_structure_id)
+                positive_structure_ids.sort()
+            metadata_row["target_structure_id_v3"] = target_structure_id
+            metadata_row["positive_structure_id_v3s"] = positive_structure_ids
+        query_metadata.append(metadata_row)
 
     write_jsonl(output_dir / "query_metadata.jsonl", query_metadata)
     write_jsonl(output_dir / "unmapped_queries.jsonl", unmapped_rows)
@@ -265,6 +343,10 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     multi_groups = [
         targets for targets in indexes["query_to_targets"].values() if len(targets) > 1
     ]
+    structure_target_owners: dict[str, set[str]] = defaultdict(set)
+    for row in document_metadata_records:
+        for structure_id in document_targets(row, "structure_id_v3"):
+            structure_target_owners[structure_id].add(row["text_id"])
     stats = {
         "original_files": [str(path) for path in original_paths],
         "augmentation_file": str(args.augmentation),
@@ -277,6 +359,23 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         "multi_label_query_groups": len(multi_groups),
         "max_multi_label_group_size": max((len(group) for group in multi_groups), default=1),
         "queries_whose_current_positive_is_missing_from_corpus": missing_positive_corpus,
+        **structure_stats,
+        "documents_with_structure_id_v3": sum(
+            bool(document_targets(row, "structure_id_v3"))
+            for row in document_metadata_records
+        ),
+        "documents_with_ambiguous_structure_id_v3": sum(
+            len(document_targets(row, "structure_id_v3")) > 1
+            for row in document_metadata_records
+        ),
+        "structure_id_v3_collisions": sum(
+            len(text_ids) > 1 for text_ids in structure_target_owners.values()
+        ),
+        "queries_missing_target_structure_id_v3": sum(
+            not row.get("target_structure_id_v3")
+            for row in query_metadata
+            if numeric_to_structure
+        ),
     }
     with (output_dir / "prepare_stats.json").open("w", encoding="utf-8") as handle:
         json.dump(stats, handle, indent=2)
@@ -298,6 +397,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--augmentation", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--structure-id-source",
+        action="append",
+        default=[],
+        help=(
+            "JSON/JSONL containing numeric_id and structure_id_v3. Repeatable; "
+            "used to enrich BM25 metadata without changing Lucene document IDs."
+        ),
+    )
+    parser.add_argument(
+        "--structure-id-field",
+        default="structure_id_v3",
+        help="Structure target field in --structure-id-source.",
+    )
     parser.add_argument(
         "--augmentation-id-mode",
         choices=["auto", "numeric", "text_id"],

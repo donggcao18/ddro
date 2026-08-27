@@ -92,6 +92,34 @@ def as_text_id_list(value: Any) -> list[str]:
     return output
 
 
+def unique_strings(value: Any) -> list[str]:
+    """Convert a scalar/list metadata value to unique non-empty strings."""
+    raw_values = value if isinstance(value, list) else [value]
+    output: list[str] = []
+    seen: set[str] = set()
+    for raw_value in raw_values:
+        item = str(raw_value or "").strip()
+        if item and item not in seen:
+            seen.add(item)
+            output.append(item)
+    return output
+
+
+def document_targets(row: dict[str, Any], target_type: str) -> list[str]:
+    """Read decoder targets for one canonical text_id document."""
+    if target_type == "text_id":
+        return unique_strings(row.get("text_id"))
+    if target_type == "url":
+        return unique_strings(
+            row.get("url_based_ids", row.get("url_based_id", row.get("url_id", "")))
+        )
+    if target_type == "structure_id_v3":
+        return unique_strings(
+            row.get("structure_id_v3s", row.get("structure_id_v3", ""))
+        )
+    raise ValueError(f"Unsupported target type: {target_type!r}")
+
+
 def write_jsonl(path: str | Path, rows: Iterable[dict[str, Any]]) -> int:
     """Write JSONL records and return the number written."""
     destination = Path(path)

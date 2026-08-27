@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 from common import iter_json_records
 from mine_dpo_negatives import mine, stratified_sample
+from mine_model_confusion_negatives import build_document_targets
 from postprocess_dpo_urls import convert
 from prepare_bm25 import prepare
 
@@ -22,6 +23,24 @@ def write_rows(path: Path, rows: list[dict]) -> None:
 
 
 class VaultPipelineTest(unittest.TestCase):
+    def test_model_miner_accepts_structure_id_v3_targets(self) -> None:
+        forward, reverse, invalid = build_document_targets(
+            {
+                "target-a": {
+                    "text_id": "target-a",
+                    "structure_id_v3s": ["compare|arg|path one"],
+                },
+                "target-b": {
+                    "text_id": "target-b",
+                    "structure_id_v3s": ["other|arg|path two"],
+                },
+            },
+            "structure_id_v3",
+        )
+        self.assertEqual(invalid, 0)
+        self.assertEqual(forward["target-a"], "compare|arg|path one")
+        self.assertEqual(reverse["other|arg|path two"], "target-b")
+
     def test_postprocesses_mined_pairs_to_url_targets(self) -> None:
         with tempfile.TemporaryDirectory() as temp_directory:
             root = Path(temp_directory)
@@ -206,6 +225,92 @@ class VaultPipelineTest(unittest.TestCase):
             pair = next(iter_json_records(dpo_output))
             self.assertEqual(pair["chosen"], "target-a")
             self.assertEqual(pair["rejected"], "target-c")
+
+    def test_structure_id_v3_join_and_bm25_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            root = Path(temp_directory)
+            original = root / "original.jsonl"
+            augmentation = root / "augmentation.jsonl"
+            structures = root / "structures.jsonl"
+            work = root / "work"
+
+            write_rows(
+                original,
+                [
+                    {"numeric_id": "1", "text_id": "target-a", "text": "Query: shared query"},
+                    {"numeric_id": "2", "text_id": "target-b", "text": "Query: shared query"},
+                    {"numeric_id": "3", "text_id": "target-c", "text": "Query: different query"},
+                    {"numeric_id": "101", "text_id": "target-a", "text": "Code: def a; end"},
+                    {"numeric_id": "102", "text_id": "target-b", "text": "Code: def b; end"},
+                    {"numeric_id": "103", "text_id": "target-c", "text": "Code: def c; end"},
+                ],
+            )
+            write_rows(
+                structures,
+                [
+                    {"numeric_id": "1", "structure_id_v3": "shared_a|arg|path one"},
+                    {"numeric_id": "2", "structure_id_v3": "shared_b|arg|path two"},
+                    {"numeric_id": "3", "structure_id_v3": "different|arg|path three"},
+                ],
+            )
+            write_rows(augmentation, [{"text_id": 1, "text": "generated query"}])
+
+            prepare_stats = prepare(
+                SimpleNamespace(
+                    train_original=str(original),
+                    test_original=[],
+                    augmentation=str(augmentation),
+                    output_dir=str(work),
+                    augmentation_id_mode="auto",
+                    code_only=False,
+                    strict=True,
+                    structure_id_source=[str(structures)],
+                    structure_id_field="structure_id_v3",
+                )
+            )
+            self.assertEqual(prepare_stats["documents_with_structure_id_v3"], 3)
+            query = next(iter_json_records(work / "query_metadata.jsonl"))
+            self.assertEqual(query["target_structure_id_v3"], "shared_a|arg|path one")
+            self.assertEqual(
+                query["positive_structure_id_v3s"],
+                ["shared_a|arg|path one", "shared_b|arg|path two"],
+            )
+
+            run = work / "run.txt"
+            run.write_text(
+                "\n".join(
+                    [
+                        "vault-000000000 Q0 target-a 1 10.0 test",
+                        "vault-000000000 Q0 target-b 2 9.0 test",
+                        "vault-000000000 Q0 target-c 3 8.0 test",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            output = work / "dpo_structure.jsonl"
+            stats = mine(
+                SimpleNamespace(
+                    run=str(run),
+                    query_metadata=str(work / "query_metadata.jsonl"),
+                    document_metadata=str(work / "document_metadata.jsonl"),
+                    output=str(output),
+                    triples_output=None,
+                    negatives_per_query=1,
+                    rank_ranges=[(1, 100)],
+                    seed=42,
+                    pair_all_positives=False,
+                    fill_shortfall=False,
+                    rank_quotas=None,
+                    target_type="structure_id_v3",
+                )
+            )
+            self.assertEqual(stats["filtered_multi_label_or_target_hits"], 2)
+            pair = next(iter_json_records(output))
+            self.assertEqual(pair["chosen"], "shared_a|arg|path one")
+            self.assertEqual(pair["rejected"], "different|arg|path three")
+            self.assertEqual(pair["chosen_text_id"], "target-a")
+            self.assertEqual(pair["rejected_text_id"], "target-c")
 
 
 if __name__ == "__main__":

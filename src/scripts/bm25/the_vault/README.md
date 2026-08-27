@@ -111,6 +111,63 @@ The default creates pairs only for the augmentation row's mapped target. Add
 `--pair-all-positives` if every valid multi-label target should also be emitted as
 a `chosen` response.
 
+## structure_id_v3 targets
+
+The structure target source is joined by `numeric_id`. Keep the legacy `text_id`
+as the Lucene/Pyserini document key because `structure_id_v3` values may contain
+spaces. BM25 filtering still operates on canonical text IDs, while the final
+`chosen` and `rejected` fields contain structure targets.
+
+First create SFT-ready data. `--expand-multilabel` writes one scalar training row
+per valid structure target; the original text-ID group remains in audit fields.
+
+```bash
+python src/scripts/preprocess/merge_structure_id_v3.py \
+  --input /data/Ruby_ready_to_feed_multilabel.jsonl \
+  --original /data/Ruby_train_r32.0.json \
+  --original /data/Ruby_test_r32.0.json \
+  --structure-source /home/users/congthanh_le/scratch/veil/CodeGR/data/augmented_dsi/Ruby_merged.jsonl \
+  --output /data/Ruby_ready_to_feed_structure_id_v3.jsonl \
+  --expand-multilabel
+```
+
+For BM25-only structure DPO pairs:
+
+```bash
+python src/scripts/bm25/the_vault/run_pipeline.py \
+  --train-original /data/Ruby_train_r32.0.json \
+  --test-original /data/Ruby_test_r32.0.json \
+  --augmentation /data/Ruby_ready_to_feed_numeric.jsonl \
+  --structure-id-source /home/users/congthanh_le/scratch/veil/CodeGR/data/augmented_dsi/Ruby_merged.jsonl \
+  --target-type structure_id_v3 \
+  --work-dir /data/vault_bm25_structure_v3
+```
+
+This writes `dpo_pairs_structure_id_v3.jsonl`. For hybrid BM25 plus
+model-confusion mining and DPO training, point `CHECKPOINT_PATH` at an SFT
+checkpoint already trained on `structure_id_v3` and run:
+
+```bash
+CHECKPOINT_PATH=/models/ruby-structure-v3-sft/checkpoint-N \
+bash src/scripts/ddro/run_vault_structure_v3_hybrid_mining_and_dpo.sh
+```
+
+For the simpler BM25-only hard-negative baseline, the dedicated launcher uses
+the structure-v3 checkpoint and mapping paths as defaults:
+
+```bash
+bash src/scripts/ddro/run_vault_structure_v3_bm25_and_dpo.sh
+```
+
+It mines `dpo_pairs_structure_id_v3.jsonl` directly from BM25 and sends that
+file to `train_ddro_vault.py`; it does not run model-confusion mining or hybrid
+combination.
+
+Preparation fails if one `numeric_id` maps to conflicting structure IDs. Model
+mining also rejects ambiguous structure targets, tokenizer collisions, and
+targets longer than `MAX_TARGET_LENGTH` unless the corresponding policy is set
+to `skip`.
+
 ## Performance on large augmentation files
 
 With 200,000 pseudo-queries and `--hits 200`, Pyserini may write 40 million
