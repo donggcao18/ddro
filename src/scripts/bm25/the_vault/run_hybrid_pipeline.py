@@ -28,7 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--structure-id-source",
         action="append",
         default=[],
-        help="JSON/JSONL containing numeric_id -> structure_id_v3 mappings.",
+        help="JSON/JSONL containing url_based_id -> structure_id_v3 mappings.",
     )
     parser.add_argument("--work-dir", required=True)
     parser.add_argument("--checkpoint-path", required=True)
@@ -37,6 +37,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["text_id", "url", "structure_id_v3"],
         default="text_id",
         help="Decoder target namespace for model mining and the final hybrid file.",
+    )
+    parser.add_argument(
+        "--structure-id-join-key",
+        choices=["url_based_id", "numeric_id"],
+        default="url_based_id",
     )
     parser.add_argument(
         "--target-collision-policy",
@@ -165,6 +170,8 @@ def main() -> None:
             str(args.seed),
             "--target-type",
             args.target_type if args.target_type != "url" else "text_id",
+            "--structure-id-join-key",
+            args.structure_id_join_key,
         ]
         for test_path in args.test_original:
             bm25_command.extend(["--test-original", test_path])

@@ -84,6 +84,7 @@ if [[ "${RUN_BM25}" == "1" ]]; then
     --train-original "${TRAIN_ORIGINAL}"
     --augmentation "${AUGMENTATION}"
     --structure-id-source "${STRUCTURE_ID_SOURCE}"
+    --structure-id-join-key url_based_id
     --target-type structure_id_v3
     --work-dir "${WORK_DIR}"
     --threads "${BM25_THREADS}"

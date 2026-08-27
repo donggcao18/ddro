@@ -27,13 +27,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--structure-id-source",
         action="append",
         default=[],
-        help="JSON/JSONL containing numeric_id -> structure_id_v3 mappings.",
+        help="JSON/JSONL containing url_based_id -> structure_id_v3 mappings.",
     )
     parser.add_argument(
         "--target-type",
         choices=["text_id", "structure_id_v3"],
         default="text_id",
         help="Decoder target namespace for the mined DPO pairs.",
+    )
+    parser.add_argument(
+        "--structure-id-join-key",
+        choices=["url_based_id", "numeric_id"],
+        default="url_based_id",
+        help="Cross-file key used to attach structure_id_v3 metadata.",
     )
     parser.add_argument("--threads", type=int, default=16)
     parser.add_argument("--batch-size", type=int, default=16)
@@ -78,6 +84,9 @@ def main() -> None:
         prepare_command.extend(["--test-original", test_path])
     for structure_path in args.structure_id_source:
         prepare_command.extend(["--structure-id-source", structure_path])
+    prepare_command.extend(
+        ["--structure-id-join-key", args.structure_id_join_key]
+    )
     if args.target_type == "structure_id_v3" and not args.structure_id_source:
         raise ValueError(
             "--target-type structure_id_v3 requires --structure-id-source"

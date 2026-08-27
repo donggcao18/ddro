@@ -85,6 +85,7 @@ MINING_ARGS=(
   --train-original "${TRAIN_ORIGINAL}"
   --augmentation "${AUGMENTATION}"
   --structure-id-source "${STRUCTURE_ID_SOURCE}"
+  --structure-id-join-key url_based_id
   --work-dir "${WORK_DIR}"
   --checkpoint-path "${CHECKPOINT_PATH}"
   --target-type structure_id_v3

@@ -237,23 +237,26 @@ class VaultPipelineTest(unittest.TestCase):
             write_rows(
                 original,
                 [
-                    {"numeric_id": "1", "text_id": "target-a", "text": "Query: shared query"},
-                    {"numeric_id": "2", "text_id": "target-b", "text": "Query: shared query"},
-                    {"numeric_id": "3", "text_id": "target-c", "text": "Query: different query"},
-                    {"numeric_id": "101", "text_id": "target-a", "text": "Code: def a; end"},
-                    {"numeric_id": "102", "text_id": "target-b", "text": "Code: def b; end"},
-                    {"numeric_id": "103", "text_id": "target-c", "text": "Code: def c; end"},
+                    {"numeric_id": "1", "text_id": "target-a", "url_based_id": "repo/a.rb/a()", "text": "Query: shared query"},
+                    {"numeric_id": "2", "text_id": "target-b", "url_based_id": "repo/b.rb/b()", "text": "Query: shared query"},
+                    {"numeric_id": "3", "text_id": "target-c", "url_based_id": "repo/c.rb/c()", "text": "Query: different query"},
+                    {"numeric_id": "101", "text_id": "target-a", "url_based_id": "repo/a.rb/a()", "text": "Code: def a; end"},
+                    {"numeric_id": "102", "text_id": "target-b", "url_based_id": "repo/b.rb/b()", "text": "Code: def b; end"},
+                    {"numeric_id": "103", "text_id": "target-c", "url_based_id": "repo/c.rb/c()", "text": "Code: def c; end"},
                 ],
             )
             write_rows(
                 structures,
                 [
-                    {"numeric_id": "1", "structure_id_v3": "shared_a|arg|path one"},
-                    {"numeric_id": "2", "structure_id_v3": "shared_b|arg|path two"},
-                    {"numeric_id": "3", "structure_id_v3": "different|arg|path three"},
+                    {"numeric_id": "9001", "url_based_id": "repo/a.rb/a()", "structure_id_v3": "shared_a|arg|path one"},
+                    {"numeric_id": "9002", "url_based_id": "repo/b.rb/b()", "structure_id_v3": "shared_b|arg|path two"},
+                    {"numeric_id": "9003", "url_based_id": "repo/c.rb/c()", "structure_id_v3": "different|arg|path three"},
                 ],
             )
-            write_rows(augmentation, [{"text_id": 1, "text": "generated query"}])
+            write_rows(
+                augmentation,
+                [{"text_id": 1, "url_based_id": "repo/a.rb/a()", "text": "generated query"}],
+            )
 
             prepare_stats = prepare(
                 SimpleNamespace(
@@ -266,6 +269,7 @@ class VaultPipelineTest(unittest.TestCase):
                     strict=True,
                     structure_id_source=[str(structures)],
                     structure_id_field="structure_id_v3",
+                    structure_id_join_key="url_based_id",
                 )
             )
             self.assertEqual(prepare_stats["documents_with_structure_id_v3"], 3)

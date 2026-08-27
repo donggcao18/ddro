@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Join structure_id_v3 targets into Vault SFT data through numeric_id."""
+"""Join structure_id_v3 targets into Vault SFT data by stable document key."""
 
 from __future__ import annotations
 
@@ -55,60 +55,70 @@ def id_list(value: Any) -> list[str]:
     return output
 
 
-def load_numeric_mapping(path: str, field: str) -> tuple[dict[str, str], dict[str, int]]:
+def join_value(row: dict[str, Any], join_key: str) -> str:
+    if join_key == "url_based_id":
+        return string_value(row.get("url_based_id", row.get("url_id", "")))
+    return string_value(row.get(join_key))
+
+
+def load_structure_mapping(
+    path: str, field: str, join_key: str
+) -> tuple[dict[str, str], dict[str, int | str]]:
     mapping: dict[str, str] = {}
     stats = defaultdict(int)
     for row_number, row in enumerate(iter_json_records(path), start=1):
         stats["source_rows"] += 1
-        numeric_id = string_value(row.get("numeric_id"))
+        key = join_value(row, join_key)
         target = string_value(row.get(field))
-        if not numeric_id:
-            stats["source_missing_numeric_id"] += 1
+        if not key:
+            stats["source_missing_join_key"] += 1
             continue
         if not target:
             stats["source_missing_target"] += 1
             continue
-        previous = mapping.get(numeric_id)
+        previous = mapping.get(key)
         if previous is not None and previous != target:
             raise ValueError(
-                f"numeric_id {numeric_id!r} maps to both {previous!r} and "
+                f"{join_key} {key!r} maps to both {previous!r} and "
                 f"{target!r} at {path}:{row_number}"
             )
-        mapping[numeric_id] = target
-    stats["source_numeric_ids"] = len(mapping)
+        mapping[key] = target
+    stats["join_key"] = join_key
+    stats["source_join_keys"] = len(mapping)
     return mapping, dict(stats)
 
 
 def load_legacy_bridge(
-    original_paths: list[str], numeric_to_structure: dict[str, str]
+    original_paths: list[str], key_to_structure: dict[str, str], join_key: str
 ) -> tuple[dict[str, str], dict[str, set[str]]]:
-    numeric_to_legacy: dict[str, str] = {}
+    key_to_legacy: dict[str, str] = {}
     legacy_to_structures: dict[str, set[str]] = defaultdict(set)
     for path in original_paths:
         for row_number, row in enumerate(iter_json_records(path), start=1):
-            numeric_id = string_value(row.get("numeric_id"))
+            key = join_value(row, join_key)
             legacy_id = string_value(row.get("text_id"))
-            if not numeric_id or not legacy_id:
+            if not key or not legacy_id:
                 continue
-            previous = numeric_to_legacy.get(numeric_id)
+            previous = key_to_legacy.get(key)
             if previous is not None and previous != legacy_id:
                 raise ValueError(
-                    f"numeric_id {numeric_id!r} maps to both {previous!r} and "
+                    f"{join_key} {key!r} maps to both {previous!r} and "
                     f"{legacy_id!r} at {path}:{row_number}"
                 )
-            numeric_to_legacy[numeric_id] = legacy_id
-            structure_id = numeric_to_structure.get(numeric_id)
+            key_to_legacy[key] = legacy_id
+            structure_id = key_to_structure.get(key)
             if structure_id:
                 legacy_to_structures[legacy_id].add(structure_id)
-    return numeric_to_legacy, legacy_to_structures
+    return key_to_legacy, legacy_to_structures
 
 
 def merge(args: argparse.Namespace) -> dict[str, Any]:
-    numeric_to_structure, stats = load_numeric_mapping(
-        args.structure_source, args.structure_id_field
+    join_key = getattr(args, "join_key", "url_based_id")
+    key_to_structure, stats = load_structure_mapping(
+        args.structure_source, args.structure_id_field, join_key
     )
-    numeric_to_legacy, legacy_to_structures = load_legacy_bridge(
-        args.original, numeric_to_structure
+    key_to_legacy, legacy_to_structures = load_legacy_bridge(
+        args.original, key_to_structure, join_key
     )
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -122,19 +132,21 @@ def merge(args: argparse.Namespace) -> dict[str, Any]:
         for row_number, row in enumerate(iter_json_records(args.input), start=1):
             counters["input_rows"] += 1
             numeric_id = string_value(row.get("numeric_id"))
-            target_structure = numeric_to_structure.get(numeric_id, "")
+            key = join_value(row, join_key)
+            target_structure = key_to_structure.get(key, "")
             if not target_structure:
                 counters["rows_missing_structure_id"] += 1
                 if args.on_missing == "error":
                     raise ValueError(
-                        f"No {args.structure_id_field} mapping for numeric_id="
-                        f"{numeric_id!r} at {args.input}:{row_number}"
+                        f"No {args.structure_id_field} mapping for {join_key}="
+                        f"{key!r} at {args.input}:{row_number}"
                     )
                 missing_handle.write(
                     json.dumps(
                         {
                             "row_number": row_number,
                             "numeric_id": numeric_id,
+                            join_key: key,
                             "reason": "missing_target_structure_id_v3",
                         },
                         ensure_ascii=False,
@@ -144,7 +156,7 @@ def merge(args: argparse.Namespace) -> dict[str, Any]:
                 continue
 
             positive_legacy_ids = id_list(row.get("text_id"))
-            current_legacy_id = numeric_to_legacy.get(numeric_id, "")
+            current_legacy_id = key_to_legacy.get(key, "")
             if current_legacy_id and current_legacy_id not in positive_legacy_ids:
                 positive_legacy_ids.append(current_legacy_id)
 
@@ -175,6 +187,7 @@ def merge(args: argparse.Namespace) -> dict[str, Any]:
                         {
                             "row_number": row_number,
                             "numeric_id": numeric_id,
+                            join_key: key,
                             "reason": "unmapped_positive_text_ids",
                             "text_ids": unmapped_legacy_ids,
                         },
@@ -198,7 +211,7 @@ def merge(args: argparse.Namespace) -> dict[str, Any]:
 
     counters.update(
         {
-            "legacy_numeric_ids": len(numeric_to_legacy),
+            "legacy_join_keys": len(key_to_legacy),
             "legacy_text_ids_with_structure": len(legacy_to_structures),
             "unique_unmapped_positive_text_ids": len(unique_unmapped_positive_ids),
             "missing_log": str(missing_log_path),
@@ -214,7 +227,7 @@ def merge(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Merge structure_id_v3 into Vault training data by numeric_id."
+        description="Merge structure_id_v3 into Vault training data by stable document key."
     )
     parser.add_argument("--input", required=True, help="Current ready-to-feed JSON/JSONL")
     parser.add_argument(
@@ -228,10 +241,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--original",
         action="append",
         required=True,
-        help="Original indexed train/test data used to bridge numeric_id to legacy text_id.",
+        help="Original indexed train/test data used to bridge the join key to legacy text_id.",
     )
     parser.add_argument("--output", required=True)
     parser.add_argument("--structure-id-field", default="structure_id_v3")
+    parser.add_argument(
+        "--join-key",
+        choices=["url_based_id", "numeric_id"],
+        default="url_based_id",
+        help="Cross-file identity key (default: url_based_id).",
+    )
     parser.add_argument(
         "--output-target-field",
         default="text_id",

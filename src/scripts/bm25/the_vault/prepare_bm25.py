@@ -23,45 +23,53 @@ from common import (
 )
 
 
+def structure_join_value(row: dict[str, Any], join_key: str) -> str:
+    if join_key == "url_based_id":
+        return as_text_id(row.get("url_based_id", row.get("url_id", ""))).strip()
+    return as_text_id(row.get(join_key)).strip()
+
+
 def load_structure_id_map(
-    paths: list[Path], field: str
-) -> tuple[dict[str, str], dict[str, int]]:
-    """Load a validated numeric_id -> structure target mapping."""
-    numeric_to_structure: dict[str, str] = {}
+    paths: list[Path], field: str, join_key: str
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """Load a validated join-key -> structure target mapping."""
+    key_to_structure: dict[str, str] = {}
     rows = 0
-    missing_numeric_id = 0
+    missing_join_key = 0
     missing_structure_id = 0
 
     for path in paths:
         for row_number, row in enumerate(iter_json_records(path), start=1):
             rows += 1
-            numeric_id = as_text_id(row.get("numeric_id"))
+            key = structure_join_value(row, join_key)
             structure_id = as_text_id(row.get(field)).strip()
-            if not numeric_id:
-                missing_numeric_id += 1
+            if not key:
+                missing_join_key += 1
                 continue
             if not structure_id:
                 missing_structure_id += 1
                 continue
-            previous = numeric_to_structure.get(numeric_id)
+            previous = key_to_structure.get(key)
             if previous is not None and previous != structure_id:
                 raise ValueError(
-                    f"numeric_id {numeric_id!r} maps to multiple {field} values: "
+                    f"{join_key} {key!r} maps to multiple {field} values: "
                     f"{previous!r} and {structure_id!r} ({path}:{row_number})"
                 )
-            numeric_to_structure[numeric_id] = structure_id
+            key_to_structure[key] = structure_id
 
-    return numeric_to_structure, {
+    return key_to_structure, {
+        "structure_join_key": join_key,
         "structure_source_rows": rows,
-        "structure_source_numeric_ids": len(numeric_to_structure),
-        "structure_source_rows_missing_numeric_id": missing_numeric_id,
+        "structure_source_join_keys": len(key_to_structure),
+        "structure_source_rows_missing_join_key": missing_join_key,
         "structure_source_rows_missing_target": missing_structure_id,
     }
 
 
 def build_original_indexes(
     paths: list[Path],
-    numeric_to_structure: dict[str, str] | None = None,
+    key_to_structure: dict[str, str] | None = None,
+    structure_join_key: str = "url_based_id",
 ) -> dict[str, Any]:
     """Index Vault metadata and reproduce its normalized-query multi-label map."""
     numeric_to_target: dict[str, str] = {}
@@ -138,13 +146,18 @@ def build_original_indexes(
     for text_id in target_metadata:
         target_to_positives[text_id].add(text_id)
 
-    if numeric_to_structure:
+    if key_to_structure:
         for metadata in target_metadata.values():
+            metadata_keys = (
+                metadata["url_based_ids"]
+                if structure_join_key == "url_based_id"
+                else metadata["numeric_ids"]
+            )
             metadata["structure_id_v3s"] = sorted(
                 {
-                    numeric_to_structure[numeric_id]
-                    for numeric_id in metadata["numeric_ids"]
-                    if numeric_id in numeric_to_structure
+                    key_to_structure[key]
+                    for key in metadata_keys
+                    if key in key_to_structure
                 }
             )
 
@@ -234,10 +247,13 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         Path(path) for path in getattr(args, "structure_id_source", [])
     ]
     structure_field = getattr(args, "structure_id_field", "structure_id_v3")
-    numeric_to_structure, structure_stats = load_structure_id_map(
-        structure_sources, structure_field
+    structure_join_key = getattr(args, "structure_id_join_key", "url_based_id")
+    key_to_structure, structure_stats = load_structure_id_map(
+        structure_sources, structure_field, structure_join_key
     )
-    indexes = build_original_indexes(original_paths, numeric_to_structure)
+    indexes = build_original_indexes(
+        original_paths, key_to_structure, structure_join_key
+    )
     code_rows = indexes["code_rows"]
     target_metadata = indexes["target_metadata"]
     target_to_positives = indexes["target_to_positives"]
@@ -303,7 +319,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             "is_original": bool(row.get("is_original", False)),
             "augmentation_row": row_number,
         }
-        if numeric_to_structure:
+        if key_to_structure:
             positive_structure_ids = sorted(
                 {
                     structure_id
@@ -313,7 +329,8 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                     )
                 }
             )
-            target_structure_id = numeric_to_structure.get(numeric_id, "")
+            target_join_key = structure_join_value(row, structure_join_key)
+            target_structure_id = key_to_structure.get(target_join_key, "")
             if not target_structure_id:
                 target_values = document_targets(
                     target_metadata.get(target, {}), "structure_id_v3"
@@ -374,7 +391,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         "queries_missing_target_structure_id_v3": sum(
             not row.get("target_structure_id_v3")
             for row in query_metadata
-            if numeric_to_structure
+            if key_to_structure
         ),
     }
     with (output_dir / "prepare_stats.json").open("w", encoding="utf-8") as handle:
@@ -402,7 +419,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help=(
-            "JSON/JSONL containing numeric_id and structure_id_v3. Repeatable; "
+            "JSON/JSONL containing url_based_id and structure_id_v3. Repeatable; "
             "used to enrich BM25 metadata without changing Lucene document IDs."
         ),
     )
@@ -410,6 +427,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--structure-id-field",
         default="structure_id_v3",
         help="Structure target field in --structure-id-source.",
+    )
+    parser.add_argument(
+        "--structure-id-join-key",
+        choices=["url_based_id", "numeric_id"],
+        default="url_based_id",
+        help="Cross-file identity key for structure metadata (default: url_based_id).",
     )
     parser.add_argument(
         "--augmentation-id-mode",

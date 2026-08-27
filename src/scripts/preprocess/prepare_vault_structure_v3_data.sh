@@ -29,6 +29,7 @@ done
   --original "${TRAIN_ORIGINAL}" \
   --original "${TEST_ORIGINAL}" \
   --structure-source "${STRUCTURE_ID_SOURCE}" \
+  --join-key url_based_id \
   --output "${OUTPUT_FILE}" \
   --expand-multilabel \
   --on-missing skip

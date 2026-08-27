@@ -16,7 +16,7 @@ def write_rows(path: Path, rows: list[dict]) -> None:
 
 
 class MergeStructureIdV3Test(unittest.TestCase):
-    def test_joins_by_numeric_id_and_expands_multilabel_targets(self) -> None:
+    def test_joins_by_url_when_numeric_ids_differ(self) -> None:
         with tempfile.TemporaryDirectory() as temp_directory:
             root = Path(temp_directory)
             original = root / "original.jsonl"
@@ -26,22 +26,23 @@ class MergeStructureIdV3Test(unittest.TestCase):
             write_rows(
                 original,
                 [
-                    {"numeric_id": "1", "text_id": "legacy-a"},
-                    {"numeric_id": "2", "text_id": "legacy-b"},
+                    {"numeric_id": "1", "text_id": "legacy-a", "url_based_id": "repo/a.rb/a()"},
+                    {"numeric_id": "2", "text_id": "legacy-b", "url_based_id": "repo/b.rb/b()"},
                 ],
             )
             write_rows(
                 structures,
                 [
-                    {"numeric_id": "1", "structure_id_v3": "structure a"},
-                    {"numeric_id": "2", "structure_id_v3": "structure b"},
+                    {"numeric_id": "9001", "url_based_id": "repo/a.rb/a()", "structure_id_v3": "structure a"},
+                    {"numeric_id": "9002", "url_based_id": "repo/b.rb/b()", "structure_id_v3": "structure b"},
                 ],
             )
             write_rows(
                 current,
                 [
                     {
-                        "numeric_id": "1",
+                        "numeric_id": "5001",
+                        "url_based_id": "repo/a.rb/a()",
                         "text_id": ["legacy-a", "legacy-b"],
                         "text": "shared query",
                     }
@@ -55,6 +56,7 @@ class MergeStructureIdV3Test(unittest.TestCase):
                     original=[str(original)],
                     output=str(output),
                     structure_id_field="structure_id_v3",
+                    join_key="url_based_id",
                     output_target_field="text_id",
                     expand_multilabel=True,
                     on_missing="error",
@@ -79,19 +81,20 @@ class MergeStructureIdV3Test(unittest.TestCase):
             write_rows(
                 original,
                 [
-                    {"numeric_id": "1", "text_id": "legacy-a"},
-                    {"numeric_id": "2", "text_id": "legacy-missing"},
+                    {"numeric_id": "1", "text_id": "legacy-a", "url_based_id": "repo/a.rb/a()"},
+                    {"numeric_id": "2", "text_id": "legacy-missing", "url_based_id": "repo/b.rb/b()"},
                 ],
             )
             write_rows(
                 structures,
-                [{"numeric_id": "1", "structure_id_v3": "structure a"}],
+                [{"numeric_id": "9001", "url_based_id": "repo/a.rb/a()", "structure_id_v3": "structure a"}],
             )
             write_rows(
                 current,
                 [
                     {
                         "numeric_id": "1",
+                        "url_based_id": "repo/a.rb/a()",
                         "text_id": ["legacy-a", "legacy-missing"],
                         "text": "shared query",
                     }
@@ -105,6 +108,7 @@ class MergeStructureIdV3Test(unittest.TestCase):
                     original=[str(original)],
                     output=str(output),
                     structure_id_field="structure_id_v3",
+                    join_key="url_based_id",
                     output_target_field="text_id",
                     expand_multilabel=True,
                     on_missing="skip",

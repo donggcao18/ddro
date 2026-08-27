@@ -113,10 +113,11 @@ a `chosen` response.
 
 ## structure_id_v3 targets
 
-The structure target source is joined by `numeric_id`. Keep the legacy `text_id`
-as the Lucene/Pyserini document key because `structure_id_v3` values may contain
-spaces. BM25 filtering still operates on canonical text IDs, while the final
-`chosen` and `rejected` fields contain structure targets.
+The structure target source is joined by exact `url_based_id` by default because
+`numeric_id` can change between dataset builds. Keep the legacy `text_id` as the
+Lucene/Pyserini document key because `structure_id_v3` values may contain spaces.
+BM25 filtering still operates on canonical text IDs, while the final `chosen`
+and `rejected` fields contain structure targets.
 
 First create SFT-ready data. `--expand-multilabel` writes one scalar training row
 per valid structure target; the original text-ID group remains in audit fields.
@@ -127,6 +128,7 @@ python src/scripts/preprocess/merge_structure_id_v3.py \
   --original /data/Ruby_train_r32.0.json \
   --original /data/Ruby_test_r32.0.json \
   --structure-source /home/users/congthanh_le/scratch/veil/CodeGR/data/augmented_dsi/Ruby_merged.jsonl \
+  --join-key url_based_id \
   --output /data/Ruby_ready_to_feed_structure_id_v3.jsonl \
   --expand-multilabel
 ```
@@ -139,6 +141,7 @@ python src/scripts/bm25/the_vault/run_pipeline.py \
   --test-original /data/Ruby_test_r32.0.json \
   --augmentation /data/Ruby_ready_to_feed_numeric.jsonl \
   --structure-id-source /home/users/congthanh_le/scratch/veil/CodeGR/data/augmented_dsi/Ruby_merged.jsonl \
+  --structure-id-join-key url_based_id \
   --target-type structure_id_v3 \
   --work-dir /data/vault_bm25_structure_v3
 ```
@@ -163,7 +166,7 @@ It mines `dpo_pairs_structure_id_v3.jsonl` directly from BM25 and sends that
 file to `train_ddro_vault.py`; it does not run model-confusion mining or hybrid
 combination.
 
-Preparation fails if one `numeric_id` maps to conflicting structure IDs. Model
+Preparation fails if one `url_based_id` maps to conflicting structure IDs. Model
 mining also rejects ambiguous structure targets, tokenizer collisions, and
 targets longer than `MAX_TARGET_LENGTH` unless the corresponding policy is set
 to `skip`.
