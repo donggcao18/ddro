@@ -15,7 +15,9 @@ AUGMENTATION="${AUGMENTATION:-${DATA_ROOT}/Ruby_ready_to_feed_multilabel.jsonl}"
 STRUCTURE_ID_SOURCE="${STRUCTURE_ID_SOURCE:-/home/users/congthanh_le/scratch/veil/CodeGR/data/augmented_dsi/Ruby_merged.jsonl}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-/home/users/congthanh_le/scratch/veil/CodeGR/outputs/DSI_Ruby_structure_v3__qg_t5/checkpoint-130000}"
 WORK_DIR="${WORK_DIR:-/home/users/congthanh_le/scratch/east/ddro/data/vault_bm25_structure_v3}"
-DPO_OUTPUT_DIR="${DPO_OUTPUT_DIR:-/home/users/congthanh_le/scratch/east/ddro/outputs/vault-ruby-structure-v3-bm25-dpo-t5-base}"
+PREFERENCE_OBJECTIVE="${PREFERENCE_OBJECTIVE:-dpo}"
+TDPO_ALPHA="${TDPO_ALPHA:-0.5}"
+DPO_OUTPUT_DIR="${DPO_OUTPUT_DIR:-/home/users/congthanh_le/scratch/east/ddro/outputs/vault-ruby-structure-v3-bm25-${PREFERENCE_OBJECTIVE}-t5-base}"
 
 BM25_PYTHON_BIN="${BM25_PYTHON_BIN:-python}"
 DPO_PYTHON_BIN="${DPO_PYTHON_BIN:-python}"
@@ -37,6 +39,7 @@ SEED="${SEED:-42}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-256}"
 MAX_TARGET_LENGTH="${MAX_TARGET_LENGTH:-128}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-2}"
+MAX_STEPS="${MAX_STEPS:--1}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-32}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
@@ -123,6 +126,9 @@ TRAIN_ARGS=(
   --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}"
   --learning_rate "${LEARNING_RATE}"
   --beta "${DPO_BETA}"
+  --preference_objective "${PREFERENCE_OBJECTIVE}"
+  --tdpo_alpha "${TDPO_ALPHA}"
+  --max_steps "${MAX_STEPS}"
   --eval_steps "${EVAL_STEPS}"
   --save_steps "${SAVE_STEPS}"
   --seed "${SEED}"
@@ -130,7 +136,7 @@ TRAIN_ARGS=(
 )
 add_precision_flag TRAIN_ARGS
 
-echo "=== Stage 2/2: DPO validation and training ==="
+echo "=== Stage 2/2: ${PREFERENCE_OBJECTIVE} validation and training ==="
 if [[ "${RUN_DRY_RUN}" == "1" ]]; then
   "${DPO_PYTHON_BIN}" "${TRAIN_ARGS[@]}" --dry_run
 fi

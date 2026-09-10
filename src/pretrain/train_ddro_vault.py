@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train DDRO/DPO for Vault from a Hugging Face Trainer checkpoint.
+"""Train DPO, TDPO1, or TDPO2 for Vault from a Hugging Face Trainer checkpoint.
 
 The input checkpoint must be a directory produced by ``Trainer`` or
 ``save_pretrained``.  In particular, a directory containing ``config.json``,
@@ -32,6 +32,8 @@ from transformers import (
 )
 from trl import DPOConfig, DPOTrainer
 
+from tdpo_trainer import PreferenceConfig, TokenDPOTrainer
+
 
 PREFERENCE_COLUMNS = ("prompt", "chosen", "rejected")
 
@@ -53,7 +55,7 @@ def unit_interval(value: str) -> float:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Train encoder-decoder DPO from a complete Hugging Face checkpoint "
+            "Train encoder-decoder DPO/TDPO from a complete Hugging Face checkpoint "
             "and prompt/chosen/rejected JSONL data."
         )
     )
@@ -85,6 +87,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--warmup_ratio", type=unit_interval, default=0.1)
     parser.add_argument("--beta", type=positive_float, default=0.4)
+    parser.add_argument(
+        "--preference_objective", choices=["dpo", "tdpo1", "tdpo2"], default="dpo"
+    )
+    parser.add_argument(
+        "--tdpo_alpha", type=float, default=0.5,
+        help="TDPO2 KL weight; ignored by DPO/TDPO1.",
+    )
+    parser.add_argument(
+        "--max_steps", type=int, default=-1,
+        help="Override epochs, useful for a short training smoke test.",
+    )
     parser.add_argument("--max_grad_norm", type=positive_float, default=0.5)
 
     parser.add_argument("--logging_steps", type=int, default=10)
@@ -338,7 +351,10 @@ def print_preflight(
 def build_training_args(args: argparse.Namespace, has_eval: bool) -> DPOConfig:
     report_to = [] if args.report_to.lower() == "none" else [args.report_to]
     strategy = "steps" if has_eval else "no"
-    return DPOConfig(
+    return PreferenceConfig(
+        preference_objective=args.preference_objective,
+        tdpo_alpha=args.tdpo_alpha,
+        max_steps=args.max_steps,
         output_dir=args.output_dir,
         run_name=args.run_name,
         seed=args.seed,
@@ -391,6 +407,12 @@ def main() -> None:
     checkpoint_path = validate_checkpoint(args.checkpoint_path)
     set_seed(args.seed)
     datasets = load_preference_datasets(args)
+    has_eval = "validation" in datasets
+    training_args = build_training_args(args, has_eval)
+    print(
+        f"Preference objective: {args.preference_objective}, "
+        f"beta={args.beta}, alpha={args.tdpo_alpha}"
+    )
     tokenizer, config = load_tokenizer_and_config(
         checkpoint_path, args.trust_remote_code
     )
@@ -419,13 +441,11 @@ def main() -> None:
     if args.gradient_checkpointing:
         model.config.use_cache = False
 
-    has_eval = "validation" in datasets
     if has_eval and args.save_steps % args.eval_steps:
         raise ValueError(
             "When validation is enabled, --save_steps must be a multiple of "
             "--eval_steps so load_best_model_at_end can select a matching checkpoint."
         )
-    training_args = build_training_args(args, has_eval)
     callbacks = []
     if has_eval and args.early_stopping_patience > 0:
         callbacks.append(
@@ -434,7 +454,8 @@ def main() -> None:
             )
         )
 
-    trainer = DPOTrainer(
+    trainer_class = DPOTrainer if args.preference_objective == "dpo" else TokenDPOTrainer
+    trainer = trainer_class(
         model=model,
         ref_model=reference_model,
         args=training_args,
