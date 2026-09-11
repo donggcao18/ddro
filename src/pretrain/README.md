@@ -59,6 +59,41 @@ When resuming through `--resume_from_checkpoint`, pass the same objective,
 alpha, beta, and original SFT checkpoint used for that run. The CLI flags select
 the objective; they are not automatically restored from a checkpoint.
 
+## Diagnosing Distributed Startup Hangs
+
+Add `--startup_debug 60` to the Python training arguments on all ranks, and add
+`--log-dir ./logs/tdpo-startup --tee 3` to `torchrun` before the script path.
+This enables flushed rank/PID/time markers and Python stack dumps every 60
+seconds until the trainer constructor returns. Dumps during healthy, slow
+startup are expected too: a dump is a snapshot, not itself an exception.
+They go to each rank's stderr, captured in torchrun's log directory.
+
+After TrainingArguments initializes distributed state, a one-element all-reduce
+tests the process group on the assigned device before loading models and
+entering TRL's rank-zero-first tokenization block. It logs `Communication probe
+BEGIN` and `Communication probe PASSED` with the expected world-size sum. The
+probe initializes communication earlier than normal and may change the symptom;
+it is a diagnostic, not proof that the original problem has been fixed.
+
+If the probe stalls, inspect both ranks' stacks and device/backend markers. If
+both ranks pass but trainer initialization stalls, inspect rank zero's stack
+for dataset/cache work versus a distributed/CUDA wait. A 100% tokenization bar
+does not prove the surrounding dataset operation and synchronization completed.
+The rank-one NCCL store timeout alone cannot distinguish these cases.
+
+Keep the same data, SFT reference, TDPO settings, and resume checkpoint. These
+diagnostics do not change the objective or checkpoint format and are disabled
+by default. They do not skip training: a successful startup resumes the normal
+run, and the periodic dumps stop before `trainer.train`. No dependency upgrade
+is needed. A Python stack may identify a native call without showing the native
+code's internal wait, so further CUDA/NCCL diagnostics may still be necessary.
+
+The diagnostics' control flow can be tested without installing ML libraries:
+
+```bash
+python -m unittest discover -s src/pretrain -p test_startup_diagnostics.py
+```
+
 ## Verification
 
 ```bash

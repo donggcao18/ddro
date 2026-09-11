@@ -33,6 +33,7 @@ from transformers import (
 from trl import DPOConfig, DPOTrainer
 
 from tdpo_trainer import PreferenceConfig, TokenDPOTrainer
+from startup_diagnostics import StartupDiagnostics
 
 
 PREFERENCE_COLUMNS = ("prompt", "chosen", "rejected")
@@ -76,6 +77,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validation_split", type=unit_interval, default=0.01)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dataset_num_proc", type=int, default=8)
+    parser.add_argument(
+        "--startup_debug", type=int, default=0, metavar="SECONDS",
+        help=(
+            "Opt-in startup diagnostics: dump Python stacks every SECONDS, log rank "
+            "progress, and probe distributed communication before trainer initialization. "
+            "0 disables diagnostics. Use the same value on all ranks."
+        ),
+    )
 
     parser.add_argument("--max_prompt_length", type=int, default=128)
     parser.add_argument("--max_target_length", type=int, default=32)
@@ -395,6 +404,11 @@ def build_training_args(args: argparse.Namespace, has_eval: bool) -> DPOConfig:
 
 def main() -> None:
     args = parse_args()
+    with StartupDiagnostics(args.startup_debug) as debug:
+        run_training(args, debug)
+
+
+def run_training(args: argparse.Namespace, debug: StartupDiagnostics) -> None:
     if args.max_prompt_length <= 0 or args.max_target_length <= 0:
         raise ValueError("Token length limits must be greater than zero")
     if args.dataset_num_proc <= 0:
@@ -404,15 +418,23 @@ def main() -> None:
     if args.early_stopping_patience < 0:
         raise ValueError("--early_stopping_patience cannot be negative")
 
+    debug.mark("Validating SFT checkpoint")
     checkpoint_path = validate_checkpoint(args.checkpoint_path)
     set_seed(args.seed)
+    debug.mark("Loading and cleaning preference data BEGIN")
     datasets = load_preference_datasets(args)
+    debug.mark("Loading and cleaning preference data DONE")
     has_eval = "validation" in datasets
+    debug.mark("Training arguments / distributed initialization BEGIN")
     training_args = build_training_args(args, has_eval)
+    if args.startup_debug:
+        debug.probe(training_args.device)
+    debug.mark("Training arguments / distributed initialization DONE")
     print(
         f"Preference objective: {args.preference_objective}, "
         f"beta={args.beta}, alpha={args.tdpo_alpha}"
     )
+    debug.mark("Loading tokenizer and config BEGIN")
     tokenizer, config = load_tokenizer_and_config(
         checkpoint_path, args.trust_remote_code
     )
@@ -424,8 +446,10 @@ def main() -> None:
         args.max_target_length,
     )
 
+    debug.mark("Loading policy model BEGIN")
     model = load_policy_model(checkpoint_path, args.trust_remote_code)
     validate_model_tokenizer(model, tokenizer)
+    debug.mark("Loading policy model DONE")
     if args.dry_run:
         print(
             "Dry run successful: checkpoint, tokenizer, and preference data are compatible."
@@ -434,9 +458,11 @@ def main() -> None:
 
     # DPO compares the trainable policy against a frozen copy of the exact SFT
     # checkpoint. Trainer checkpoint files such as optimizer.pt are not loaded here.
+    debug.mark("Loading reference model BEGIN")
     reference_model = load_policy_model(checkpoint_path, args.trust_remote_code)
     reference_model.requires_grad_(False)
     reference_model.eval()
+    debug.mark("Loading reference model DONE")
 
     if args.gradient_checkpointing:
         model.config.use_cache = False
@@ -455,6 +481,7 @@ def main() -> None:
         )
 
     trainer_class = DPOTrainer if args.preference_objective == "dpo" else TokenDPOTrainer
+    debug.mark("Trainer initialization BEGIN (includes TRL tokenization and barriers)")
     trainer = trainer_class(
         model=model,
         ref_model=reference_model,
@@ -465,6 +492,8 @@ def main() -> None:
         is_encoder_decoder=True,
         callbacks=callbacks,
     )
+    debug.mark("Trainer initialization DONE; entering train/resume")
+    debug.stop()
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
 
     # Keep checkpoints resumable in output_dir and place the portable inference
