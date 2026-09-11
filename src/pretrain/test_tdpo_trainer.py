@@ -15,6 +15,7 @@ from transformers import PreTrainedTokenizerFast, T5Config, T5ForConditionalGene
 from trl import DPOTrainer
 
 from tdpo_trainer import PreferenceConfig, TokenDPOTrainer, sequence_statistics, tdpo_loss
+from preference_cache import TokenizationCacheDataset
 
 
 class TDPOTest(unittest.TestCase):
@@ -150,7 +151,9 @@ class TDPOTest(unittest.TestCase):
                 trainer_type = DPOTrainer if objective == "dpo" else TokenDPOTrainer
                 trainer = trainer_type(
                     model=model, ref_model=reference, args=config, tokenizer=tokenizer,
-                    train_dataset=dataset, eval_dataset=dataset, is_encoder_decoder=True,
+                    train_dataset=TokenizationCacheDataset.from_dataset(dataset, 1000),
+                    eval_dataset=TokenizationCacheDataset.from_dataset(dataset, 1000),
+                    is_encoder_decoder=True,
                 )
                 before = model.shared.weight.detach().clone()
                 trainer.train()

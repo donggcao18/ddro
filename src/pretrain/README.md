@@ -59,7 +59,95 @@ When resuming through `--resume_from_checkpoint`, pass the same objective,
 alpha, beta, and original SFT checkpoint used for that run. The CLI flags select
 the objective; they are not automatically restored from a checkpoint.
 
+## Faster Tokenization Cache Loading
+
+For URL TDPO training, the convenience launcher defaults to visible GPUs 0,1
+(or respects an existing scheduler-provided CUDA_VISIBLE_DEVICES), batch size
+16 per GPU, accumulation 1, TDPO2, bf16, gradient checkpointing, two epochs,
+and a 7200-second timeout. It resumes the latest checkpoint in
+`outputs/vault-url-tdpo2-full` and does not rerun BM25:
+
+```bash
+bash src/scripts/ddro/launch_tdpo_training_vault_url.sh
+```
+
+Override `DATASET_CACHE_DIR` with a sufficiently large node-local disk path for
+faster cache I/O. The persistent fallback is `data/hf_cache_w1000` under the
+repository (or `HF_DATASETS_CACHE` if set); it is not assumed to be local SSD.
+Other environment overrides include `CHECKPOINT_PATH`, `TRAIN_FILE`,
+`OUTPUT_DIR`, `CUDA_VISIBLE_DEVICES`, `TRAIN_BATCH_SIZE`, `DDP_TIMEOUT`,
+`TOKENIZATION_WRITER_BATCH_SIZE`, and `STARTUP_DEBUG`.
+
+```bash
+# Inspect the command without touching data or launching training.
+PRINT_ONLY=1 bash src/scripts/ddro/launch_tdpo_training_vault_url.sh
+
+# One GPU with the same effective batch size of 32.
+CUDA_VISIBLE_DEVICES=0 TRAIN_BATCH_SIZE=8 GRADIENT_ACCUMULATION_STEPS=4 \
+  bash src/scripts/ddro/launch_tdpo_training_vault_url.sh
+```
+
+`RESUME_FROM_CHECKPOINT` accepts `latest` (default), an explicit training
+checkpoint path, or `none` for a new run. Use a separate `OUTPUT_DIR` for new
+experiments. The original SFT checkpoint remains `CHECKPOINT_PATH`, even when
+resuming. Extra arguments are passed to the Python training script; use the
+environment overrides above for settings shown in the launch summary. Stop an
+existing run before launching another job against the same output directory.
+
+The Vault Python entry point now defaults to `--tokenization_writer_batch_size
+1000`. TRL 0.11.4 hard-codes 10 rows per Arrow write batch; the local
+`TokenizationCacheDataset` adapter overrides only TRL's `_tokenize` map call.
+It keeps the original tokenizer, truncation, labels, row order, and split
+selection indices. DPO, TDPO1, and TDPO2 use the same adapter. GPU batch size
+and gradient accumulation are independent of this cache setting.
+
+A versioned fingerprint includes the input dataset fingerprint and writer size,
+so old ten-row caches are not silently reused. The first run rebuilds tokenized
+caches without deleting the originals. Changing the writer size also rebuilds
+the layout. A successful map prints `[token-cache ...] mapping/cache reopen DONE`
+with elapsed time and the resulting Arrow cache paths.
+
+Use `--dataset_cache_dir` to place both the JSON loader cache and downstream
+dataset caches on sufficiently large node-local disk. For example, add these
+arguments to the existing single-node training command, only after confirming
+that `/tmp` is suitable disk-backed storage with enough free space:
+
+```bash
+--dataset_cache_dir "/tmp/${USER}/ddro-cache-w1000" \
+--tokenization_writer_batch_size 1000
+```
+
+Every rank on the node must use the same path. Do not use a per-rank cache
+directory. Multi-node jobs need an appropriate cache strategy on each node;
+this example is for the current single-node, two-GPU run. Node-local caches
+may disappear when a job ends, so use persistent local scratch when available
+and keep model checkpoints in the existing persistent output directory.
+
+Larger Arrow write batches reduce the number of record batches and can reduce
+cache metadata overhead; they do not guarantee a specific speedup or fix all
+filesystem/RAM problems. Start at 1000. Very large writer sizes can increase
+CPU-memory use. A longer `--ddp_timeout` only permits a longer wait; it does not
+make cache loading faster. The adapter does not change resume state, but the
+installed TRL/Datasets runtime and actual startup speed should be checked with
+a smoke run on the training machine.
+
+```bash
+python -m unittest discover -s src/pretrain -p test_preference_cache.py
+python -m unittest discover -s src/pretrain -p test_tdpo_trainer.py
+```
+
+The cache tests compare token values and row order with the original TRL map,
+check the Arrow batch count on disk-backed data with one/two CPU processes,
+and exercise selection indices and cache fingerprints. The trainer tests use
+the adapter during tiny CPU DPO/TDPO train/eval/save/resume runs.
+
 ## Diagnosing Distributed Startup Hangs
+
+The Python entry point accepts `--ddp_timeout SECONDS` (default: `1800`). Use
+`--ddp_timeout 7200` for a two-hour distributed process-group timeout. This is
+not a training duration limit and does not accelerate preprocessing. A startup
+operation taking approximately two hours can still exceed this timeout because
+the waiting rank may enter the barrier before tokenization begins.
 
 Add `--startup_debug 60` to the Python training arguments on all ranks, and add
 `--log-dir ./logs/tdpo-startup --tee 3` to `torchrun` before the script path.

@@ -34,6 +34,7 @@ from trl import DPOConfig, DPOTrainer
 
 from tdpo_trainer import PreferenceConfig, TokenDPOTrainer
 from startup_diagnostics import StartupDiagnostics
+from preference_cache import TokenizationCacheDataset
 
 
 PREFERENCE_COLUMNS = ("prompt", "chosen", "rejected")
@@ -41,6 +42,13 @@ PREFERENCE_COLUMNS = ("prompt", "chosen", "rejected")
 
 def positive_float(value: str) -> float:
     parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be greater than zero")
+    return parsed
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be greater than zero")
     return parsed
@@ -77,6 +85,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validation_split", type=unit_interval, default=0.01)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dataset_num_proc", type=int, default=8)
+    parser.add_argument(
+        "--dataset_cache_dir",
+        help="Datasets cache root; use node-local disk shared by ranks on the same node.",
+    )
+    parser.add_argument(
+        "--tokenization_writer_batch_size", type=positive_int, default=1000,
+        help="Rows per Arrow write batch during TRL tokenization (default: 1000).",
+    )
+    parser.add_argument(
+        "--ddp_timeout", type=positive_int, default=1800, metavar="SECONDS",
+        help="Distributed process-group timeout in seconds (default: 1800).",
+    )
     parser.add_argument(
         "--startup_debug", type=int, default=0, metavar="SECONDS",
         help=(
@@ -242,7 +262,11 @@ def load_preference_datasets(args: argparse.Namespace) -> DatasetDict:
     if args.eval_file:
         data_files["validation"] = args.eval_file
 
-    datasets = load_dataset("json", data_files=data_files)
+    cache_dir = None
+    if args.dataset_cache_dir:
+        cache_dir = str(Path(args.dataset_cache_dir).expanduser().resolve())
+        print(f"Datasets cache root: {cache_dir}", flush=True)
+    datasets = load_dataset("json", data_files=data_files, cache_dir=cache_dir)
     datasets = DatasetDict(
         {
             name: clean_preference_dataset(split, name, args.dataset_num_proc)
@@ -372,6 +396,7 @@ def build_training_args(args: argparse.Namespace, has_eval: bool) -> DPOConfig:
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        ddp_timeout=args.ddp_timeout,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         warmup_ratio=args.warmup_ratio,
@@ -481,6 +506,10 @@ def run_training(args: argparse.Namespace, debug: StartupDiagnostics) -> None:
         )
 
     trainer_class = DPOTrainer if args.preference_objective == "dpo" else TokenDPOTrainer
+    datasets = DatasetDict({
+        name: TokenizationCacheDataset.from_dataset(split, args.tokenization_writer_batch_size)
+        for name, split in datasets.items()
+    })
     debug.mark("Trainer initialization BEGIN (includes TRL tokenization and barriers)")
     trainer = trainer_class(
         model=model,
