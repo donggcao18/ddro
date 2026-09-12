@@ -1,0 +1,32 @@
+{
+  "checkpoint_path": "/models/vault-sft/checkpoint-196000",
+  "corpus_files": ["/data/vault/Ruby_train_r32.0.json"],
+  "query_file": "/data/vault/Ruby_ready_to_feed_numeric.jsonl",
+  "output_dir": "/outputs/vault-iterative-dpo",
+  "target_type": "text_id",
+  "rounds": 3,
+  "queries_per_round": 10000,
+  "steps_per_round": 1000,
+  "seed": 42,
+  "validation_fraction": 0.05,
+  "num_gpus": 1,
+  "precision": "bf16",
+  "num_beams": 16,
+  "negatives_per_query": 4,
+  "mining_batch_size": 16,
+  "max_prompt_length": 256,
+  "max_target_length": 32,
+  "selection_metric": "mrr@10",
+  "training": {
+    "per_device_train_batch_size": 4,
+    "gradient_accumulation_steps": 8,
+    "learning_rate": 1e-6,
+    "beta": 0.4,
+    "warmup_ratio": 0.1,
+    "save_steps": 500,
+    "logging_steps": 10,
+    "save_total_limit": 2,
+    "dataset_num_proc": 1,
+    "dataloader_num_workers": 0
+  }
+}

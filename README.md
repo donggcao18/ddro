@@ -173,6 +173,18 @@ bash scripts/ddro/slurm_submit_ddro_training.sh
 
 DDRO is implemented using a custom version of HuggingFace's [DPOTrainer](https://github.com/huggingface/trl).
 
+For Vault, [iterative DPO](src/pretrain/ITERATIVE_DPO.md) mines model-confusion
+preferences before each round, freezes those pairs and the reference during
+training, then continues from the latest policy snapshot. It runs entirely in
+`ddro_env` without BM25. Edit the paths and round budget in
+`src/scripts/configs/iterative_vault_dpo.json`, then run:
+
+```bash
+python src/pretrain/train_iterative_ddro_vault.py --config src/scripts/configs/iterative_vault_dpo.json
+# Continue an interrupted run with the same configuration:
+python src/pretrain/train_iterative_ddro_vault.py --config src/scripts/configs/iterative_vault_dpo.json --resume
+```
+
 ---
 
 ## Evaluation

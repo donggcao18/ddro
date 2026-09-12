@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mine Vault DPO negatives from a frozen SFT model's constrained predictions.
+"""Mine Vault DPO negatives from a frozen policy snapshot's constrained predictions.
 
 This is intentionally independent from the existing BM25 miner.  It loads the
 same Hugging Face checkpoint format as ``train_ddro_vault.py``, constrains beam
@@ -265,6 +265,22 @@ def select_model_candidates(
     return selected, counters
 
 
+def retrieval_metrics(targets: Sequence[str | None], positives: set[str],
+                      cutoffs: Sequence[int]) -> dict[str, float]:
+    """Score the original ranked beams; invalid beams still occupy a rank."""
+    if not positives:
+        raise ValueError("Retrieval evaluation requires known positives")
+    result = {}
+    for k in cutoffs:
+        prefix = targets[:k]
+        result[f"recall@{k}"] = len(set(prefix) & positives) / len(positives)
+        result[f"mrr@{k}"] = next(
+            (1.0 / rank for rank, target in enumerate(prefix, 1) if target in positives), 0.0
+        )
+    result["valid_generation_rate"] = sum(t is not None for t in targets) / max(1, len(targets))
+    return result
+
+
 def resolve_device(value: str) -> Any:
     import torch
 
@@ -285,7 +301,9 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
     """Run constrained model-confusion mining and return audit statistics."""
     import torch
     from tqdm.auto import tqdm
-    from transformers import AutoConfig, AutoModelForSeq2SeqLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForSeq2SeqLM, AutoTokenizer, set_seed
+
+    set_seed(getattr(args, "seed", 42))
 
     if args.negatives_per_query <= 0:
         raise ValueError("--negatives-per-query must be greater than zero")
@@ -321,6 +339,8 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
     text_id_to_target, target_to_text_id, invalid_target_mappings = (
         build_document_targets(document_rows, args.target_type)
     )
+    if getattr(args, "strict_corpus", False) and invalid_target_mappings:
+        raise ValueError(f"{invalid_target_mappings} corpus documents have missing/ambiguous decoder targets")
     (
         encoded_targets,
         sequence_to_target,
@@ -334,6 +354,14 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
         args.target_collision_policy,
         args.target_length_policy,
     )
+    if getattr(args, "strict_corpus", False):
+        for sequence in encoded_targets:
+            if tokenizer.eos_token_id is not None and sequence[-1] != tokenizer.eos_token_id:
+                raise ValueError("Every corpus target must end in EOS")
+            if tokenizer.pad_token_id in sequence or (
+                tokenizer.unk_token_id is not None and tokenizer.unk_token_id in sequence
+            ):
+                raise ValueError("Corpus target contains padding or unknown tokens; correct the tokenizer/target mapping")
     collision_targets = {
         target for group in collision_groups for target in group
     }
@@ -429,6 +457,9 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
     temporary_output = atomic_output_path(output_path)
     stats: Counter[str] = Counter()
     candidate_count_distribution: Counter[int] = Counter()
+    evaluation_only = getattr(args, "evaluation_only", False)
+    metric_totals: Counter[str] = Counter()
+    cutoffs = sorted({1, min(5, args.num_beams), min(10, args.num_beams), args.num_beams})
 
     query_iterator: Iterable[dict[str, Any]] = iter_json_records(args.query_metadata)
     if args.limit_queries is not None:
@@ -463,6 +494,7 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                     padding=True,
                     truncation=True,
                     max_length=args.max_prompt_length,
+                    return_token_type_ids=False,
                     return_tensors="pt",
                 )
                 tokenized = {
@@ -481,6 +513,7 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                         prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
                         return_dict_in_generate=True,
                         output_scores=True,
+                        length_penalty=getattr(args, "length_penalty", 1.0),
                     )
 
                 all_sequences = generated.sequences.detach().cpu().tolist()
@@ -512,6 +545,22 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                         and text_id_to_target[positive_id]
                         not in mining_excluded_targets
                     }
+                    if evaluation_only:
+                        missing = positive_ids - text_id_to_target.keys()
+                        if missing or any(text_id_to_target[p] in mining_excluded_targets for p in positive_ids):
+                            raise ValueError("Evaluation positives must all be valid, complete corpus targets")
+                        ranked_targets = [sequence_to_target.get(canonical_generated_tokens(
+                            sequence, int(config.decoder_start_token_id),
+                            tokenizer.pad_token_id, tokenizer.eos_token_id,
+                        )) for sequence in all_sequences[start:end]]
+                        metric_totals.update(retrieval_metrics(ranked_targets, positive_targets, cutoffs))
+                        output_handle.write(json.dumps({
+                            "query_key": query["query_key"],
+                            "positive_text_ids": sorted(positive_ids),
+                            "predicted_text_ids": [target_to_text_id.get(t) for t in ranked_targets],
+                            "round_id": getattr(args, "round_id", None),
+                        }) + "\n")
+                        continue
                     if target_text_id not in text_id_to_target:
                         raise ValueError(
                             f"Query {query.get('query_key')!r} targets text_id="
@@ -573,6 +622,12 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                                     "url_based_ids", []
                                 ),
                             }
+                            if getattr(args, "round_id", None) is not None:
+                                output_row.update({
+                                    "round_id": args.round_id,
+                                    "policy_fingerprint": getattr(args, "checkpoint_fingerprint", None),
+                                    "family_id": query.get("family_id", ""),
+                                })
                             if args.target_type == "structure_id_v3":
                                 output_row["chosen_structure_id_v3"] = chosen_target
                                 output_row["rejected_structure_id_v3"] = rejected_target
@@ -620,8 +675,16 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
             "num_beams": args.num_beams,
             "negatives_per_query": args.negatives_per_query,
             "output": str(output_path),
+            "seed": getattr(args, "seed", 42),
+            "round_id": getattr(args, "round_id", None),
+            "policy_fingerprint": getattr(args, "checkpoint_fingerprint", None),
+            "length_penalty": getattr(args, "length_penalty", 1.0),
         }
     )
+    if evaluation_only:
+        if not stats["queries_processed"]:
+            raise ValueError("No validation queries were evaluated")
+        result["metrics"] = {key: value / stats["queries_processed"] for key, value in metric_totals.items()}
     stats_path = output_path.with_suffix(".stats.json")
     with stats_path.open("w", encoding="utf-8") as handle:
         json.dump(result, handle, indent=2, sort_keys=True)
@@ -634,6 +697,14 @@ def build_parser() -> argparse.ArgumentParser:
         description="Mine Vault DPO negatives from constrained SFT model predictions."
     )
     parser.add_argument("--checkpoint-path", required=True)
+    parser.add_argument("--checkpoint-fingerprint")
+    parser.add_argument("--round-id", type=int)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--length-penalty", type=float, default=1.0)
+    parser.add_argument("--evaluation-only", action="store_true",
+                        help="Write ranked predictions and retrieval metrics instead of preference pairs")
+    parser.add_argument("--strict-corpus", action="store_true",
+                        help="Reject missing/ambiguous mappings, padding, and unknown target tokens")
     parser.add_argument("--query-metadata", required=True)
     parser.add_argument("--document-metadata", required=True)
     parser.add_argument("--output", required=True)

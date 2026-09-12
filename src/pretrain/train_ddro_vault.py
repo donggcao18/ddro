@@ -28,9 +28,15 @@ from transformers import (
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
     EarlyStoppingCallback,
+    TrainerCallback,
     set_seed,
 )
 from trl import DPOConfig, DPOTrainer
+
+try:
+    from .iterative_dpo_utils import atomic_json, checkpoint_hash, file_hash, read_json, verify_round_inputs
+except ImportError:  # Direct script entry point.
+    from iterative_dpo_utils import atomic_json, checkpoint_hash, file_hash, read_json, verify_round_inputs
 
 
 PREFERENCE_COLUMNS = ("prompt", "chosen", "rejected")
@@ -63,6 +69,12 @@ def parse_args() -> argparse.Namespace:
         help="SFT checkpoint directory containing config, weights, and tokenizer files.",
     )
     parser.add_argument("--train_file", required=True, help="Training JSON/JSONL file.")
+    parser.add_argument("--reference_checkpoint_path", help="Frozen reference; defaults to checkpoint_path")
+    parser.add_argument("--max_steps", type=int, default=-1, help="Optimizer steps; overrides epochs when positive")
+    parser.add_argument("--load_best_model_at_end", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--export_latest", action="store_true", help="Export latest/; requires --no-load_best_model_at_end")
+    parser.add_argument("--strict_targets", action="store_true", help="Reject truncated/colliding decoder targets")
+    parser.add_argument("--round_manifest", help="Immutable controller manifest required for iterative resume")
     parser.add_argument(
         "--eval_file",
         help=(
@@ -344,6 +356,7 @@ def build_training_args(args: argparse.Namespace, has_eval: bool) -> DPOConfig:
         seed=args.seed,
         data_seed=args.seed,
         num_train_epochs=args.num_train_epochs,
+        max_steps=args.max_steps,
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -364,7 +377,7 @@ def build_training_args(args: argparse.Namespace, has_eval: bool) -> DPOConfig:
         save_strategy="steps",
         save_steps=args.save_steps,
         save_total_limit=args.save_total_limit,
-        load_best_model_at_end=has_eval,
+        load_best_model_at_end=has_eval and args.load_best_model_at_end,
         metric_for_best_model="eval_loss" if has_eval else None,
         greater_is_better=False if has_eval else None,
         bf16=args.bf16,
@@ -374,11 +387,57 @@ def build_training_args(args: argparse.Namespace, has_eval: bool) -> DPOConfig:
         dataset_num_proc=args.dataset_num_proc,
         remove_unused_columns=False,
         report_to=report_to,
+        precompute_ref_log_probs=False,
+        sync_ref_model=False,
     )
 
 
-def main() -> None:
-    args = parse_args()
+def validate_target_sequences(datasets: DatasetDict, tokenizer: Any, limit: int) -> None:
+    targets = set()
+    for dataset in datasets.values():
+        targets.update(dataset["chosen"])
+        targets.update(dataset["rejected"])
+    owners = {}
+    for target in sorted(targets):
+        sequence = tuple(tokenizer(target, truncation=False, add_special_tokens=True)["input_ids"])
+        if not sequence or len(sequence) > limit:
+            raise ValueError(f"Decoder target must fit without truncation ({len(sequence)} > {limit}): {target!r}")
+        if tokenizer.eos_token_id is not None and sequence[-1] != tokenizer.eos_token_id:
+            raise ValueError(f"Target does not end in EOS: {target!r}")
+        if tokenizer.pad_token_id in sequence or (
+            tokenizer.unk_token_id is not None and tokenizer.unk_token_id in sequence
+        ):
+            raise ValueError(f"Target contains padding/unknown tokens: {target!r}")
+        if sequence in owners and owners[sequence] != target:
+            raise ValueError(f"Token-identical targets: {owners[sequence]!r}, {target!r}")
+        owners[sequence] = target
+
+
+class RoundCheckpointCallback(TrainerCallback):
+    def __init__(self, identity: str):
+        self.identity = identity
+
+    def on_save(self, args, state, control, **kwargs):
+        # on_save runs after the trainer has written optimizer/scheduler/RNG.
+        from accelerate.utils import wait_for_everyone
+        wait_for_everyone()
+        if state.is_world_process_zero:
+            atomic_json(Path(args.output_dir) / f"checkpoint-{state.global_step}" / "round_checkpoint.json",
+                        {"identity": self.identity, "global_step": state.global_step,
+                         "world_size": args.world_size})
+
+
+def disable_t5_attention_dropout(model: Any) -> None:
+    # TRL disables nn.Dropout modules, but T5 attention also uses functional
+    # dropout with a float probability. Disable that path for matching policy
+    # and reference likelihoods, including while the policy is in train mode.
+    from transformers.models.t5.modeling_t5 import T5Attention
+    for module in model.modules():
+        if isinstance(module, T5Attention):
+            module.dropout = 0.0
+
+
+def train_round(args: argparse.Namespace) -> None:
     if args.max_prompt_length <= 0 or args.max_target_length <= 0:
         raise ValueError("Token length limits must be greater than zero")
     if args.dataset_num_proc <= 0:
@@ -387,13 +446,48 @@ def main() -> None:
         raise ValueError("Logging, evaluation, and save step counts must be greater than zero")
     if args.early_stopping_patience < 0:
         raise ValueError("--early_stopping_patience cannot be negative")
+    if args.max_steps == 0 or args.max_steps < -1:
+        raise ValueError("--max_steps must be -1 or positive")
+    if args.export_latest and args.load_best_model_at_end:
+        raise ValueError("--export_latest requires --no-load_best_model_at_end")
+    if args.early_stopping_patience and not args.load_best_model_at_end:
+        raise ValueError("Early stopping requires best-model loading; use round-level retrieval selection instead")
+
+    identity = None
+    if args.round_manifest:
+        manifest = read_json(args.round_manifest)
+        verify_round_inputs(manifest)
+        identity = file_hash(args.round_manifest)
+        if args.validation_split or args.eval_file or not args.export_latest or not args.strict_targets:
+            raise ValueError("Iterative rounds require fixed training pairs, strict targets, and latest export")
+        if Path(args.checkpoint_path).resolve() != Path(manifest["policy_checkpoint"]).resolve():
+            raise ValueError("Policy checkpoint differs from round manifest")
+        if Path(args.train_file).resolve() != Path(manifest["pairs_file"]).resolve():
+            raise ValueError("Training pairs differ from round manifest")
+        for key, value in manifest["training"].items():
+            if getattr(args, key) != value:
+                raise ValueError(f"Training option differs from round manifest: {key}")
+        precision = "bf16" if args.bf16 else "fp16" if args.fp16 else "fp32"
+        if precision != manifest["precision"]:
+            raise ValueError("Training precision differs from round manifest")
+        if args.resume_from_checkpoint:
+            if args.resume_from_checkpoint is True:
+                raise ValueError("Iterative resume requires an explicit completed checkpoint")
+            marker = Path(args.resume_from_checkpoint) / "round_checkpoint.json"
+            if not marker.is_file() or read_json(marker)["identity"] != identity:
+                raise ValueError("Resume checkpoint has a different round identity")
 
     checkpoint_path = validate_checkpoint(args.checkpoint_path)
+    reference_path = validate_checkpoint(args.reference_checkpoint_path or args.checkpoint_path)
+    if identity and checkpoint_hash(reference_path) != manifest["policy_fingerprint"]:
+        raise ValueError("Reference must be the frozen round-start policy")
     set_seed(args.seed)
     datasets = load_preference_datasets(args)
     tokenizer, config = load_tokenizer_and_config(
         checkpoint_path, args.trust_remote_code
     )
+    if args.strict_targets:
+        validate_target_sequences(datasets, tokenizer, args.max_target_length)
     print_preflight(
         datasets,
         tokenizer,
@@ -412,21 +506,33 @@ def main() -> None:
 
     # DPO compares the trainable policy against a frozen copy of the exact SFT
     # checkpoint. Trainer checkpoint files such as optimizer.pt are not loaded here.
-    reference_model = load_policy_model(checkpoint_path, args.trust_remote_code)
+    reference_tokenizer, reference_config = load_tokenizer_and_config(reference_path, args.trust_remote_code)
+    if tokenizer.get_vocab() != reference_tokenizer.get_vocab() or any(
+        getattr(config, key) != getattr(reference_config, key)
+        for key in ("decoder_start_token_id", "eos_token_id", "pad_token_id", "vocab_size")
+    ):
+        raise ValueError("Policy/reference tokenizer or configuration mismatch")
+    reference_model = load_policy_model(reference_path, args.trust_remote_code)
+    validate_model_tokenizer(reference_model, tokenizer)
     reference_model.requires_grad_(False)
     reference_model.eval()
+    if args.round_manifest:
+        disable_t5_attention_dropout(model)
+        disable_t5_attention_dropout(reference_model)
 
     if args.gradient_checkpointing:
         model.config.use_cache = False
 
     has_eval = "validation" in datasets
-    if has_eval and args.save_steps % args.eval_steps:
+    if has_eval and args.load_best_model_at_end and args.save_steps % args.eval_steps:
         raise ValueError(
             "When validation is enabled, --save_steps must be a multiple of "
             "--eval_steps so load_best_model_at_end can select a matching checkpoint."
         )
     training_args = build_training_args(args, has_eval)
     callbacks = []
+    if identity:
+        callbacks.append(RoundCheckpointCallback(identity))
     if has_eval and args.early_stopping_patience > 0:
         callbacks.append(
             EarlyStoppingCallback(
@@ -444,16 +550,32 @@ def main() -> None:
         is_encoder_decoder=True,
         callbacks=callbacks,
     )
-    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+    if identity and trainer.accelerator.num_processes != manifest["num_gpus"]:
+        raise ValueError("Training process count differs from round manifest")
+    result = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
 
     # Keep checkpoints resumable in output_dir and place the portable inference
     # artifact in final/.  This has the same config/weights/tokenizer layout as SFT.
-    final_dir = Path(args.output_dir) / "final"
+    final_dir = Path(args.output_dir) / ("latest" if args.export_latest else "final")
     trainer.model.config.use_cache = True
     trainer.save_model(str(final_dir))
-    tokenizer.save_pretrained(final_dir)
+    if trainer.is_world_process_zero():
+        tokenizer.save_pretrained(final_dir)
     trainer.save_state()
+    trainer.accelerator.wait_for_everyone()
+    if trainer.is_world_process_zero():
+        atomic_json(Path(args.output_dir) / "training_metrics.json", result.metrics)
+        if identity:
+            atomic_json(final_dir / "round_complete.json", {
+                "identity": identity, "global_step": trainer.state.global_step,
+                "checkpoint_fingerprint": checkpoint_hash(final_dir),
+            })
+    trainer.accelerator.wait_for_everyone()
     print(f"Saved final Hugging Face DPO model to {final_dir}")
+
+
+def main() -> None:
+    train_round(parse_args())
 
 
 if __name__ == "__main__":
