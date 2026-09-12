@@ -1,5 +1,8 @@
 # Vault DPO and Token-Level DPO
 
+See [the token-level experiment summary and improvement plan](TOKEN_LEVEL_EXPERIMENT.md)
+for the current Ruby URL setup, reported observations, and proposed retrieval-specific ablations.
+
 `train_ddro_vault.py` supports `--preference_objective dpo|tdpo1|tdpo2`.
 The default remains `dpo`. Both TDPO variants reuse the same SFT checkpoint,
 tokenizer, JSONL `prompt/chosen/rejected` data, validation split, and distributed
