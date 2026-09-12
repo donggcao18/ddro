@@ -107,6 +107,9 @@ def unique_strings(value: Any) -> list[str]:
 
 def document_targets(row: dict[str, Any], target_type: str) -> list[str]:
     """Read decoder targets for one canonical text_id document."""
+    if row.get("doc_id_type") == target_type:
+        # Direct multilabel metadata already contains the selected ID verbatim.
+        return unique_strings(row.get("text_id"))
     if target_type == "text_id":
         return unique_strings(row.get("text_id"))
     if target_type == "url":

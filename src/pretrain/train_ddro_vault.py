@@ -479,8 +479,9 @@ def train_round(args: argparse.Namespace) -> None:
 
     checkpoint_path = validate_checkpoint(args.checkpoint_path)
     reference_path = validate_checkpoint(args.reference_checkpoint_path or args.checkpoint_path)
-    if identity and checkpoint_hash(reference_path) != manifest["policy_fingerprint"]:
-        raise ValueError("Reference must be the frozen round-start policy")
+    if identity and (reference_path.resolve() != Path(manifest["reference_checkpoint"]).resolve()
+                     or checkpoint_hash(reference_path) != manifest["reference_fingerprint"]):
+        raise ValueError("Reference differs from the frozen round reference")
     set_seed(args.seed)
     datasets = load_preference_datasets(args)
     tokenizer, config = load_tokenizer_and_config(
@@ -504,8 +505,8 @@ def train_round(args: argparse.Namespace) -> None:
         )
         return
 
-    # DPO compares the trainable policy against a frozen copy of the exact SFT
-    # checkpoint. Trainer checkpoint files such as optimizer.pt are not loaded here.
+    # Load the round's frozen reference independently from the latest policy.
+    # Trainer checkpoint files such as optimizer.pt are not loaded here.
     reference_tokenizer, reference_config = load_tokenizer_and_config(reference_path, args.trust_remote_code)
     if tokenizer.get_vocab() != reference_tokenizer.get_vocab() or any(
         getattr(config, key) != getattr(reference_config, key)

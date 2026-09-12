@@ -73,12 +73,7 @@ def checkpoint_hash(path: str | Path) -> str:
     ).encode()).hexdigest()
 
 
-def round_queries(rows: list[dict], count: int | None, round_id: int, seed: int) -> list[dict]:
-    """Take a rotating window of a seeded permutation; no duplicates in a round.
-
-    Query coverage is exhausted before the window wraps. A fixed permutation
-    makes selection independent of previous generation successes or failures.
-    """
+def _query_order(rows: list[dict], count: int | None, seed: int) -> tuple[list[dict], int]:
     if not rows:
         raise ValueError("No training queries")
     if count is not None and count <= 0:
@@ -86,6 +81,18 @@ def round_queries(rows: list[dict], count: int | None, round_id: int, seed: int)
     order = sorted(rows, key=lambda row: row["query_key"])
     random.Random(seed).shuffle(order)
     size = min(count or len(order), len(order))
+    return order, size
+
+
+def partition_queries(rows: list[dict], count: int | None, seed: int) -> list[list[dict]]:
+    """Shuffle once and cover all queries once, keeping a smaller final partition."""
+    order, size = _query_order(rows, count, seed)
+    return [order[start:start + size] for start in range(0, len(order), size)]
+
+
+def round_queries(rows: list[dict], count: int | None, round_id: int, seed: int) -> list[dict]:
+    """Legacy fixed-round schedule: take rotating windows, wrapping when needed."""
+    order, size = _query_order(rows, count, seed)
     start = (round_id * size) % len(order)
     return [order[(start + i) % len(order)] for i in range(size)]
 
@@ -100,6 +107,8 @@ def verify_round_inputs(manifest: dict) -> None:
     assert_file_hashes(manifest["inputs"])
     if checkpoint_hash(manifest["policy_checkpoint"]) != manifest["policy_fingerprint"]:
         raise ValueError("Round starting checkpoint changed")
+    if checkpoint_hash(manifest["reference_checkpoint"]) != manifest["reference_fingerprint"]:
+        raise ValueError("Round reference checkpoint changed")
 
 
 def latest_resumable_checkpoint(directory: Path, identity: str,

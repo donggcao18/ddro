@@ -11,14 +11,15 @@ import unittest
 SRC = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(SRC))
 sys.path.insert(0, str(SRC / "scripts/bm25/the_vault"))
-from common import iter_json_records
-from data.data_prep.prepare_vault_dpo_metadata import prepare
+from common import document_targets, iter_json_records
+from data.data_prep.prepare_vault_dpo_metadata import multilabel_rows, prepare
 from mine_model_confusion_negatives import retrieval_metrics
 from pretrain.iterative_dpo_utils import (
     atomic_json, atomic_jsonl, checkpoint_hash, file_hash, latest_resumable_checkpoint,
-    read_json, round_queries,
+    partition_queries, read_json, round_queries,
 )
 from pretrain.train_iterative_ddro_vault import audit_pairs, load_config, run_pipeline
+from pretrain.update_dpo_reference import reference_identity
 
 
 def fake_checkpoint(path: Path, weights="initial"):
@@ -52,12 +53,22 @@ class FixtureWorker:
     def __init__(self):
         self.calls = []
         self.fail_training = False
+        self.empty_mining_rounds = set()
 
     def __call__(self, command):
         self.calls.append(command)
         def option(name):
             return command[command.index(name) + 1]
-        if "--checkpoint-path" in command:
+        if "--decay" in command:
+            output = Path(option("--output"))
+            identity = reference_identity(option("--reference-checkpoint"), option("--policy-checkpoint"),
+                                          option("--reference-fingerprint"), option("--policy-fingerprint"),
+                                          float(option("--decay")))
+            fake_checkpoint(output, weights=json.dumps(identity, sort_keys=True))
+            atomic_json(output / "reference_complete.json", {
+                "identity": identity, "checkpoint_fingerprint": checkpoint_hash(output),
+            })
+        elif "--checkpoint-path" in command:
             queries = list(iter_json_records(option("--query-metadata")))
             output = Path(option("--output"))
             if "--evaluation-only" in command:
@@ -75,6 +86,8 @@ class FixtureWorker:
                                   "positive_text_ids": query["positive_text_ids"],
                                   "negative_source": "model_confusion", "round_id": int(option("--round-id")),
                                   "policy_fingerprint": option("--checkpoint-fingerprint")})
+                if int(option("--round-id")) in self.empty_mining_rounds:
+                    pairs = []
                 atomic_jsonl(output, pairs)
                 atomic_json(output.with_suffix(".stats.json"), {"model_pairs_written": len(pairs)})
         else:
@@ -91,6 +104,68 @@ class FixtureWorker:
 
 
 class MetadataTest(unittest.TestCase):
+    def test_full_partition_keeps_remainder_and_never_wraps(self):
+        rows = [{"query_key": str(i)} for i in range(10)]
+        for size, lengths in ((4, [4, 4, 2]), (5, [5, 5]), (20, [10]), (None, [10])):
+            with self.subTest(size=size):
+                partitions = partition_queries(rows, size, 42)
+                self.assertEqual([len(part) for part in partitions], lengths)
+                keys = [r["query_key"] for part in partitions for r in part]
+                self.assertEqual(len(keys), len(set(keys)))
+                self.assertEqual(set(keys), {r["query_key"] for r in rows})
+                self.assertNotEqual(keys, [r["query_key"] for r in rows])
+                self.assertEqual(partitions, partition_queries(list(reversed(rows)), size, 42))
+
+    def test_multilabel_uses_exact_per_row_labels_and_groups_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            a, b, c, d = [f"repo/lib/file.rb/function_{i}(arg)" for i in range(4)]
+            rows = [
+                {"text": "same query", "url_based_id": a, "positive_url_based_id": [a, b, b]},
+                {"text": "same query", "url_based_id": a, "positive_url_based_id": [a, c]},
+                {"text": "different query", "url_based_id": a, "positive_url_based_id": [b]},
+                {"text": "independent", "url_based_id": d, "positive_url_based_id": [d]},
+            ]
+            # Unrelated namespaces and labels must have no influence on URL identities.
+            for row in rows:
+                row.update(numeric_id="1090", semantic_id="9261", positive_text_ids=["wrong"],
+                           text_id="wrong", original={"code": "unused"})
+            atomic_jsonl(root / "queries.jsonl", rows + [rows[0]])
+            manifest = prepare([], str(root / "queries.jsonl"), str(root / "meta"),
+                               input_format="multilabel", doc_id_type="url_based_id")
+            train = list(iter_json_records(root / "meta/train_queries.jsonl"))
+            val = list(iter_json_records(root / "meta/validation_queries.jsonl"))
+            prepared = train + val
+            self.assertEqual(len(prepared), 4)  # Only the exact labeled duplicate is removed.
+            same = [r for r in prepared if r["prompt"] == "same query"]
+            self.assertEqual({tuple(r["positive_text_ids"]) for r in same}, {(a, b), (a, c)})
+            other = next(r for r in prepared if r["prompt"] == "different query")
+            self.assertEqual(other["positive_text_ids"], [b])
+            self.assertEqual(other["target_text_id"], b)  # Never add source a as an implicit positive.
+            self.assertEqual(len({r["family_id"] for r in prepared if r["source_doc_id"] == a}), 1)
+            self.assertFalse({r["family_id"] for r in train} & {r["family_id"] for r in val})
+            docs = list(iter_json_records(root / "meta/document_metadata.jsonl"))
+            self.assertEqual({r["text_id"] for r in docs}, {a, b, c, d})  # b/c have no source row.
+            self.assertTrue(all(document_targets(r, "url_based_id") == [r["text_id"]] for r in docs))
+            self.assertEqual(manifest["candidate_documents"], 4)
+
+    def test_multilabel_column_selection_optional_corpus_and_invalid_labels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            row = {"text": "find", "semantic_id": "s-1", "positive_semantic_id": ["s-2"],
+                   "url_based_id": "ignored", "positive_url_based_id": ["also-ignored"]}
+            atomic_jsonl(root / "queries.jsonl", [row])
+            atomic_jsonl(root / "corpus.jsonl", [{"semantic_id": "s-3", "positive_semantic_id": ["not-a-candidate"]}])
+            docs, queries = multilabel_rows([str(root / "corpus.jsonl")], str(root / "queries.jsonl"), "semantic_id")
+            self.assertEqual(set(docs), {"s-1", "s-2", "s-3"})
+            self.assertEqual(queries[0]["positive_text_ids"], ["s-2"])
+            self.assertEqual(document_targets(docs["s-2"], "semantic_id"), ["s-2"])
+            for labels in (None, [], "s-1", [None], [""], [" s-1"]):
+                with self.subTest(labels=labels):
+                    atomic_jsonl(root / "queries.jsonl", [{**row, "positive_semantic_id": labels}])
+                    with self.assertRaisesRegex(ValueError, "positive_semantic_id"):
+                        multilabel_rows([], str(root / "queries.jsonl"), "semantic_id")
+
     def test_no_corpus_labels_or_transitive_relevance_and_family_disjointness(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -116,6 +191,8 @@ class MetadataTest(unittest.TestCase):
         subsets = [round_queries(rows, 4, r, 7) for r in range(3)]
         flattened = [row["query_key"] for group in subsets for row in group]
         self.assertEqual(len(set(flattened[:10])), 10)
+        self.assertNotEqual(flattened[:10], [r["query_key"] for r in rows])
+        self.assertNotEqual(subsets[0], round_queries(rows, 4, 0, 8))
         self.assertTrue(all(len({r["query_key"] for r in group}) == 4 for group in subsets))
         self.assertEqual(subsets[1], round_queries(list(reversed(rows)), 4, 1, 7))
 
@@ -136,6 +213,130 @@ class MetadataTest(unittest.TestCase):
 
 
 class ControllerTest(unittest.TestCase):
+    def test_automatic_round_count_covers_all_training_queries_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = fixture(root)
+            raw = read_json(path)
+            raw.pop("rounds")
+            raw.pop("steps_per_round")
+            raw["epochs_per_round"] = 1
+            atomic_json(path, raw)
+            cfg = load_config(path)
+            self.assertIsNone(cfg["rounds"])
+            worker = FixtureWorker()
+            prepared = run_pipeline(cfg, prepare_only=True, runner=worker)
+            self.assertFalse(worker.calls)
+            plan = read_json(root / "run/round_plan.json")
+            self.assertEqual(plan["mode"], "partition_all")
+            self.assertEqual(plan["partition_sizes"], [5, 5, 4])
+            self.assertEqual(prepared["planned_rounds"], 3)
+            state = run_pipeline(cfg, resume=True, runner=worker)
+            self.assertTrue(state["complete"])
+            train = list(iter_json_records(root / "run/metadata/train_queries.jsonl"))
+            selected = [row for i in range(plan["total_rounds"])
+                        for row in iter_json_records(root / f"run/round-{i:03d}/queries.jsonl")]
+            self.assertEqual(len(selected), len(train))
+            self.assertEqual({r["query_key"] for r in selected}, {r["query_key"] for r in train})
+            for command in worker.calls:
+                if "--round_manifest" in command:
+                    self.assertEqual(command[command.index("--num_train_epochs") + 1], "1")
+                    self.assertEqual(command[command.index("--max_steps") + 1], "-1")
+            calls = len(worker.calls)
+            run_pipeline(cfg, resume=True, runner=worker)
+            self.assertEqual(len(worker.calls), calls)
+
+    def test_ema_reference_lineage_skips_and_tamper_detection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = fixture(root)
+            atomic_json(path, {**read_json(path), "rounds": 3, "reference_update": "ema"})
+            cfg = load_config(path)
+            worker = FixtureWorker()
+            worker.empty_mining_rounds = {1}
+            state = run_pipeline(cfg, runner=worker)
+            first = read_json(root / "run/round-000/round_inputs.json")
+            third = read_json(root / "run/round-002/round_inputs.json")
+            self.assertEqual(first["reference_checkpoint"], cfg["checkpoint_path"])
+            self.assertEqual(third["reference_checkpoint"], str(root / "run/round-000/reference"))
+            self.assertEqual(third["policy_checkpoint"], str(root / "run/round-000/training/latest"))
+            self.assertEqual(state["latest_reference"], str(root / "run/round-002/reference"))
+            self.assertEqual(len([c for c in worker.calls if "--decay" in c]), 2)
+            train_calls = [c for c in worker.calls if "--round_manifest" in c]
+            self.assertEqual(train_calls[-1][train_calls[-1].index("--reference_checkpoint_path") + 1],
+                             third["reference_checkpoint"])
+            calls = len(worker.calls)
+            run_pipeline(cfg, resume=True, runner=worker)
+            self.assertEqual(len(worker.calls), calls)
+            (root / "run/round-000/reference/model.safetensors").write_bytes(b"tampered")
+            with self.assertRaisesRegex(ValueError, "EMA reference snapshot"):
+                run_pipeline(cfg, resume=True, runner=worker)
+
+    def test_epoch_rounds_accept_shortfalls_and_skip_empty_rounds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = fixture(root)
+            raw = read_json(config_path)
+            raw.pop("steps_per_round")
+            raw.update(epochs_per_round=1, rounds=3, num_beams=2, negatives_per_query=4,
+                       selection_metric="mrr@2")
+            atomic_json(config_path, raw)
+            cfg = load_config(config_path)
+            self.assertIsNone(cfg["steps_per_round"])
+            # This worker produces one pair/query instead of the requested four.
+            worker = FixtureWorker()
+            worker.empty_mining_rounds = {0, 2}
+            def runner(command):
+                worker(command)
+                if "--evaluation-only" in command:
+                    output = Path(command[command.index("--output") + 1])
+                    atomic_json(output.with_suffix(".stats.json"), {"metrics": {"mrr@2": 0.5}})
+            state = run_pipeline(cfg, runner=runner)
+            self.assertTrue(state["complete"])
+            self.assertEqual([r["status"] for r in state["rounds"]],
+                             ["skipped_no_negatives", "trained", "skipped_no_negatives"])
+            self.assertEqual(state["rounds"][0]["checkpoint"], cfg["checkpoint_path"])
+            self.assertEqual(state["rounds"][0]["optimizer_steps"], 0)
+            self.assertEqual(state["latest"], str(root / "run/round-001/training/latest"))
+            self.assertEqual(state["rounds"][1]["pair_audit"]["nominal_dataset_passes"], 1)
+            train_calls = [c for c in worker.calls if "--round_manifest" in c]
+            self.assertEqual(len(train_calls), 1)
+            self.assertEqual(train_calls[0][train_calls[0].index("--max_steps") + 1], "-1")
+            self.assertEqual(train_calls[0][train_calls[0].index("--num_train_epochs") + 1], "1")
+            calls = len(worker.calls)
+            run_pipeline(cfg, resume=True, runner=runner)
+            self.assertEqual(len(worker.calls), calls)
+
+    def test_corpus_free_url_multilabel_rounds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = fixture(root)
+            raw = read_json(config_path)
+            raw.pop("corpus_files")
+            raw.update(input_format="multilabel", target_type="url_based_id", num_gpus=2)
+            atomic_json(config_path, raw)
+            atomic_jsonl(root / "queries.jsonl", [
+                {"text": f"query {i}", "url_based_id": f"repo/f{i}.rb/f(arg)",
+                 "positive_url_based_id": [f"repo/f{i}.rb/f(arg)", f"repo/f{i}.rb/g(arg)"]}
+                for i in range(8)
+            ])
+            cfg = load_config(config_path)
+            self.assertEqual(cfg["corpus_files"], [])
+            worker = FixtureWorker()
+            state = run_pipeline(cfg, runner=worker)
+            self.assertTrue(state["complete"])
+            for command in worker.calls:
+                if "--target-type" in command:
+                    self.assertEqual(command[command.index("--target-type") + 1], "url_based_id")
+                else:
+                    self.assertIn("--nproc_per_node=2", command)
+            pairs = list(iter_json_records(root / "run/round-000/preferences.jsonl"))
+            self.assertTrue(all(p["chosen"].startswith("repo/") and
+                                p["rejected"] not in p["positive_text_ids"] for p in pairs))
+            calls = len(worker.calls)
+            run_pipeline(cfg, resume=True, runner=worker)
+            self.assertEqual(len(worker.calls), calls)
+
     def test_two_rounds_snapshot_lineage_fixed_data_and_idempotent_resume(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -198,7 +399,7 @@ class ControllerTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "artifact changed"):
                 run_pipeline(cfg, resume=True, runner=worker)
 
-    def test_pair_audit_rejects_empty_duplicate_positive_and_stale(self):
+    def test_pair_audit_accepts_empty_but_rejects_duplicate_positive_and_stale(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             cfg = load_config(fixture(root))
@@ -207,7 +408,13 @@ class ControllerTest(unittest.TestCase):
             original = list(iter_json_records(directory / "preferences.jsonl"))
             queries = list(iter_json_records(directory / "queries.jsonl"))
             fingerprint = read_json(directory / "round_inputs.json")["policy_fingerprint"]
-            invalid = [[], [original[0], original[0]],
+            atomic_jsonl(root / "empty.jsonl", [])
+            report = audit_pairs(root / "empty.jsonl", queries, root / "run/metadata/document_metadata.jsonl",
+                                 "text_id", 0, fingerprint, 2, None)
+            self.assertEqual(report["pairs"], 0)
+            self.assertEqual(report["queries_without_negatives"], len(queries))
+            self.assertEqual(report["previous_overlap_fraction"], 0)
+            invalid = [[original[0], original[0]],
                        [{**original[0], "rejected_text_id": original[0]["chosen_text_id"]}],
                        [{**original[0], "round_id": 100}]]
             for rows in invalid:

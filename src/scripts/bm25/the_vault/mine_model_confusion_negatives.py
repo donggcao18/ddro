@@ -307,8 +307,8 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
 
     if args.negatives_per_query <= 0:
         raise ValueError("--negatives-per-query must be greater than zero")
-    if args.num_beams < args.negatives_per_query:
-        raise ValueError("--num-beams must be at least --negatives-per-query")
+    if args.num_beams <= 0:
+        raise ValueError("--num-beams must be greater than zero")
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be greater than zero")
     if args.max_prompt_length <= 0 or args.max_target_length <= 0:
@@ -710,9 +710,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True)
     parser.add_argument(
         "--target-type",
-        choices=["text_id", "url", "structure_id_v3"],
         default="text_id",
-        help="Decoder target namespace. The default preserves the original text_id behavior.",
+        help="Legacy namespace (text_id, url, structure_id_v3), or exact ID column from prepared multilabel metadata.",
     )
     parser.add_argument(
         "--target-collision-policy",

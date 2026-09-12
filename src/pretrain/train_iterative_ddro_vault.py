@@ -22,14 +22,17 @@ from common import document_targets, iter_json_records, normalize_query
 from data.data_prep.prepare_vault_dpo_metadata import prepare
 from pretrain.iterative_dpo_utils import (
     assert_file_hashes, atomic_json, atomic_jsonl, checkpoint_hash, file_hash,
-    latest_resumable_checkpoint, read_json, round_queries,
+    latest_resumable_checkpoint, partition_queries, read_json, round_queries,
 )
+from pretrain.update_dpo_reference import reference_identity
 
 
 DEFAULTS = {
-    "rounds": 3, "queries_per_round": None, "steps_per_round": 1000,
+    "rounds": None, "queries_per_round": None, "steps_per_round": 1000,
     "epochs_per_round": None, "seed": 42, "validation_fraction": 0.05,
     "target_type": "text_id", "id_mode": "auto", "structure_id_sources": [],
+    "input_format": "legacy", "corpus_files": [],
+    "reference_update": "replace", "reference_ema_decay": 0.9,
     "num_gpus": 1, "precision": "bf16", "device": "auto",
     "num_beams": 16, "negatives_per_query": 4, "mining_batch_size": 16,
     "max_prompt_length": 256, "max_target_length": 32, "length_penalty": 1.0,
@@ -47,19 +50,34 @@ TRAIN_DEFAULTS = {
 
 def load_config(path: Path) -> dict:
     raw = read_json(path)
-    required = {"checkpoint_path", "corpus_files", "query_file", "output_dir"}
+    required = {"checkpoint_path", "query_file", "output_dir"}
     unknown = raw.keys() - required - DEFAULTS.keys()
     if unknown or required - raw.keys():
         raise ValueError(f"Invalid config keys: unknown={unknown}, missing={required - raw.keys()}")
     cfg = {**DEFAULTS, **raw}
+    if cfg["reference_update"] not in {"replace", "ema"}:
+        raise ValueError("reference_update must be replace or ema")
+    if (type(cfg["reference_ema_decay"]) not in {int, float}
+            or not math.isfinite(cfg["reference_ema_decay"])
+            or not 0 <= cfg["reference_ema_decay"] <= 1):
+        raise ValueError("reference_ema_decay must be between zero and one")
     if type(cfg["seed"]) is not int or cfg["seed"] < 0:
         raise ValueError("seed must be a nonnegative integer")
     if "epochs_per_round" in raw and "steps_per_round" not in raw:
         cfg["steps_per_round"] = None
     if (cfg["steps_per_round"] is None) == (cfg["epochs_per_round"] is None):
         raise ValueError("Specify exactly one of steps_per_round or epochs_per_round")
-    if cfg["target_type"] not in {"text_id", "url", "structure_id_v3"}:
-        raise ValueError("Invalid target_type")
+    if cfg["input_format"] not in {"legacy", "multilabel"}:
+        raise ValueError("Invalid input_format")
+    if cfg["input_format"] == "multilabel":
+        if "target_type" not in raw or not isinstance(cfg["target_type"], str) or not cfg["target_type"].strip():
+            raise ValueError("multilabel requires target_type to name the document ID column")
+        if cfg["target_type"] != cfg["target_type"].strip():
+            raise ValueError("target_type must not contain surrounding whitespace")
+        if cfg["id_mode"] != "auto" or cfg["structure_id_sources"]:
+            raise ValueError("multilabel reads IDs directly; omit id_mode and structure_id_sources")
+    elif cfg["target_type"] not in {"text_id", "url", "structure_id_v3"}:
+        raise ValueError("Invalid target_type for legacy inputs")
     if cfg["precision"] not in {"fp32", "fp16", "bf16"}:
         raise ValueError("Invalid precision")
     if cfg["id_mode"] not in {"auto", "numeric", "text_id"}:
@@ -79,8 +97,6 @@ def load_config(path: Path) -> dict:
         raise ValueError("validation_fraction must be between zero and one")
     if not math.isfinite(cfg["length_penalty"]):
         raise ValueError("length_penalty must be finite")
-    if cfg["num_beams"] <= cfg["negatives_per_query"]:
-        raise ValueError("num_beams must exceed negatives_per_query to allow positive filtering")
     metrics = {f"{name}@{k}" for name in ("mrr", "recall")
                for k in {1, min(5, cfg["num_beams"]), min(10, cfg["num_beams"]), cfg["num_beams"]}}
     if cfg["selection_metric"] not in metrics:
@@ -102,8 +118,8 @@ def load_config(path: Path) -> dict:
         if not isinstance(cfg[key], list):
             raise ValueError(f"{key} must be a list of paths")
         cfg[key] = [str((path.parent / Path(p).expanduser()).resolve()) for p in cfg[key]]
-    if not cfg["corpus_files"]:
-        raise ValueError("corpus_files cannot be empty")
+    if not cfg["corpus_files"] and cfg["input_format"] == "legacy":
+        raise ValueError("corpus_files cannot be empty for legacy inputs")
     return cfg
 
 
@@ -176,7 +192,7 @@ def training_command(cfg: dict, manifest_path: Path, directory: Path,
         command += ["-m", "torch.distributed.run", "--standalone", f"--nproc_per_node={cfg['num_gpus']}"]
     command += [str(SRC / "pretrain/train_ddro_vault.py")]
     options = {**manifest["training"], "checkpoint_path": manifest["policy_checkpoint"],
-               "reference_checkpoint_path": manifest["policy_checkpoint"], "train_file": manifest["pairs_file"],
+               "reference_checkpoint_path": manifest["reference_checkpoint"], "train_file": manifest["pairs_file"],
                "round_manifest": manifest_path, "output_dir": directory, "validation_split": 0}
     for key, value in options.items():
         command.extend([f"--{key}", str(value)])
@@ -218,14 +234,12 @@ def audit_pairs(path: Path, queries: list[dict], documents: Path, target_type: s
         counts[row["query_key"]] += 1
         if counts[row["query_key"]] > quota:
             raise ValueError("Negative quota exceeded")
-    if not seen:
-        raise ValueError("No model-confusion pairs remain; widen beams or select more queries")
     return {"pairs": len(seen), "selected_queries": len(queries), "queries_with_pairs": len(counts),
             "queries_without_negatives": len(queries) - len(counts),
-            "query_coverage": len(counts) / len(queries),
+            "query_coverage": len(counts) / max(1, len(queries)),
             "pairs_per_query": dict(Counter(counts.get(key, 0) for key in query_map)),
             "overlap_with_previous_pairs": len(seen & previous_keys),
-            "previous_overlap_fraction": len(seen & previous_keys) / len(seen)}
+            "previous_overlap_fraction": len(seen & previous_keys) / max(1, len(seen))}
 
 
 def run_pipeline(cfg: dict, resume=False, prepare_only=False, runner=run_command) -> dict:
@@ -238,6 +252,7 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner):
     manifest_path = output / "run_manifest.json"
     sources = [cfg["query_file"], *cfg["corpus_files"], *cfg["structure_id_sources"]]
     code = [Path(__file__), SRC / "pretrain/train_ddro_vault.py",
+            SRC / "pretrain/update_dpo_reference.py",
             SRC / "pretrain/iterative_dpo_utils.py", SRC / "data/data_prep/prepare_vault_dpo_metadata.py",
             MINING / "mine_model_confusion_negatives.py", MINING / "prepare_bm25.py", MINING / "common.py",
             SRC / "utils/trie.py"]
@@ -279,12 +294,25 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner):
     validation = metadata / "validation_queries.jsonl"
     stage("prepare", [documents, training, validation, metadata / "split_manifest.json"], lambda: prepare(
         cfg["corpus_files"], cfg["query_file"], str(metadata), cfg["validation_fraction"], cfg["seed"],
-        cfg["structure_id_sources"], cfg["id_mode"]))
+        cfg["structure_id_sources"], cfg["id_mode"], cfg["input_format"], cfg["target_type"]))
     queries = list(iter_json_records(training))
     heldout = list(iter_json_records(validation))
     if ({normalize_query(r["prompt"]) for r in queries} & {normalize_query(r["prompt"]) for r in heldout}
             or {r["family_id"] for r in queries} & {r["family_id"] for r in heldout}):
         raise ValueError("Training and validation query families overlap")
+    partitions = partition_queries(queries, cfg["queries_per_round"], cfg["seed"]) if cfg["rounds"] is None else None
+    total_rounds = len(partitions) if partitions is not None else cfg["rounds"]
+    plan = {"mode": "partition_all" if partitions is not None else "fixed_rounds",
+            "total_rounds": total_rounds, "training_queries": len(queries), "validation_queries": len(heldout),
+            "queries_per_round": cfg["queries_per_round"], "seed": cfg["seed"],
+            "partition_sizes": [len(part) for part in partitions] if partitions is not None else None}
+    plan_path = output / "round_plan.json"
+    stage("round-plan", [plan_path], lambda: atomic_json(plan_path, plan))
+    if read_json(plan_path) != plan:
+        raise ValueError("Round partition plan changed")
+    state["planned_rounds"] = total_rounds
+    atomic_json(manifest_path, state)
+    print(f"Round plan: {total_rounds} rounds for {len(queries)} training queries ({plan['mode']}).", flush=True)
     if prepare_only:
         return state
 
@@ -297,17 +325,19 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner):
 
     checkpoint = cfg["checkpoint_path"]
     fingerprint = identity["initial_checkpoint"]
+    reference_checkpoint, reference_fingerprint = checkpoint, fingerprint
     baseline = evaluate("baseline", checkpoint, fingerprint, -1, output / "baseline")
     best = {"round_id": -1, "checkpoint": checkpoint, "metrics": baseline,
             "checkpoint_fingerprint": fingerprint}
     previous = None
     results = []
-    for round_id in range(cfg["rounds"]):
+    for round_id in range(total_rounds):
         directory = output / f"round-{round_id:03d}"
         selected = directory / "queries.jsonl"
         pairs = directory / "preferences.jsonl"
         audit = directory / "pair_audit.json"
-        selected_rows = round_queries(queries, cfg["queries_per_round"], round_id, cfg["seed"])
+        selected_rows = (partitions[round_id] if partitions is not None else
+                         round_queries(queries, cfg["queries_per_round"], round_id, cfg["seed"]))
         stage(f"select-{round_id}", [selected], lambda: atomic_jsonl(selected, selected_rows))
         mining_stats = pairs.with_suffix(".stats.json")
         def mine_round():
@@ -318,14 +348,18 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner):
                 presentations = (cfg["steps_per_round"] * cfg["num_gpus"] *
                                  cfg["training"]["per_device_train_batch_size"] *
                                  cfg["training"]["gradient_accumulation_steps"])
-                report["nominal_pair_presentations"] = presentations
-                report["nominal_dataset_passes"] = presentations / report["pairs"]
+                report["nominal_pair_presentations"] = presentations if report["pairs"] else 0
+                report["nominal_dataset_passes"] = presentations / report["pairs"] if report["pairs"] else 0
+            else:
+                report["nominal_pair_presentations"] = report["pairs"] * cfg["epochs_per_round"]
+                report["nominal_dataset_passes"] = cfg["epochs_per_round"] if report["pairs"] else 0
             atomic_json(audit, report)
             print("Round preferences:", json.dumps(report), flush=True)
         stage(f"mine-{round_id}", [pairs, mining_stats, audit], mine_round)
         round_manifest = directory / "round_inputs.json"
         payload = {"round_id": round_id, "policy_checkpoint": checkpoint,
                    "policy_fingerprint": fingerprint, "pairs_file": str(pairs),
+                   "reference_checkpoint": reference_checkpoint, "reference_fingerprint": reference_fingerprint,
                    "inputs": {str(p): file_hash(p) for p in [selected, pairs, documents, validation]},
                    "training": training_options(cfg, round_id), "precision": cfg["precision"],
                    "num_gpus": cfg["num_gpus"]}
@@ -345,18 +379,50 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner):
             resume_checkpoint = latest_resumable_checkpoint(
                 train_dir, round_identity, cfg["num_gpus"], cfg["precision"] == "fp16")
             runner(training_command(cfg, round_manifest, train_dir, resume_checkpoint))
-        stage(f"train-{round_id}", [completion, train_dir / "training_metrics.json"], train)
-        info = read_json(completion)
-        if info["identity"] != round_identity or checkpoint_hash(latest) != info["checkpoint_fingerprint"]:
-            raise ValueError("Round output snapshot changed or is incomplete")
-        checkpoint, fingerprint = str(latest), info["checkpoint_fingerprint"]
+        report = read_json(audit)
+        if report["pairs"] == 0:
+            skipped = directory / "round_skipped.json"
+            marker = {"identity": round_identity, "reason": "no_model_negatives",
+                      "checkpoint": checkpoint, "checkpoint_fingerprint": fingerprint, "global_step": 0}
+            stage(f"skip-{round_id}", [skipped], lambda: atomic_json(skipped, marker))
+            if read_json(skipped) != marker:
+                raise ValueError("Skipped round provenance changed")
+            print(f"Round {round_id}: no usable negatives; skipping training and keeping the policy.", flush=True)
+            info = marker
+        else:
+            stage(f"train-{round_id}", [completion, train_dir / "training_metrics.json"], train)
+            info = read_json(completion)
+            if info["identity"] != round_identity or checkpoint_hash(latest) != info["checkpoint_fingerprint"]:
+                raise ValueError("Round output snapshot changed or is incomplete")
+            checkpoint, fingerprint = str(latest), info["checkpoint_fingerprint"]
+            if cfg["reference_update"] == "ema":
+                reference_output = directory / "reference"
+                reference_marker = reference_output / "reference_complete.json"
+                expected = reference_identity(reference_checkpoint, checkpoint, reference_fingerprint,
+                                              fingerprint, cfg["reference_ema_decay"])
+                command = [sys.executable, str(SRC / "pretrain/update_dpo_reference.py")]
+                for key, value in {**expected, "output": str(reference_output)}.items():
+                    command.extend(["--" + key.replace("_", "-"), str(value)])
+                stage(f"reference-{round_id}", [reference_marker], lambda: runner(command))
+                reference_info = read_json(reference_marker)
+                if (reference_info["identity"] != expected
+                        or checkpoint_hash(reference_output) != reference_info["checkpoint_fingerprint"]):
+                    raise ValueError("EMA reference snapshot or provenance changed")
+                reference_checkpoint = str(reference_output)
+                reference_fingerprint = reference_info["checkpoint_fingerprint"]
+            else:
+                reference_checkpoint, reference_fingerprint = checkpoint, fingerprint
         metrics = evaluate(f"evaluate-{round_id}", checkpoint, fingerprint, round_id, directory)
         result = {"round_id": round_id, "checkpoint": checkpoint, "checkpoint_fingerprint": fingerprint,
-                  "metrics": metrics, "pair_audit": read_json(audit), "optimizer_steps": info["global_step"]}
+                  "metrics": metrics, "pair_audit": report, "optimizer_steps": info["global_step"],
+                  "reference_checkpoint": payload["reference_checkpoint"],
+                  "next_reference_checkpoint": reference_checkpoint,
+                  "status": "trained" if report["pairs"] else "skipped_no_negatives"}
         results.append(result)
         if metrics[cfg["selection_metric"]] > best["metrics"][cfg["selection_metric"]]:
             best = {key: result[key] for key in ("round_id", "checkpoint", "checkpoint_fingerprint", "metrics")}
-        state.update({"rounds": results, "best": best, "latest": checkpoint})
+        state.update({"rounds": results, "best": best, "latest": checkpoint,
+                      "latest_reference": reference_checkpoint})
         atomic_json(manifest_path, state)
         atomic_json(output / "best_checkpoint.json", best)
         previous = pairs
