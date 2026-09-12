@@ -71,6 +71,7 @@ class FixtureWorker:
         elif "--checkpoint-path" in command:
             queries = list(iter_json_records(option("--query-metadata")))
             output = Path(option("--output"))
+            atomic_json(output.with_suffix(".excluded_text_ids.json"), {"overlength_targets": []})
             if "--evaluation-only" in command:
                 atomic_jsonl(output, [{"query_key": q["query_key"], "predicted_text_ids": [q["target_text_id"]]}
                                      for q in queries])

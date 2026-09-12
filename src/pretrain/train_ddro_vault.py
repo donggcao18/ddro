@@ -89,6 +89,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--max_prompt_length", type=int, default=128)
     parser.add_argument("--max_target_length", type=int, default=32)
+    parser.add_argument("--target_length_policy", choices=["error", "skip", "truncate"], default="error")
     parser.add_argument("--num_train_epochs", type=positive_float, default=2.0)
     parser.add_argument("--per_device_train_batch_size", type=int, default=4)
     parser.add_argument("--per_device_eval_batch_size", type=int, default=8)
@@ -392,14 +393,18 @@ def build_training_args(args: argparse.Namespace, has_eval: bool) -> DPOConfig:
     )
 
 
-def validate_target_sequences(datasets: DatasetDict, tokenizer: Any, limit: int) -> None:
+def validate_target_sequences(datasets: DatasetDict, tokenizer: Any, limit: int,
+                              length_policy: str = "error") -> None:
     targets = set()
     for dataset in datasets.values():
         targets.update(dataset["chosen"])
         targets.update(dataset["rejected"])
     owners = {}
     for target in sorted(targets):
-        sequence = tuple(tokenizer(target, truncation=False, add_special_tokens=True)["input_ids"])
+        options = {"truncation": length_policy == "truncate", "add_special_tokens": True}
+        if length_policy == "truncate":
+            options["max_length"] = limit
+        sequence = tuple(tokenizer(target, **options)["input_ids"])
         if not sequence or len(sequence) > limit:
             raise ValueError(f"Decoder target must fit without truncation ({len(sequence)} > {limit}): {target!r}")
         if tokenizer.eos_token_id is not None and sequence[-1] != tokenizer.eos_token_id:
@@ -488,7 +493,7 @@ def train_round(args: argparse.Namespace) -> None:
         checkpoint_path, args.trust_remote_code
     )
     if args.strict_targets:
-        validate_target_sequences(datasets, tokenizer, args.max_target_length)
+        validate_target_sequences(datasets, tokenizer, args.max_target_length, args.target_length_policy)
     print_preflight(
         datasets,
         tokenizer,

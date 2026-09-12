@@ -36,6 +36,7 @@ DEFAULTS = {
     "num_gpus": 1, "precision": "bf16", "device": "auto",
     "num_beams": 16, "negatives_per_query": 4, "mining_batch_size": 16,
     "max_prompt_length": 256, "max_target_length": 32, "length_penalty": 1.0,
+    "target_length_policy": "error",
     "selection_metric": "mrr@10",
     "training": {},
 }
@@ -55,6 +56,8 @@ def load_config(path: Path) -> dict:
     if unknown or required - raw.keys():
         raise ValueError(f"Invalid config keys: unknown={unknown}, missing={required - raw.keys()}")
     cfg = {**DEFAULTS, **raw}
+    if cfg["target_length_policy"] not in {"error", "skip", "truncate"}:
+        raise ValueError("target_length_policy must be error, skip, or truncate")
     if cfg["reference_update"] not in {"replace", "ema"}:
         raise ValueError("reference_update must be replace or ema")
     if (type(cfg["reference_ema_decay"]) not in {int, float}
@@ -165,7 +168,7 @@ def generation_command(cfg: dict, checkpoint: str, queries: Path, documents: Pat
         "max-prompt-length": cfg["max_prompt_length"], "max-target-length": cfg["max_target_length"],
         "length-penalty": cfg["length_penalty"], "seed": cfg["seed"] + max(round_id, 0),
         "device": cfg["device"], "round-id": round_id,
-        "target-collision-policy": "error", "target-length-policy": "error",
+        "target-collision-policy": "error", "target-length-policy": cfg["target_length_policy"],
     }
     for key, value in options.items():
         command.extend([f"--{key}", str(value)])
@@ -180,6 +183,7 @@ def generation_command(cfg: dict, checkpoint: str, queries: Path, documents: Pat
 def training_options(cfg: dict, round_id: int) -> dict:
     return {**cfg["training"], "seed": cfg["seed"] + round_id,
             "max_prompt_length": cfg["max_prompt_length"], "max_target_length": cfg["max_target_length"],
+            "target_length_policy": cfg["target_length_policy"],
             "max_steps": cfg["steps_per_round"] or -1,
             "num_train_epochs": cfg["epochs_per_round"] or 1.0}
 
@@ -319,7 +323,7 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner):
     def evaluate(name, checkpoint, fingerprint, round_id, directory):
         predictions = directory / "validation_predictions.jsonl"
         stats = predictions.with_suffix(".stats.json")
-        stage(name, [predictions, stats], lambda: runner(generation_command(
+        stage(name, [predictions, stats, predictions.with_suffix(".excluded_text_ids.json")], lambda: runner(generation_command(
             cfg, checkpoint, validation, documents, predictions, fingerprint, round_id, evaluate=True)))
         return read_json(stats)["metrics"]
 
@@ -355,7 +359,7 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner):
                 report["nominal_dataset_passes"] = cfg["epochs_per_round"] if report["pairs"] else 0
             atomic_json(audit, report)
             print("Round preferences:", json.dumps(report), flush=True)
-        stage(f"mine-{round_id}", [pairs, mining_stats, audit], mine_round)
+        stage(f"mine-{round_id}", [pairs, mining_stats, audit, pairs.with_suffix(".excluded_text_ids.json")], mine_round)
         round_manifest = directory / "round_inputs.json"
         payload = {"round_id": round_id, "policy_checkpoint": checkpoint,
                    "policy_fingerprint": fingerprint, "pairs_file": str(pairs),

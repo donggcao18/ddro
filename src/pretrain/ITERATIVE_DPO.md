@@ -172,10 +172,26 @@ never used to construct training preferences.
 Prepared metadata retains internal names such as `text_id`, `positive_text_ids`
 and `chosen_text_id`; in this mode their values are the selected IDs themselves
 (URLs here), not mapped semantic IDs. `doc_id_type` records their namespace.
-Use a checkpoint SFT-trained to generate that same ID type. Long URLs must fit
-`max_target_length` including EOS; strict generation checks reject truncation
-and token collisions. The configured limit of 64 is not guaranteed to fit the
-full dataset. Use a new output directory when changing data or ID type;
+Use a checkpoint SFT-trained to generate that same ID type. The example config
+uses `max_target_length: 128` and `target_length_policy: "truncate"`. Mining and
+training both use the tokenizer's truncation with special tokens, retaining EOS
+within the limit. Original full URL strings remain in metadata and preference
+JSONL. The constrained decoder's shortened token sequence is mapped back to
+the full ID for mining and retrieval evaluation. Queries are not dropped just
+because their target is long. Token-identical IDs, including truncation
+collisions, still fail preflight: two indistinguishable targets cannot form
+a valid preference. Truncation means learning a shortened representation of
+the URL, not generating its complete text. Log files named
+`*.excluded_text_ids.json` include `truncated_targets` and the original token
+lengths in `overlength_targets`; statistics also report the truncation count.
+
+`target_length_policy: "error"` keeps the original fail-on-overlength behavior
+(the default when omitted). `"skip"` excludes long IDs from candidate generation
+and skips training queries with a long chosen target. Evaluation in skip mode
+retains all query labels and counts unreachable long positives as misses.
+In every mode, padding/unknown tokens and ambiguous targets remain errors.
+
+Use a new output directory when changing data, ID type, or length policy;
 existing rounds cannot be resumed with different inputs.
 
 Legacy inputs remain supported with `input_format: "legacy"` (the default):
@@ -209,9 +225,9 @@ the requested value; counts and input hashes are saved in `split_manifest.json`.
 In legacy mode, `target_type` supports `text_id`, `url`, and `structure_id_v3`. For structure
 targets, provide `structure_id_sources` with URL-to-structure mappings, or
 include the structure fields in corpus records. Match the SFT decoder namespace.
-Every corpus target must have an unambiguous mapping and fit entirely within
-`max_target_length`, including EOS. Increase the limit or correct the mapping
-when preflight fails; this path never truncates document identities.
+Every corpus target must have an unambiguous mapping. The selected
+`target_length_policy` also applies to legacy inputs; `error` requires complete
+targets to fit within `max_target_length`, including EOS.
 
 ## Checkpoints and recovery
 

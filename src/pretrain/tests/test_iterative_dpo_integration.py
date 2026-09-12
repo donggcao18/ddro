@@ -49,7 +49,10 @@ class RealT5RoundTest(unittest.TestCase):
     def test_ema_reference_training_and_resume(self):
         self.exercise_rounds(multilabel=True, ema=True)
 
-    def exercise_rounds(self, multilabel, ema=False):
+    def test_truncated_url_targets_mining_training_and_resume(self):
+        self.exercise_rounds(multilabel=True, truncate=True)
+
+    def exercise_rounds(self, multilabel, ema=False, truncate=False):
         import torch
         from tokenizers import Tokenizer
         from tokenizers.models import WordLevel
@@ -121,6 +124,9 @@ class RealT5RoundTest(unittest.TestCase):
                 config.pop("rounds")  # Exercise full-data scheduling with a smaller final partition.
                 config.update(reference_update="ema", reference_ema_decay=0.9)
                 atomic_json(config_path, config)
+            if truncate:
+                atomic_json(config_path, {**read_json(config_path), "target_length_policy": "truncate",
+                                          "max_target_length": 8})
             loaded = []
             original_loader = trainer_module.load_policy_model
             def tracked_loader(*args):
@@ -139,6 +145,14 @@ class RealT5RoundTest(unittest.TestCase):
             def tracked_trainer(*args, **kwargs):
                 kwargs["callbacks"].append(InterruptOnce())
                 result = real_trainer(*args, **kwargs)
+                if truncate:
+                    for i in range(len(result.train_dataset)):
+                        for column in ("chosen", "rejected"):
+                            original = kwargs["train_dataset"][i][column]
+                            expected = tokenizer(original, truncation=True, max_length=8)["input_ids"]
+                            self.assertGreater(len(tokenizer(original)["input_ids"]), 8)
+                            self.assertEqual(result.train_dataset[i][column + "_labels"], expected)
+                            self.assertEqual(expected[-1], tokenizer.eos_token_id)
                 batch = result._prepare_inputs(result.data_collator([result.train_dataset[i] for i in range(2)]))
                 result.model.train()
                 initial_loss, _ = result.get_batch_loss_metrics(result.model, batch)
@@ -184,6 +198,13 @@ class RealT5RoundTest(unittest.TestCase):
 
             cfg = load_config(config_path)
             straight = run_pipeline(cfg, runner=runner)
+            if truncate:
+                baseline_stats = read_json(root / "straight/baseline/validation_predictions.stats.json")
+                self.assertEqual(baseline_stats["truncated_targets"], 8)
+                self.assertEqual(baseline_stats["excluded_overlength_targets"], 0)
+                self.assertEqual(baseline_stats["usable_decoder_targets"], 8)
+                for result in straight["rounds"]:
+                    self.assertEqual(result["pair_audit"]["query_coverage"], 1)
             if ema:
                 plan = read_json(root / "straight/round_plan.json")
                 self.assertEqual(plan["partition_sizes"], [4, 2])

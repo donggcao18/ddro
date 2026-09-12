@@ -52,10 +52,25 @@ class FakeTokenizer:
         self.encodings = encodings
 
     def __call__(self, text: str, **kwargs) -> dict[str, list[int]]:
-        return {"input_ids": self.encodings[text]}
+        ids = self.encodings[text]
+        if kwargs.get("truncation") and len(ids) > kwargs["max_length"]:
+            ids = ids[:kwargs["max_length"] - 1] + [ids[-1]]
+        return {"input_ids": ids}
 
 
 class ModelConfusionHelperTest(unittest.TestCase):
+    def test_truncated_targets_keep_full_ids_and_reject_prefix_collisions(self):
+        tokenizer = FakeTokenizer({"long-a": [10, 11, 12, 1], "long-b": [14, 15, 16, 1],
+                                   "same-prefix": [10, 11, 99, 1]})
+        encoded, mapping, excluded, groups, overlong = build_target_index(
+            tokenizer, ["long-a", "long-b"], 3, length_policy="truncate")
+        self.assertEqual(mapping, {(10, 11, 1): "long-a", (14, 15, 1): "long-b"})
+        self.assertEqual(excluded, set())
+        self.assertEqual(len(overlong), 2)
+        self.assertTrue(all(len(tokens) == 3 and tokens[-1] == 1 for tokens in encoded))
+        with self.assertRaisesRegex(ValueError, "same tokenizer target sequence"):
+            build_target_index(tokenizer, ["long-a", "same-prefix"], 3, length_policy="truncate")
+
     def test_canonicalizes_and_filters_model_beams(self) -> None:
         sequence_to_id = {
             (11, 1): "target",

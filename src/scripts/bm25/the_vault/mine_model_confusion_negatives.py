@@ -18,7 +18,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
-from common import as_text_id, document_targets, iter_json_records
+from common import as_text_id, as_text_id_list, document_targets, iter_json_records
 
 
 SRC_DIR = Path(__file__).resolve().parents[3]
@@ -99,6 +99,8 @@ def build_target_index(
     list[tuple[int, str]],
 ]:
     """Build unique target sequences and identify unusable decoder targets."""
+    if length_policy not in {"error", "skip", "truncate"}:
+        raise ValueError("Invalid target length policy")
     sequence_groups: dict[tuple[int, ...], list[str]] = {}
     overlong_targets: list[tuple[int, str]] = []
     for target in sorted(set(targets)):
@@ -107,7 +109,13 @@ def build_target_index(
             raise ValueError(f"Tokenizer produced no target tokens for target={target!r}")
         if len(sequence) > max_target_length:
             overlong_targets.append((len(sequence), target))
-            continue
+            if length_policy != "truncate":
+                continue
+            # Match encoder-decoder DPO tokenization, including special tokens.
+            sequence = tuple(tokenizer(target, add_special_tokens=True, truncation=True,
+                                       max_length=max_target_length)["input_ids"])
+            if not sequence or len(sequence) > max_target_length:
+                raise ValueError(f"Tokenizer did not truncate target to the requested length: {target!r}")
         sequence_groups.setdefault(sequence, []).append(target)
     overlong_targets.sort(reverse=True)
     if overlong_targets and length_policy == "error":
@@ -139,9 +147,8 @@ def build_target_index(
     collision_targets = {
         target for group in collision_groups for target in group
     }
-    mining_excluded_targets = collision_targets | {
-        target for _, target in overlong_targets
-    }
+    mining_excluded_targets = collision_targets | (
+        {target for _, target in overlong_targets} if length_policy != "truncate" else set())
     sequence_to_target = {
         sequence: group[0]
         for sequence, group in sequence_groups.items()
@@ -365,7 +372,8 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
     collision_targets = {
         target for group in collision_groups for target in group
     }
-    overlength_targets = {target for _, target in overlong_targets}
+    overlength_targets = ({target for _, target in overlong_targets}
+                          if args.target_length_policy != "truncate" else set())
     collision_excluded_text_ids = {
         target_to_text_id[target]
         for target in collision_targets
@@ -421,6 +429,8 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                 "collision_policy": args.target_collision_policy,
                 "length_policy": args.target_length_policy,
                 "max_target_length": args.max_target_length,
+                "truncated_targets": [target for _, target in overlong_targets]
+                    if args.target_length_policy == "truncate" else [],
                 "collision_groups": [
                     {
                         "targets": group,
@@ -436,10 +446,10 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                     }
                     for length, target in overlong_targets
                 ],
-                # Only tokenizer collisions must be removed from final hybrid
-                # DPO data. Overlength targets are excluded from constrained
-                # model generation only; the DDRO trainer owns its truncation
-                # policy for chosen/rejected rows.
+                # Legacy hybrid paths may retain overlength chosen targets.
+                # Strict iterative mining also skips queries whose chosen
+                # target is overlength; no truncated ID enters training.
+                "strict_training_excluded_text_ids": sorted(mining_excluded_text_ids),
                 "excluded_targets": sorted(collision_targets),
                 "excluded_text_ids": sorted(collision_excluded_text_ids),
                 "model_mining_excluded_targets": sorted(
@@ -475,11 +485,18 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
             ):
                 eligible_queries: list[dict[str, Any]] = []
                 for query in query_batch:
+                    stats["queries_seen"] += 1
                     query_target_id = as_text_id(query.get("target_text_id"))
+                    query_positive_ids = set(as_text_id_list(query.get("positive_text_ids"))) | {query_target_id}
+                    if query_positive_ids & overlength_excluded_text_ids:
+                        stats["queries_with_overlength_positive"] += 1
                     if query_target_id in collision_excluded_text_ids:
                         stats["queries_skipped_target_collision"] += 1
                         continue
                     if query_target_id in overlength_excluded_text_ids:
+                        if getattr(args, "strict_corpus", False) and not evaluation_only:
+                            stats["queries_skipped_overlength_target"] += 1
+                            continue
                         stats["queries_with_overlength_target_processed"] += 1
                     eligible_queries.append(query)
                 query_batch = eligible_queries
@@ -547,8 +564,14 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                     }
                     if evaluation_only:
                         missing = positive_ids - text_id_to_target.keys()
-                        if missing or any(text_id_to_target[p] in mining_excluded_targets for p in positive_ids):
-                            raise ValueError("Evaluation positives must all be valid, complete corpus targets")
+                        if missing:
+                            raise ValueError("Evaluation positives must all map to corpus targets")
+                        positive_targets = {text_id_to_target[p] for p in positive_ids}
+                        if positive_targets & (mining_excluded_targets - overlength_targets):
+                            raise ValueError("Evaluation positives contain ambiguous targets")
+                        # Keep long positives in the ground truth. Since they
+                        # cannot be generated, they count as misses, rather
+                        # than silently shrinking recall's denominator.
                         ranked_targets = [sequence_to_target.get(canonical_generated_tokens(
                             sequence, int(config.decoder_start_token_id),
                             tokenizer.pad_token_id, tokenizer.eos_token_id,
@@ -595,6 +618,9 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                         chosen_target = text_id_to_target.get(chosen_id)
                         if chosen_id in collision_excluded_text_ids:
                             stats["chosen_targets_skipped_collision"] += 1
+                            continue
+                        if getattr(args, "strict_corpus", False) and chosen_id in overlength_excluded_text_ids:
+                            stats["chosen_targets_skipped_overlength"] += 1
                             continue
                         if chosen_target is None:
                             raise ValueError(
@@ -665,6 +691,7 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
             "excluded_collision_targets": len(collision_targets),
             "excluded_collision_text_ids": len(collision_excluded_text_ids),
             "excluded_overlength_targets": len(overlength_targets),
+            "truncated_targets": len(overlong_targets) if args.target_length_policy == "truncate" else 0,
             "excluded_overlength_text_ids": len(overlength_excluded_text_ids),
             "model_mining_excluded_targets": len(mining_excluded_targets),
             "model_mining_excluded_text_ids": len(mining_excluded_text_ids),
@@ -724,12 +751,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--target-length-policy",
-        choices=["error", "skip"],
+        choices=["error", "skip", "truncate"],
         default="error",
         help=(
             "How to handle decoder targets longer than --max-target-length. "
-            "Use skip to remove them from the constrained model-generation "
-            "candidate trie without excluding them from downstream DDRO data."
+            "Use skip to remove them from the candidate trie, or truncate to "
+            "use tokenizer-truncated sequences while preserving original ID labels."
         ),
     )
     parser.add_argument("--negatives-per-query", type=int, default=4)
