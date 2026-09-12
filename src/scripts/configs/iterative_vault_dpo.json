@@ -16,7 +16,7 @@
   "negatives_per_query": 4,
   "mining_batch_size": 16,
   "max_prompt_length": 256,
-  "max_target_length": 64,
+  "max_target_length": 128,
   "selection_metric": "mrr@10",
   "training": {
     "per_device_train_batch_size": 16,
