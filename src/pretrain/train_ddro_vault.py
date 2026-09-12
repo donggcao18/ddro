@@ -90,6 +90,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_prompt_length", type=int, default=128)
     parser.add_argument("--max_target_length", type=int, default=32)
     parser.add_argument("--target_length_policy", choices=["error", "skip", "truncate"], default="error")
+    parser.add_argument("--target_collision_policy", choices=["error", "skip", "allow"], default="error")
     parser.add_argument("--num_train_epochs", type=positive_float, default=2.0)
     parser.add_argument("--per_device_train_batch_size", type=int, default=4)
     parser.add_argument("--per_device_eval_batch_size", type=int, default=8)
@@ -394,7 +395,7 @@ def build_training_args(args: argparse.Namespace, has_eval: bool) -> DPOConfig:
 
 
 def validate_target_sequences(datasets: DatasetDict, tokenizer: Any, limit: int,
-                              length_policy: str = "error") -> None:
+                              length_policy: str = "error", collision_policy: str = "error") -> None:
     targets = set()
     for dataset in datasets.values():
         targets.update(dataset["chosen"])
@@ -413,7 +414,7 @@ def validate_target_sequences(datasets: DatasetDict, tokenizer: Any, limit: int,
             tokenizer.unk_token_id is not None and tokenizer.unk_token_id in sequence
         ):
             raise ValueError(f"Target contains padding/unknown tokens: {target!r}")
-        if sequence in owners and owners[sequence] != target:
+        if collision_policy != "allow" and sequence in owners and owners[sequence] != target:
             raise ValueError(f"Token-identical targets: {owners[sequence]!r}, {target!r}")
         owners[sequence] = target
 
@@ -493,7 +494,8 @@ def train_round(args: argparse.Namespace) -> None:
         checkpoint_path, args.trust_remote_code
     )
     if args.strict_targets:
-        validate_target_sequences(datasets, tokenizer, args.max_target_length, args.target_length_policy)
+        validate_target_sequences(datasets, tokenizer, args.max_target_length,
+                                  args.target_length_policy, args.target_collision_policy)
     print_preflight(
         datasets,
         tokenizer,

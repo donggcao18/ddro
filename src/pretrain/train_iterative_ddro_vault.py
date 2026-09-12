@@ -37,6 +37,7 @@ DEFAULTS = {
     "num_beams": 16, "negatives_per_query": 4, "mining_batch_size": 16,
     "max_prompt_length": 256, "max_target_length": 32, "length_penalty": 1.0,
     "target_length_policy": "error",
+    "target_collision_policy": "error",
     "selection_metric": "mrr@10",
     "training": {},
 }
@@ -58,6 +59,8 @@ def load_config(path: Path) -> dict:
     cfg = {**DEFAULTS, **raw}
     if cfg["target_length_policy"] not in {"error", "skip", "truncate"}:
         raise ValueError("target_length_policy must be error, skip, or truncate")
+    if cfg["target_collision_policy"] not in {"error", "skip", "allow"}:
+        raise ValueError("target_collision_policy must be error, skip, or allow")
     if cfg["reference_update"] not in {"replace", "ema"}:
         raise ValueError("reference_update must be replace or ema")
     if (type(cfg["reference_ema_decay"]) not in {int, float}
@@ -168,7 +171,8 @@ def generation_command(cfg: dict, checkpoint: str, queries: Path, documents: Pat
         "max-prompt-length": cfg["max_prompt_length"], "max-target-length": cfg["max_target_length"],
         "length-penalty": cfg["length_penalty"], "seed": cfg["seed"] + max(round_id, 0),
         "device": cfg["device"], "round-id": round_id,
-        "target-collision-policy": "error", "target-length-policy": cfg["target_length_policy"],
+        "target-collision-policy": cfg["target_collision_policy"],
+        "target-length-policy": cfg["target_length_policy"],
     }
     for key, value in options.items():
         command.extend([f"--{key}", str(value)])
@@ -184,6 +188,7 @@ def training_options(cfg: dict, round_id: int) -> dict:
     return {**cfg["training"], "seed": cfg["seed"] + round_id,
             "max_prompt_length": cfg["max_prompt_length"], "max_target_length": cfg["max_target_length"],
             "target_length_policy": cfg["target_length_policy"],
+            "target_collision_policy": cfg["target_collision_policy"],
             "max_steps": cfg["steps_per_round"] or -1,
             "num_train_epochs": cfg["epochs_per_round"] or 1.0}
 

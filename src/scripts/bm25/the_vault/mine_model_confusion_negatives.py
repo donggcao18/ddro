@@ -101,6 +101,8 @@ def build_target_index(
     """Build unique target sequences and identify unusable decoder targets."""
     if length_policy not in {"error", "skip", "truncate"}:
         raise ValueError("Invalid target length policy")
+    if collision_policy not in {"error", "skip", "allow"}:
+        raise ValueError("Invalid target collision policy")
     sequence_groups: dict[tuple[int, ...], list[str]] = {}
     overlong_targets: list[tuple[int, str]] = []
     for target in sorted(set(targets)):
@@ -147,12 +149,12 @@ def build_target_index(
     collision_targets = {
         target for group in collision_groups for target in group
     }
-    mining_excluded_targets = collision_targets | (
+    mining_excluded_targets = (collision_targets if collision_policy != "allow" else set()) | (
         {target for _, target in overlong_targets} if length_policy != "truncate" else set())
     sequence_to_target = {
         sequence: group[0]
         for sequence, group in sequence_groups.items()
-        if len(group) == 1
+        if len(group) == 1 or collision_policy == "allow"
     }
     encoded_targets = [list(sequence) for sequence in sequence_to_target]
     if not encoded_targets:
@@ -369,9 +371,12 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                 tokenizer.unk_token_id is not None and tokenizer.unk_token_id in sequence
             ):
                 raise ValueError("Corpus target contains padding or unknown tokens; correct the tokenizer/target mapping")
-    collision_targets = {
-        target for group in collision_groups for target in group
-    }
+    collision_targets = ({target for group in collision_groups for target in group}
+                         if args.target_collision_policy != "allow" else set())
+    target_aliases = ({group[0]: group for group in collision_groups}
+                      if args.target_collision_policy == "allow" else {})
+    target_representatives = {target: representative for representative, group in target_aliases.items()
+                              for target in group}
     overlength_targets = ({target for _, target in overlong_targets}
                           if args.target_length_policy != "truncate" else set())
     collision_excluded_text_ids = {
@@ -577,10 +582,14 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                             tokenizer.pad_token_id, tokenizer.eos_token_id,
                         )) for sequence in all_sequences[start:end]]
                         metric_totals.update(retrieval_metrics(ranked_targets, positive_targets, cutoffs))
+                        stats["ambiguous_generation_sequences"] += sum(t in target_aliases for t in ranked_targets)
                         output_handle.write(json.dumps({
                             "query_key": query["query_key"],
                             "positive_text_ids": sorted(positive_ids),
                             "predicted_text_ids": [target_to_text_id.get(t) for t in ranked_targets],
+                            "predicted_text_id_groups": [
+                                [target_to_text_id[alias] for alias in target_aliases.get(t, [t])]
+                                if t is not None else [] for t in ranked_targets],
                             "round_id": getattr(args, "round_id", None),
                         }) + "\n")
                         continue
@@ -590,6 +599,9 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                             f"{target_text_id!r}, which has no usable "
                             f"{args.target_type} decoder target"
                         )
+                    # Any sequence shared with a positive is ineligible as a
+                    # negative, even if its representative has another full ID.
+                    positive_targets = {target_representatives.get(t, t) for t in positive_targets}
                     candidates, selection_stats = select_model_candidates(
                         all_sequences[start:end],
                         all_scores[start:end],
@@ -688,6 +700,7 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
             "target_length_policy": args.target_length_policy,
             "max_target_length": args.max_target_length,
             "tokenizer_collision_groups": len(collision_groups),
+            "allowed_collision_groups": len(target_aliases),
             "excluded_collision_targets": len(collision_targets),
             "excluded_collision_text_ids": len(collision_excluded_text_ids),
             "excluded_overlength_targets": len(overlength_targets),
@@ -742,11 +755,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--target-collision-policy",
-        choices=["error", "skip"],
+        choices=["error", "skip", "allow"],
         default="error",
         help=(
             "Fail on tokenizer-identical targets (default), or exclude every "
-            "affected target and write an exclusion manifest beside the output."
+            "affected target, or allow shared token sequences with a deterministic "
+            "representative and exclude every positive's aliases from negatives."
         ),
     )
     parser.add_argument(
