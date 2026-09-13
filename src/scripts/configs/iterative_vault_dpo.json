@@ -14,7 +14,7 @@
   "precision": "bf16",
   "num_beams": 10,
   "negatives_per_query": 4,
-  "mining_batch_size": 16,
+  "mining_batch_size": 64,
   "max_prompt_length": 256,
   "max_target_length": 128,
   "target_length_policy": "truncate",
@@ -29,7 +29,7 @@
     "warmup_ratio": 0.1,
     "save_steps": 500,
     "logging_steps": 10,
-    "save_total_limit": 2,
+    "save_total_limit": 3,
     "dataset_num_proc": 1,
     "dataloader_num_workers": 0
   }
