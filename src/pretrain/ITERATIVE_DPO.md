@@ -30,6 +30,53 @@ training process group. Mining/evaluation use one device and run in separate
 processes, so their model memory is released before training. `fp32` with
 `device: cpu` supports small smoke tests; mixed precision requires CUDA.
 
+## Evaluation frequency and resuming an existing run
+
+The example config evaluates after every eight completed training epochs:
+
+```json
+"eval_every_epochs": 8,
+"eval_at_end": true
+```
+
+With `epochs_per_round: 1`, scheduled evaluation runs after zero-based rounds
+7, 15, 23, and so on. The final round is also evaluated; set `eval_at_end: false`
+to omit an extra final evaluation before the next eight-epoch boundary. These
+are epochs over each round's preference partition, not eight passes over the
+whole original query dataset. Empty rounds add no training epochs. With longer
+rounds, evaluation occurs at the first round boundary that crosses each
+eight-epoch threshold. `eval_every_epochs: null` (the default when omitted)
+preserves evaluation after every round. A numeric interval requires epoch-based
+rounds. The SFT baseline still runs once and is reused on resume.
+
+To change the schedule while an old run is in `evaluate-0`:
+
+1. Stop the current evaluation/job before starting another controller.
+2. Update `src/pretrain/train_iterative_ddro_vault.py` and add the two settings
+   above to your existing config. Keep all existing training settings and paths,
+   including the same `output_dir`.
+3. Restart the launcher with `--resume`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 CONFIG=/path/to/your/existing-config.json \
+  bash src/scripts/ddro/run_vault_iterative_dpo.sh --resume
+```
+
+This release accepts the immediately preceding controller's fingerprints and
+evaluation-schedule changes during resume. It records the prior identity in
+`run_manifest.json` under `identity_updates`; it does not rewrite round input
+manifests, preferences, checkpoint completion markers, or model weights.
+Training settings, source files, other runtime code, package versions, and
+checkpoint/artifact integrity are still checked. Unrelated older or modified
+controller versions are not automatically accepted.
+
+Completed evaluations are reused even when they precede the new interval.
+An interrupted evaluation that is no longer due is bypassed; its round's
+completed policy remains the starting policy for the next round. Deferred
+evaluations have `metrics: null` and `evaluation_status: "deferred"` in the
+run manifest. Best-checkpoint selection uses only the baseline and completed
+evaluations; training always proceeds from the latest trained policy.
+
 ## Round semantics
 
 1. Fix train/validation query-family membership once.
@@ -45,7 +92,7 @@ processes, so their model memory is released before training. `fp32` with
    reference snapshot separately. Freeze the reference, reset optimizer/scheduler,
    and train on the fixed preferences. Both start from SFT in the first round.
 6. Export the latest policy, update the reference for the next round, evaluate
-   fixed validation queries using the policy, and repeat.
+   fixed validation queries when the evaluation schedule is due, and repeat.
 
 The example config uses `reference_update: "ema"` and `reference_ema_decay: 0.9`:
 
@@ -284,8 +331,9 @@ regenerates it from its recorded input snapshots; the blend is never applied
 twice to an already updated reference. `latest_reference` in the run manifest
 points to the reference available for the next round.
 
-Model, tokenizer, source-data, configuration, relevant-code and package-version
-changes are rejected on resume. Use a new output directory for a changed
+Model, tokenizer, source-data, training-configuration, relevant-code and package-version
+changes are rejected on resume, except the compatible evaluation-only upgrade
+and scheduling changes described above. Use a new output directory for a changed
 experiment. Keep all round-start/latest and EMA reference snapshots; checkpoint rotation affects
 only periodic checkpoints inside an individual round. Completion markers and
 atomic manifests prevent an unfinished snapshot from becoming the next reference.

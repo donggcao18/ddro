@@ -6,6 +6,8 @@
   "target_type": "url_based_id",
   "queries_per_round": 10000,
   "epochs_per_round": 1,
+  "eval_every_epochs": 8,
+  "eval_at_end": true,
   "reference_update": "replace",
   "reference_ema_decay": 0.9,
   "seed": 42,

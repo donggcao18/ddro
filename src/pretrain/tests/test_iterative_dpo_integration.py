@@ -55,7 +55,10 @@ class RealT5RoundTest(unittest.TestCase):
     def test_allow_unknown_padding_and_collisions_in_mining_training_resume(self):
         self.exercise_rounds(multilabel=True, allow_tokens=True)
 
-    def exercise_rounds(self, multilabel, ema=False, truncate=False, allow_tokens=False):
+    def test_change_evaluation_schedule_after_round_zero_training(self):
+        self.exercise_rounds(multilabel=True, schedule_change=True)
+
+    def exercise_rounds(self, multilabel, ema=False, truncate=False, allow_tokens=False, schedule_change=False):
         import torch
         from tokenizers import Tokenizer
         from tokenizers.models import WordLevel
@@ -65,9 +68,9 @@ class RealT5RoundTest(unittest.TestCase):
         import mine_model_confusion_negatives as miner
         from pretrain import train_ddro_vault as trainer_module
         from pretrain import update_dpo_reference as ema_module
-        from pretrain.iterative_dpo_utils import atomic_json, atomic_jsonl, read_json
+        from pretrain.iterative_dpo_utils import atomic_json, atomic_jsonl, file_hash, read_json
         from common import iter_json_records
-        from pretrain.train_iterative_ddro_vault import load_config, run_pipeline
+        from pretrain.train_iterative_ddro_vault import EVALUATION_COMPATIBLE_CONTROLLERS, load_config, run_pipeline
 
         torch.set_num_threads(1)
         with tempfile.TemporaryDirectory() as tmp:
@@ -136,6 +139,8 @@ class RealT5RoundTest(unittest.TestCase):
             if truncate:
                 atomic_json(config_path, {**read_json(config_path), "target_length_policy": "truncate",
                                           "max_target_length": 8})
+            if schedule_change:
+                atomic_json(config_path, {**read_json(config_path), "eval_every_epochs": 8})
             if allow_tokens:
                 atomic_json(config_path, {**read_json(config_path), "target_token_policy": "allow",
                                           "target_collision_policy": "allow"})
@@ -154,10 +159,11 @@ class RealT5RoundTest(unittest.TestCase):
             interrupted = [False]
             interrupt_enabled = [False]
             ema_interrupted = [False]
+            evaluation_interrupted = [False]
             real_trainer = trainer_module.DPOTrainer
             class InterruptOnce(TrainerCallback):
                 def on_save(self, args, state, control, **kwargs):
-                    if interrupt_enabled[0] and not interrupted[0]:
+                    if interrupt_enabled[0] and not interrupted[0] and not schedule_change:
                         interrupted[0] = True
                         raise RuntimeError("intentional interruption after checkpoint save")
             def tracked_trainer(*args, **kwargs):
@@ -195,6 +201,11 @@ class RealT5RoundTest(unittest.TestCase):
                         ema_interrupted[0] = True
                         raise RuntimeError("intentional interruption after EMA export")
                 elif "--checkpoint-path" in command:
+                    if (schedule_change and interrupt_enabled[0] and not evaluation_interrupted[0]
+                            and "--evaluation-only" in command
+                            and command[command.index("--round-id") + 1] == "0"):
+                        evaluation_interrupted[0] = True
+                        raise RuntimeError("intentional interruption during evaluate-0")
                     miner.mine(miner.build_parser().parse_args(command[2:]))
                 else:
                     loaded.clear()
@@ -256,13 +267,32 @@ class RealT5RoundTest(unittest.TestCase):
                             self.assertTrue(all(rejected_tokens != tokenizer(p)["input_ids"]
                                                 for p in pair["positive_text_ids"]))
             resumed_cfg = {**cfg, "output_dir": str(root / "resumed")}
+            if schedule_change:
+                resumed_cfg["eval_every_epochs"] = None
             interrupt_enabled[0] = True
             with self.assertRaisesRegex(RuntimeError, "intentional interruption"):
                 run_pipeline(resumed_cfg, runner=runner)
+            if schedule_change:
+                manifest_path = root / "resumed/run_manifest.json"
+                legacy = read_json(manifest_path)
+                self.assertIn("train-0", legacy["stages"])
+                self.assertNotIn("evaluate-0", legacy["stages"])
+                legacy["identity"]["config"].pop("eval_every_epochs")
+                legacy["identity"]["config"].pop("eval_at_end")
+                legacy["identity"]["code"][str(SRC / "pretrain/train_iterative_ddro_vault.py")] = sorted(EVALUATION_COMPATIBLE_CONTROLLERS)[0]
+                atomic_json(manifest_path, legacy)
+                completion = root / "resumed/round-000/training/latest/round_complete.json"
+                original_completion_hash = file_hash(completion)
+                resumed_cfg["eval_every_epochs"] = 8
             if ema:
                 with self.assertRaisesRegex(RuntimeError, "after EMA export"):
                     run_pipeline(resumed_cfg, resume=True, runner=runner)
             resumed = run_pipeline(resumed_cfg, resume=True, runner=runner)
+            if schedule_change:
+                self.assertEqual(file_hash(completion), original_completion_hash)
+                self.assertIsNone(resumed["rounds"][0]["metrics"])
+                self.assertIsNotNone(resumed["rounds"][1]["metrics"])
+                self.assertEqual(len(resumed["identity_updates"]), 1)
             expected = T5ForConditionalGeneration.from_pretrained(straight["latest"]).state_dict()
             actual = T5ForConditionalGeneration.from_pretrained(resumed["latest"]).state_dict()
             for key in expected:

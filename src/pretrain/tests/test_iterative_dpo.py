@@ -18,7 +18,9 @@ from pretrain.iterative_dpo_utils import (
     atomic_json, atomic_jsonl, checkpoint_hash, file_hash, latest_resumable_checkpoint,
     partition_queries, read_json, round_queries,
 )
-from pretrain.train_iterative_ddro_vault import audit_pairs, load_config, run_pipeline
+from pretrain.train_iterative_ddro_vault import (
+    EVALUATION_COMPATIBLE_CONTROLLERS, audit_pairs, evaluation_due, load_config, run_pipeline,
+)
 from pretrain.update_dpo_reference import reference_identity
 
 
@@ -214,6 +216,104 @@ class MetadataTest(unittest.TestCase):
 
 
 class ControllerTest(unittest.TestCase):
+    def test_resume_old_run_during_evaluation_changes_schedule_without_retraining(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = fixture(root)
+            raw = read_json(path)
+            raw.pop("steps_per_round")
+            raw.update(epochs_per_round=1, rounds=9)
+            atomic_json(path, raw)
+            cfg = load_config(path)
+            worker = FixtureWorker()
+            def interrupt_evaluation(command):
+                if "--evaluation-only" in command and command[command.index("--round-id") + 1] == "0":
+                    # Simulate an interrupted generation file, with no committed stage.
+                    output = Path(command[command.index("--output") + 1])
+                    output.write_text("unfinished evaluation", encoding="utf-8")
+                    raise RuntimeError("interrupted evaluate-0")
+                worker(command)
+            with self.assertRaisesRegex(RuntimeError, "interrupted evaluate-0"):
+                run_pipeline(cfg, runner=interrupt_evaluation)
+            manifest_path = root / "run/run_manifest.json"
+            old = read_json(manifest_path)
+            self.assertIn("train-0", old["stages"])
+            self.assertNotIn("evaluate-0", old["stages"])
+            # Reproduce the previous release's manifest: no schedule keys and
+            # its known controller fingerprint, keeping all training hashes.
+            old["identity"]["config"].pop("eval_every_epochs")
+            old["identity"]["config"].pop("eval_at_end")
+            controller = str(SRC / "pretrain/train_iterative_ddro_vault.py")
+            old["identity"]["code"][controller] = sorted(EVALUATION_COMPATIBLE_CONTROLLERS)[0]
+            atomic_json(manifest_path, old)
+            preserved_paths = [root / "run/round-000" / name for name in (
+                "queries.jsonl", "preferences.jsonl", "round_inputs.json", "training/latest/round_complete.json")]
+            original_hashes = {p: file_hash(p) for p in preserved_paths}
+            original_policy = checkpoint_hash(root / "run/round-000/training/latest")
+            atomic_json(path, {**raw, "eval_every_epochs": 8})
+            worker.calls.clear()
+            state = run_pipeline(load_config(path), resume=True, runner=worker)
+            self.assertTrue(state["complete"])
+            self.assertEqual(len(state["identity_updates"]), 1)
+            self.assertEqual([c[c.index("--round-id") + 1] for c in worker.calls if "--evaluation-only" in c], ["7", "8"])
+            self.assertFalse(any("--output" in c and str(root / "run/round-000/preferences.jsonl") in c for c in worker.calls))
+            train_calls = [c for c in worker.calls if "--round_manifest" in c]
+            self.assertEqual(len(train_calls), 8)
+            self.assertNotIn(str(root / "run/round-000/round_inputs.json"), train_calls[0])
+            self.assertIsNone(state["rounds"][0]["metrics"])
+            self.assertEqual(state["rounds"][0]["evaluation_status"], "deferred")
+            self.assertEqual(state["rounds"][7]["completed_training_epochs"], 8)
+            self.assertEqual({p: file_hash(p) for p in preserved_paths}, original_hashes)
+            self.assertEqual(checkpoint_hash(root / "run/round-000/training/latest"), original_policy)
+            calls = len(worker.calls)
+            run_pipeline(load_config(path), resume=True, runner=worker)
+            self.assertEqual(len(worker.calls), calls)
+
+    def test_schedule_change_retains_completed_metrics_and_rejects_other_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = fixture(root)
+            raw = read_json(path)
+            raw.pop("steps_per_round")
+            raw["epochs_per_round"] = 1
+            atomic_json(path, raw)
+            cfg = load_config(path)
+            worker = FixtureWorker()
+            def interrupt_next_round(command):
+                if "--checkpoint-path" in command and "--evaluation-only" not in command and command[command.index("--round-id") + 1] == "1":
+                    raise RuntimeError("interrupted next round")
+                worker(command)
+                if "--evaluation-only" in command and command[command.index("--round-id") + 1] == "0":
+                    output = Path(command[command.index("--output") + 1])
+                    atomic_json(output.with_suffix(".stats.json"), {"metrics": {"mrr@8": 0.9}})
+            with self.assertRaisesRegex(RuntimeError, "interrupted next round"):
+                run_pipeline(cfg, runner=interrupt_next_round)
+            worker.calls.clear()
+            updated = {**cfg, "eval_every_epochs": 8, "eval_at_end": False}
+            with self.assertRaisesRegex(ValueError, "Resume config"):
+                run_pipeline({**updated, "training": {**cfg["training"], "learning_rate": 0.1}}, resume=True, runner=worker)
+            state = run_pipeline(updated, resume=True, runner=worker)
+            self.assertFalse(any("--evaluation-only" in c for c in worker.calls))
+            self.assertEqual(state["best"]["round_id"], 0)
+            self.assertEqual(state["rounds"][0]["metrics"]["mrr@8"], 0.9)
+            self.assertIsNone(state["rounds"][1]["metrics"])
+            manifest_path = root / "run/run_manifest.json"
+            tampered = read_json(manifest_path)
+            tampered["identity"]["code"][str(SRC / "pretrain/train_ddro_vault.py")] = "unknown-trainer-version"
+            atomic_json(manifest_path, tampered)
+            with self.assertRaisesRegex(ValueError, "Resume config"):
+                run_pipeline({**updated, "eval_every_epochs": 4}, resume=True, runner=worker)
+
+    def test_epoch_evaluation_boundary_and_final_override(self):
+        cfg = {"eval_every_epochs": 8, "eval_at_end": True}
+        self.assertFalse(evaluation_due(cfg, 0, 1, False))
+        self.assertTrue(evaluation_due(cfg, 7, 8, False))
+        self.assertFalse(evaluation_due(cfg, 8, 8, False))  # Empty round contributes no epoch.
+        self.assertFalse(evaluation_due(cfg, 8, 9, False))
+        self.assertTrue(evaluation_due(cfg, 15, 16, False))
+        self.assertTrue(evaluation_due(cfg, 0, 1, True))
+        self.assertFalse(evaluation_due({**cfg, "eval_at_end": False}, 0, 1, True))
+
     def test_automatic_round_count_covers_all_training_queries_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

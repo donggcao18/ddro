@@ -40,6 +40,7 @@ DEFAULTS = {
     "target_collision_policy": "error",
     "target_token_policy": "error",
     "selection_metric": "mrr@10",
+    "eval_every_epochs": None, "eval_at_end": True,
     "training": {},
 }
 TRAIN_DEFAULTS = {
@@ -49,6 +50,50 @@ TRAIN_DEFAULTS = {
     "logging_steps": 10, "save_total_limit": 2, "dataset_num_proc": 1,
     "dataloader_num_workers": 0,
 }
+
+# The immediately preceding controller, in LF and CRLF form. Only this known
+# evaluation-only upgrade may change its code fingerprint during resume.
+EVALUATION_COMPATIBLE_CONTROLLERS = {
+    "1bae0608a2e5ad79141d31b228553f98f2f21afe6ecbe453991dd039b8e60280",
+    "8edf71dcade31b08f67f1f581cb77eadd93f56df086c14ac7ea09de320951452",
+}
+EVALUATION_SCHEDULE_KEYS = {"eval_every_epochs", "eval_at_end"}
+
+
+def accept_evaluation_resume_update(state: dict, identity: dict) -> None:
+    """Permit only scheduling changes and the known compatible controller upgrade."""
+    previous = state["identity"]
+    previous_config = {k: v for k, v in previous["config"].items() if k not in EVALUATION_SCHEDULE_KEYS}
+    current_config = {k: v for k, v in identity["config"].items() if k not in EVALUATION_SCHEDULE_KEYS}
+    controller = str(Path(__file__))
+    previous_code, current_code = previous["code"], identity["code"]
+    valid_controller = (previous_code.get(controller) == current_code.get(controller)
+                        or previous_code.get(controller) in EVALUATION_COMPATIBLE_CONTROLLERS)
+    if (previous_config != current_config or not valid_controller
+            or {k: v for k, v in previous_code.items() if k != controller}
+            != {k: v for k, v in current_code.items() if k != controller}
+            or {k: v for k, v in previous.items() if k not in {"code", "config"}}
+            != {k: v for k, v in identity.items() if k not in {"code", "config"}}):
+        raise ValueError("Resume config, source data, code, environment, or SFT checkpoint changed; "
+                         "only evaluation scheduling and the compatible controller upgrade may change")
+    # Do not accept an upgrade over altered committed artifacts.
+    for artifacts in state["stages"].values():
+        assert_file_hashes(artifacts)
+    state.setdefault("identity_updates", []).append({
+        "reason": "evaluation_schedule_update", "previous_identity": previous,
+        "new_schedule": {key: identity["config"][key] for key in sorted(EVALUATION_SCHEDULE_KEYS)},
+        "new_controller_fingerprint": current_code[controller],
+    })
+    state["identity"] = identity
+
+
+def evaluation_due(cfg: dict, previous_epochs: float, completed_epochs: float, final_round: bool) -> bool:
+    interval = cfg["eval_every_epochs"]
+    if interval is None:
+        return True  # Preserve the old per-round default for existing configs.
+    crossed_boundary = (math.floor((completed_epochs + 1e-9) / interval)
+                        > math.floor((previous_epochs + 1e-9) / interval))
+    return crossed_boundary or (cfg["eval_at_end"] and final_round)
 
 
 def load_config(path: Path) -> dict:
@@ -76,6 +121,14 @@ def load_config(path: Path) -> dict:
         cfg["steps_per_round"] = None
     if (cfg["steps_per_round"] is None) == (cfg["epochs_per_round"] is None):
         raise ValueError("Specify exactly one of steps_per_round or epochs_per_round")
+    interval = cfg["eval_every_epochs"]
+    if interval is not None:
+        if type(interval) not in {int, float} or not math.isfinite(interval) or interval <= 0:
+            raise ValueError("eval_every_epochs must be null or a finite positive number")
+        if cfg["epochs_per_round"] is None:
+            raise ValueError("eval_every_epochs requires epoch-based rounds (epochs_per_round)")
+    if type(cfg["eval_at_end"]) is not bool:
+        raise ValueError("eval_at_end must be a boolean")
     if cfg["input_format"] not in {"legacy", "multilabel"}:
         raise ValueError("Invalid input_format")
     if cfg["input_format"] == "multilabel":
@@ -284,7 +337,9 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner):
             raise ValueError("Run exists; use --resume with the same config or a new output_dir")
         state = read_json(manifest_path)
         if state["identity"] != identity:
-            raise ValueError("Resume config, source data, code, environment, or SFT checkpoint changed")
+            accept_evaluation_resume_update(state, identity)
+            atomic_json(manifest_path, state)
+            print("Resuming with updated evaluation schedule; committed training artifacts are preserved.", flush=True)
     else:
         if resume:
             raise ValueError("No run_manifest.json to resume")
@@ -345,6 +400,7 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner):
             "checkpoint_fingerprint": fingerprint}
     previous = None
     results = []
+    completed_epochs = 0.0
     for round_id in range(total_rounds):
         directory = output / f"round-{round_id:03d}"
         selected = directory / "queries.jsonl"
@@ -426,14 +482,26 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner):
                 reference_fingerprint = reference_info["checkpoint_fingerprint"]
             else:
                 reference_checkpoint, reference_fingerprint = checkpoint, fingerprint
-        metrics = evaluate(f"evaluate-{round_id}", checkpoint, fingerprint, round_id, directory)
+        previous_epochs = completed_epochs
+        if report["pairs"] and cfg["epochs_per_round"] is not None:
+            completed_epochs += cfg["epochs_per_round"]
+        evaluation_stage = f"evaluate-{round_id}"
+        cached_evaluation = evaluation_stage in state["stages"]
+        if cached_evaluation or evaluation_due(cfg, previous_epochs, completed_epochs, round_id == total_rounds - 1):
+            metrics = evaluate(evaluation_stage, checkpoint, fingerprint, round_id, directory)
+            evaluation_status = "reused" if cached_evaluation else "evaluated"
+        else:
+            metrics = None
+            evaluation_status = "deferred"
+            print(f"Round {round_id}: evaluation deferred ({completed_epochs:g} completed training epochs).", flush=True)
         result = {"round_id": round_id, "checkpoint": checkpoint, "checkpoint_fingerprint": fingerprint,
                   "metrics": metrics, "pair_audit": report, "optimizer_steps": info["global_step"],
+                  "completed_training_epochs": completed_epochs, "evaluation_status": evaluation_status,
                   "reference_checkpoint": payload["reference_checkpoint"],
                   "next_reference_checkpoint": reference_checkpoint,
                   "status": "trained" if report["pairs"] else "skipped_no_negatives"}
         results.append(result)
-        if metrics[cfg["selection_metric"]] > best["metrics"][cfg["selection_metric"]]:
+        if metrics is not None and metrics[cfg["selection_metric"]] > best["metrics"][cfg["selection_metric"]]:
             best = {key: result[key] for key in ("round_id", "checkpoint", "checkpoint_fingerprint", "metrics")}
         state.update({"rounds": results, "best": best, "latest": checkpoint,
                       "latest_reference": reference_checkpoint})
