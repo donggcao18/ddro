@@ -203,6 +203,7 @@ def canonical_generated_tokens(
     decoder_start_token_id: int,
     pad_token_id: int | None,
     eos_token_id: int | None,
+    allow_pad_in_target: bool = False,
 ) -> tuple[int, ...]:
     """Normalize one generated encoder-decoder sequence for exact target lookup."""
     tokens = [int(token_id) for token_id in sequence]
@@ -214,7 +215,7 @@ def canonical_generated_tokens(
         if eos_token_id is not None and token_id == eos_token_id:
             canonical.append(token_id)
             break
-        if pad_token_id is not None and token_id == pad_token_id:
+        if pad_token_id is not None and token_id == pad_token_id and not allow_pad_in_target:
             break
         canonical.append(token_id)
     return tuple(canonical)
@@ -229,6 +230,7 @@ def select_model_candidates(
     decoder_start_token_id: int,
     pad_token_id: int | None,
     eos_token_id: int | None,
+    allow_pad_in_target: bool = False,
 ) -> tuple[list[dict[str, Any]], Counter[str]]:
     """Map beams to unique valid non-positive targets in model rank order."""
     selected: list[dict[str, Any]] = []
@@ -243,6 +245,7 @@ def select_model_candidates(
             decoder_start_token_id,
             pad_token_id,
             eos_token_id,
+            allow_pad_in_target,
         )
         target = sequence_to_target.get(canonical)
         if target is None:
@@ -363,13 +366,17 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
         args.target_collision_policy,
         args.target_length_policy,
     )
+    allow_target_tokens = getattr(args, "target_token_policy", "error") == "allow"
+    unknown_sequences = sum(tokenizer.unk_token_id is not None and tokenizer.unk_token_id in seq
+                            for seq in encoded_targets)
+    padding_sequences = sum(tokenizer.pad_token_id in seq for seq in encoded_targets)
     if getattr(args, "strict_corpus", False):
         for sequence in encoded_targets:
             if tokenizer.eos_token_id is not None and sequence[-1] != tokenizer.eos_token_id:
                 raise ValueError("Every corpus target must end in EOS")
-            if tokenizer.pad_token_id in sequence or (
+            if not allow_target_tokens and (tokenizer.pad_token_id in sequence or (
                 tokenizer.unk_token_id is not None and tokenizer.unk_token_id in sequence
-            ):
+            )):
                 raise ValueError("Corpus target contains padding or unknown tokens; correct the tokenizer/target mapping")
     collision_targets = ({target for group in collision_groups for target in group}
                          if args.target_collision_policy != "allow" else set())
@@ -580,6 +587,7 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                         ranked_targets = [sequence_to_target.get(canonical_generated_tokens(
                             sequence, int(config.decoder_start_token_id),
                             tokenizer.pad_token_id, tokenizer.eos_token_id,
+                            allow_target_tokens,
                         )) for sequence in all_sequences[start:end]]
                         metric_totals.update(retrieval_metrics(ranked_targets, positive_targets, cutoffs))
                         stats["ambiguous_generation_sequences"] += sum(t in target_aliases for t in ranked_targets)
@@ -611,6 +619,7 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                         int(config.decoder_start_token_id),
                         tokenizer.pad_token_id,
                         tokenizer.eos_token_id,
+                        allow_target_tokens,
                     )
                     stats.update(selection_stats)
                     candidate_count_distribution[len(candidates)] += 1
@@ -698,6 +707,9 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
             "target_type": args.target_type,
             "target_collision_policy": args.target_collision_policy,
             "target_length_policy": args.target_length_policy,
+            "target_token_policy": getattr(args, "target_token_policy", "error"),
+            "target_sequences_with_unknown_tokens": unknown_sequences,
+            "target_sequences_with_padding_tokens": padding_sequences,
             "max_target_length": args.max_target_length,
             "tokenizer_collision_groups": len(collision_groups),
             "allowed_collision_groups": len(target_aliases),
@@ -745,6 +757,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Write ranked predictions and retrieval metrics instead of preference pairs")
     parser.add_argument("--strict-corpus", action="store_true",
                         help="Reject missing/ambiguous mappings, padding, and unknown target tokens")
+    parser.add_argument("--target-token-policy", choices=["error", "allow"], default="error",
+                        help="Allow existing unknown/padding tokens in targets without changing their encoding")
     parser.add_argument("--query-metadata", required=True)
     parser.add_argument("--document-metadata", required=True)
     parser.add_argument("--output", required=True)

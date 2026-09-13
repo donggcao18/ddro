@@ -59,6 +59,19 @@ class FakeTokenizer:
 
 
 class ModelConfusionHelperTest(unittest.TestCase):
+    def test_allow_collisions_keeps_shared_sequence_and_padding_lookup(self):
+        tokenizer = FakeTokenizer({"a": [10, 0, 2, 1], "b": [10, 0, 2, 1], "c": [11, 1]})
+        encoded, mapping, excluded, groups, _ = build_target_index(
+            tokenizer, ["a", "b", "c"], 8, collision_policy="allow")
+        self.assertEqual(mapping, {(10, 0, 2, 1): "a", (11, 1): "c"})
+        self.assertEqual(excluded, set())
+        self.assertEqual(groups, [["a", "b"]])
+        self.assertEqual(canonical_generated_tokens([0, 10, 0, 2, 1, 0], 0, 0, 1, True), (10, 0, 2, 1))
+        # A positive alias must protect the entire token sequence from rejection.
+        selected, _ = select_model_candidates([[0, 10, 0, 2, 1], [0, 11, 1]], [0, -1],
+                                              mapping, {"a"}, 4, 0, 0, 1, True)
+        self.assertEqual([row["target"] for row in selected], ["c"])
+
     def test_truncated_targets_keep_full_ids_and_reject_prefix_collisions(self):
         tokenizer = FakeTokenizer({"long-a": [10, 11, 12, 1], "long-b": [14, 15, 16, 1],
                                    "same-prefix": [10, 11, 99, 1]})

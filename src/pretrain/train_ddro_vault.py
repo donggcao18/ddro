@@ -91,6 +91,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_target_length", type=int, default=32)
     parser.add_argument("--target_length_policy", choices=["error", "skip", "truncate"], default="error")
     parser.add_argument("--target_collision_policy", choices=["error", "skip", "allow"], default="error")
+    parser.add_argument("--target_token_policy", choices=["error", "allow"], default="error")
     parser.add_argument("--num_train_epochs", type=positive_float, default=2.0)
     parser.add_argument("--per_device_train_batch_size", type=int, default=4)
     parser.add_argument("--per_device_eval_batch_size", type=int, default=8)
@@ -395,7 +396,8 @@ def build_training_args(args: argparse.Namespace, has_eval: bool) -> DPOConfig:
 
 
 def validate_target_sequences(datasets: DatasetDict, tokenizer: Any, limit: int,
-                              length_policy: str = "error", collision_policy: str = "error") -> None:
+                              length_policy: str = "error", collision_policy: str = "error",
+                              token_policy: str = "error") -> None:
     targets = set()
     for dataset in datasets.values():
         targets.update(dataset["chosen"])
@@ -410,9 +412,9 @@ def validate_target_sequences(datasets: DatasetDict, tokenizer: Any, limit: int,
             raise ValueError(f"Decoder target must fit without truncation ({len(sequence)} > {limit}): {target!r}")
         if tokenizer.eos_token_id is not None and sequence[-1] != tokenizer.eos_token_id:
             raise ValueError(f"Target does not end in EOS: {target!r}")
-        if tokenizer.pad_token_id in sequence or (
+        if token_policy != "allow" and (tokenizer.pad_token_id in sequence or (
             tokenizer.unk_token_id is not None and tokenizer.unk_token_id in sequence
-        ):
+        )):
             raise ValueError(f"Target contains padding/unknown tokens: {target!r}")
         if collision_policy != "allow" and sequence in owners and owners[sequence] != target:
             raise ValueError(f"Token-identical targets: {owners[sequence]!r}, {target!r}")
@@ -495,7 +497,8 @@ def train_round(args: argparse.Namespace) -> None:
     )
     if args.strict_targets:
         validate_target_sequences(datasets, tokenizer, args.max_target_length,
-                                  args.target_length_policy, args.target_collision_policy)
+                                  args.target_length_policy, args.target_collision_policy,
+                                  args.target_token_policy)
     print_preflight(
         datasets,
         tokenizer,

@@ -52,7 +52,10 @@ class RealT5RoundTest(unittest.TestCase):
     def test_truncated_url_targets_mining_training_and_resume(self):
         self.exercise_rounds(multilabel=True, truncate=True)
 
-    def exercise_rounds(self, multilabel, ema=False, truncate=False):
+    def test_allow_unknown_padding_and_collisions_in_mining_training_resume(self):
+        self.exercise_rounds(multilabel=True, allow_tokens=True)
+
+    def exercise_rounds(self, multilabel, ema=False, truncate=False, allow_tokens=False):
         import torch
         from tokenizers import Tokenizer
         from tokenizers.models import WordLevel
@@ -70,10 +73,14 @@ class RealT5RoundTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             ids = [f"repo/lib/file_{i}.rb/function_{i}(arg)" if multilabel else f"doc-{i}" for i in range(8)]
+            if allow_tokens:
+                ids[:2] = [f"repo/<pad>/file_{i}.rb/function_{i}(arg)" for i in range(2)]
             pre_tokenizer = Whitespace() if multilabel else WhitespaceSplit()
             vocab = {"<pad>": 0, "</s>": 1, "<unk>": 2, "find": 3}
             for target in ids:
                 for token, _ in pre_tokenizer.pre_tokenize_str(target):
+                    if allow_tokens and token in {"file_0", "file_1", "function_0", "function_1"}:
+                        continue
                     if token not in vocab:
                         vocab[token] = len(vocab)
             backend = Tokenizer(WordLevel(vocab, unk_token="<unk>"))
@@ -95,7 +102,9 @@ class RealT5RoundTest(unittest.TestCase):
             if multilabel:
                 atomic_jsonl(root / "queries.jsonl", [
                     {"text": f"find {ids[i]}", "url_based_id": ids[i],
-                     "positive_url_based_id": [ids[i], ids[i ^ 1]]} for i in range(8)
+                     "family_id": f"family-{i // 2}",
+                     "positive_url_based_id": [ids[i]] if allow_tokens and i < 2 else [ids[i], ids[i ^ 1]]}
+                    for i in range(8)
                 ])
                 (root / "corpus.jsonl").unlink()
             config_path = root / "config.json"
@@ -127,6 +136,15 @@ class RealT5RoundTest(unittest.TestCase):
             if truncate:
                 atomic_json(config_path, {**read_json(config_path), "target_length_policy": "truncate",
                                           "max_target_length": 8})
+            if allow_tokens:
+                atomic_json(config_path, {**read_json(config_path), "target_token_policy": "allow",
+                                          "target_collision_policy": "allow"})
+                # Isolate the trainer preflight from the random validation split.
+                from datasets import Dataset, DatasetDict
+                shared_targets = DatasetDict(train=Dataset.from_list([
+                    {"chosen": ids[0], "rejected": ids[2]}, {"chosen": ids[1], "rejected": ids[3]}]))
+                trainer_module.validate_target_sequences(shared_targets, tokenizer, 32,
+                                                          collision_policy="allow", token_policy="allow")
             loaded = []
             original_loader = trainer_module.load_policy_model
             def tracked_loader(*args):
@@ -198,6 +216,14 @@ class RealT5RoundTest(unittest.TestCase):
 
             cfg = load_config(config_path)
             straight = run_pipeline(cfg, runner=runner)
+            if allow_tokens:
+                stats = read_json(root / "straight/baseline/validation_predictions.stats.json")
+                self.assertEqual(stats["allowed_collision_groups"], 1)
+                self.assertEqual(stats["excluded_collision_targets"], 0)
+                self.assertEqual(stats["target_sequences_with_unknown_tokens"], 1)
+                self.assertEqual(stats["target_sequences_with_padding_tokens"], 1)
+                self.assertEqual(stats["usable_decoder_targets"], 7)
+                self.assertEqual(tokenizer(ids[0])["input_ids"], tokenizer(ids[1])["input_ids"])
             if truncate:
                 baseline_stats = read_json(root / "straight/baseline/validation_predictions.stats.json")
                 self.assertEqual(baseline_stats["truncated_targets"], 8)
@@ -220,10 +246,15 @@ class RealT5RoundTest(unittest.TestCase):
                     self.assertTrue(pairs)
                     for pair in pairs:
                         self.assertEqual(pair["target_type"], "url_based_id")
-                        self.assertEqual(len(pair["positive_text_ids"]), 2)
+                        self.assertEqual(len(pair["positive_text_ids"]),
+                                         1 if allow_tokens and pair["chosen"] in ids[:2] else 2)
                         self.assertIn(pair["chosen"], pair["positive_text_ids"])
                         self.assertNotIn(pair["rejected"], pair["positive_text_ids"])
                         self.assertIn(pair["rejected"], ids)
+                        if allow_tokens:
+                            rejected_tokens = tokenizer(pair["rejected"])["input_ids"]
+                            self.assertTrue(all(rejected_tokens != tokenizer(p)["input_ids"]
+                                                for p in pair["positive_text_ids"]))
             resumed_cfg = {**cfg, "output_dir": str(root / "resumed")}
             interrupt_enabled[0] = True
             with self.assertRaisesRegex(RuntimeError, "intentional interruption"):

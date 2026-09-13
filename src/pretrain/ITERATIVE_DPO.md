@@ -178,9 +178,7 @@ training both use the tokenizer's truncation with special tokens, retaining EOS
 within the limit. Original full URL strings remain in metadata and preference
 JSONL. The constrained decoder's shortened token sequence is mapped back to
 the full ID for mining and retrieval evaluation. Queries are not dropped just
-because their target is long. Token-identical IDs, including truncation
-collisions, still fail preflight: two indistinguishable targets cannot form
-a valid preference. Truncation means learning a shortened representation of
+because their target is long. Truncation means learning a shortened representation of
 the URL, not generating its complete text. Log files named
 `*.excluded_text_ids.json` include `truncated_targets` and the original token
 lengths in `overlength_targets`; statistics also report the truncation count.
@@ -189,7 +187,27 @@ lengths in `overlength_targets`; statistics also report the truncation count.
 (the default when omitted). `"skip"` excludes long IDs from candidate generation
 and skips training queries with a long chosen target. Evaluation in skip mode
 retains all query labels and counts unreachable long positives as misses.
-In every mode, padding/unknown tokens and ambiguous targets remain errors.
+The example config also sets `target_collision_policy: "allow"` and
+`target_token_policy: "allow"`. These make token collisions and existing
+unknown/padding tokens non-fatal in both mining and DPO training. The tokenizer's
+output is retained, not rewritten by substituting other tokens. Normal batch
+padding is separate from padding tokens occurring inside the encoded target.
+The latter are retained through EOS when looking up generated sequences.
+Counts of unknown/padding target sequences are saved in generation statistics.
+
+Under collision policy `allow`, different full IDs sharing one token sequence
+are retained as aliases. Generation uses the lexicographically first full ID
+as that sequence's representative. All aliases of every positive are excluded
+from negatives, so indistinguishable sequences are not trained against each
+other. Per-query positive lists and chosen full IDs remain unchanged. Evaluation
+scores the deterministic representative against the original full-ID labels;
+`predicted_text_id_groups` records all aliases for each generated sequence.
+The model cannot distinguish aliases using the shortened/unknown-token encoding.
+Query variations for the same document were already supported and are unaffected.
+
+For stricter runs, `target_collision_policy: "error"` rejects collisions;
+`"skip"` excludes them. `target_token_policy: "error"` restores rejection of
+unknown/padding tokens. Both default to `error` when omitted.
 
 Use a new output directory when changing data, ID type, or length policy;
 existing rounds cannot be resumed with different inputs.

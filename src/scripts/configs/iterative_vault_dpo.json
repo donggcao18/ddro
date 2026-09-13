@@ -19,6 +19,7 @@
   "max_target_length": 128,
   "target_length_policy": "truncate",
   "target_collision_policy": "allow",
+  "target_token_policy": "allow",
   "selection_metric": "mrr@10",
   "training": {
     "per_device_train_batch_size": 16,
