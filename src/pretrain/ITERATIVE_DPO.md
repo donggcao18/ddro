@@ -17,6 +17,24 @@ python src/pretrain/train_iterative_ddro_vault.py --config /path/to/experiment.j
 CONFIG=/path/to/experiment.json bash src/scripts/ddro/run_vault_iterative_dpo.sh
 ```
 
+For the dedicated EMA experiment, edit the paths in
+`src/scripts/configs/iterative_vault_dpo_ema.json`, then run:
+
+```bash
+conda activate ddro_env
+CUDA_VISIBLE_DEVICES=0,1 bash src/scripts/ddro/run_vault_iterative_dpo_ema.sh
+# Continue the same EMA experiment:
+CUDA_VISIBLE_DEVICES=0,1 bash src/scripts/ddro/run_vault_iterative_dpo_ema.sh --resume
+```
+
+This config uses two GPUs for training and mining, one epoch per round, and
+`reference_update: "ema"` with decay `0.9`: the next reference is 90% of the
+previous reference plus 10% of the just-trained policy. Results go to
+`vault-iterative-dpo-ema-d09`. Start a separate EMA run when switching from an
+existing replacement experiment; changing the reference rule is not a
+resume-compatible setting. `CONFIG` and `PYTHON_BIN` overrides work as in the
+regular launcher; a custom `CONFIG` must itself specify EMA.
+
 To inspect metadata and splits before GPU work:
 
 ```bash
