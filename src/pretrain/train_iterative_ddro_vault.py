@@ -33,7 +33,7 @@ DEFAULTS = {
     "target_type": "text_id", "id_mode": "auto", "structure_id_sources": [],
     "input_format": "legacy", "corpus_files": [],
     "reference_update": "replace", "reference_ema_decay": 0.9,
-    "num_gpus": 1, "precision": "bf16", "device": "auto",
+    "num_gpus": 1, "mining_num_gpus": None, "precision": "bf16", "device": "auto",
     "num_beams": 16, "negatives_per_query": 4, "mining_batch_size": 16,
     "max_prompt_length": 256, "max_target_length": 32, "length_penalty": 1.0,
     "target_length_policy": "error",
@@ -51,37 +51,49 @@ TRAIN_DEFAULTS = {
     "dataloader_num_workers": 0,
 }
 
-# The immediately preceding controller, in LF and CRLF form. Only this known
-# evaluation-only upgrade may change its code fingerprint during resume.
+# Known controllers in LF and CRLF form, before the evaluation upgrade.
 EVALUATION_COMPATIBLE_CONTROLLERS = {
     "1bae0608a2e5ad79141d31b228553f98f2f21afe6ecbe453991dd039b8e60280",
     "8edf71dcade31b08f67f1f581cb77eadd93f56df086c14ac7ea09de320951452",
 }
 EVALUATION_SCHEDULE_KEYS = {"eval_every_epochs", "eval_at_end"}
+MINING_COMPATIBLE_CONTROLLERS = EVALUATION_COMPATIBLE_CONTROLLERS | {
+    "13c07e6d53f273b021498b572469322782b6af52333bbe6173a7466f50d88e1c",
+    "d02f074f416ad1979679458933d8e940e378a32b2771f13b6a34bbab167f8b3c",
+}
+RUNTIME_KEYS = EVALUATION_SCHEDULE_KEYS | {"mining_num_gpus"}
 
 
 def accept_evaluation_resume_update(state: dict, identity: dict) -> None:
-    """Permit only scheduling changes and the known compatible controller upgrade."""
+    """Permit scheduling/mining concurrency changes, preserving committed training."""
     previous = state["identity"]
-    previous_config = {k: v for k, v in previous["config"].items() if k not in EVALUATION_SCHEDULE_KEYS}
-    current_config = {k: v for k, v in identity["config"].items() if k not in EVALUATION_SCHEDULE_KEYS}
+    previous_config = {k: v for k, v in previous["config"].items() if k not in RUNTIME_KEYS}
+    current_config = {k: v for k, v in identity["config"].items() if k not in RUNTIME_KEYS}
     controller = str(Path(__file__))
     previous_code, current_code = previous["code"], identity["code"]
     valid_controller = (previous_code.get(controller) == current_code.get(controller)
-                        or previous_code.get(controller) in EVALUATION_COMPATIBLE_CONTROLLERS)
+                        or previous_code.get(controller) in MINING_COMPATIBLE_CONTROLLERS)
+    allowed_code = {controller}
+    mining_launcher = str(SRC / "pretrain/mine_on_gpus.py")
+    # Only known old releases may add this new file. Future launcher edits
+    # must still fail the normal code-identity check.
+    if (previous_code.get(controller) in MINING_COMPATIBLE_CONTROLLERS
+            and mining_launcher not in previous_code):
+        allowed_code.add(mining_launcher)
     if (previous_config != current_config or not valid_controller
-            or {k: v for k, v in previous_code.items() if k != controller}
-            != {k: v for k, v in current_code.items() if k != controller}
+            or {k: v for k, v in previous_code.items() if k not in allowed_code}
+            != {k: v for k, v in current_code.items() if k not in allowed_code}
             or {k: v for k, v in previous.items() if k not in {"code", "config"}}
             != {k: v for k, v in identity.items() if k not in {"code", "config"}}):
         raise ValueError("Resume config, source data, code, environment, or SFT checkpoint changed; "
-                         "only evaluation scheduling and the compatible controller upgrade may change")
+                         "only evaluation scheduling, mining_num_gpus, and the compatible controller upgrade may change")
     # Do not accept an upgrade over altered committed artifacts.
     for artifacts in state["stages"].values():
         assert_file_hashes(artifacts)
     state.setdefault("identity_updates", []).append({
-        "reason": "evaluation_schedule_update", "previous_identity": previous,
+        "reason": "runtime_configuration_update", "previous_identity": previous,
         "new_schedule": {key: identity["config"][key] for key in sorted(EVALUATION_SCHEDULE_KEYS)},
+        "mining_num_gpus": identity["config"].get("mining_num_gpus"),
         "new_controller_fingerprint": current_code[controller],
     })
     state["identity"] = identity
@@ -153,6 +165,11 @@ def load_config(path: Path) -> dict:
         value = cfg[key]
         if value is not None and (type(value) is not int or value <= 0):
             raise ValueError(f"{key} must be a positive integer")
+    mining_gpus = cfg["mining_num_gpus"]
+    if mining_gpus is not None and (type(mining_gpus) is not int or mining_gpus <= 0):
+        raise ValueError("mining_num_gpus must be null or a positive integer")
+    if (mining_gpus or cfg["num_gpus"]) > 1 and cfg["device"] not in {"auto", "cuda"}:
+        raise ValueError("Multi-GPU mining requires device=auto or cuda; select GPUs with CUDA_VISIBLE_DEVICES")
     if cfg["epochs_per_round"] is not None and not (0 < cfg["epochs_per_round"] < float("inf")):
         raise ValueError("epochs_per_round must be finite and positive")
     if not 0 < cfg["validation_fraction"] < 1:
@@ -219,6 +236,10 @@ def run_command(command: list[str]) -> None:
 def generation_command(cfg: dict, checkpoint: str, queries: Path, documents: Path,
                        output: Path, fingerprint: str, round_id: int, evaluate=False) -> list[str]:
     command = [sys.executable, str(MINING / "mine_model_confusion_negatives.py")]
+    mining_gpus = cfg.get("mining_num_gpus") or cfg["num_gpus"]
+    if mining_gpus > 1:
+        command = [sys.executable, str(SRC / "pretrain/mine_on_gpus.py"),
+                   "--num-gpus", str(mining_gpus)]
     options = {
         "checkpoint-path": checkpoint, "checkpoint-fingerprint": fingerprint,
         "query-metadata": queries, "document-metadata": documents, "output": output,
@@ -322,7 +343,7 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner):
             SRC / "pretrain/update_dpo_reference.py",
             SRC / "pretrain/iterative_dpo_utils.py", SRC / "data/data_prep/prepare_vault_dpo_metadata.py",
             MINING / "mine_model_confusion_negatives.py", MINING / "prepare_bm25.py", MINING / "common.py",
-            SRC / "utils/trie.py"]
+            SRC / "utils/trie.py", SRC / "pretrain/mine_on_gpus.py"]
     versions = {}
     for package in ("torch", "transformers", "trl", "datasets", "accelerate", "tokenizers"):
         try:
@@ -339,7 +360,7 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner):
         if state["identity"] != identity:
             accept_evaluation_resume_update(state, identity)
             atomic_json(manifest_path, state)
-            print("Resuming with updated evaluation schedule; committed training artifacts are preserved.", flush=True)
+            print("Resuming with updated runtime settings; committed training artifacts are preserved.", flush=True)
     else:
         if resume:
             raise ValueError("No run_manifest.json to resume")

@@ -26,9 +26,46 @@ python src/pretrain/train_iterative_ddro_vault.py --config /path/to/experiment.j
 
 Always launch the controller with `python`, not `torchrun`. Set `num_gpus` for
 single-node distributed training; the controller launches and joins each
-training process group. Mining/evaluation use one device and run in separate
-processes, so their model memory is released before training. `fp32` with
+training process group. Set `mining_num_gpus` for mining and evaluation; when
+omitted or null, it defaults to `num_gpus`. Each GPU loads the same policy and
+processes a disjoint query shard. These processes exit before training starts,
+so their model memory is released before training. `fp32` with
 `device: cpu` supports small smoke tests; mixed precision requires CUDA.
+
+For two GPUs, use the following settings in your existing config:
+
+```json
+"num_gpus": 2,
+"mining_num_gpus": 2,
+"mining_batch_size": 64
+```
+
+`mining_batch_size` is **per GPU**. Beam width and negative quotas are unchanged.
+For N GPUs, set `mining_num_gpus: N` and expose at least N GPUs through
+`CUDA_VISIBLE_DEVICES`. Multi-GPU mining requires `device: auto` or `cuda` and
+uses logical devices `cuda:0` through `cuda:N-1` within that visible list.
+For example, `CUDA_VISIBLE_DEVICES=2,3` selects physical GPUs 2 and 3. Set
+`mining_num_gpus: 1` to retain the original single-device mining path.
+
+Shards preserve the original contiguous batches and merge in original query
+order. A small dataset may use fewer workers than requested if it has fewer
+batches. Evaluation metrics are weighted by processed query count; shared
+corpus statistics are not multiplied by the number of workers.
+
+Per-worker progress is in `round-000/preferences.shards/gpu-000/worker.log`
+(and `gpu-001`, etc.). Evaluation uses `validation_predictions.shards/`.
+The merged preference file remains `round-000/preferences.jsonl`.
+Completed shards have hash-checked `complete.json` markers and are reused
+after interruption. Failed or incomplete shards rerun; training cannot start
+with a partially merged preference dataset. Changing the GPU count during an
+unfinished mining stage regenerates that stage's shards.
+
+To upgrade an existing run, stop the running job, copy both
+`src/pretrain/train_iterative_ddro_vault.py` and `src/pretrain/mine_on_gpus.py`,
+add `mining_num_gpus` to the existing config, and restart with `--resume`.
+Keep training settings (including `num_gpus`), data, and output paths unchanged.
+The known preceding controllers are supported; completed stages and model
+checkpoints are preserved. Arbitrary code changes still fail resume checks.
 
 ## Evaluation frequency and resuming an existing run
 
@@ -52,7 +89,8 @@ rounds. The SFT baseline still runs once and is reused on resume.
 To change the schedule while an old run is in `evaluate-0`:
 
 1. Stop the current evaluation/job before starting another controller.
-2. Update `src/pretrain/train_iterative_ddro_vault.py` and add the two settings
+2. Update `src/pretrain/train_iterative_ddro_vault.py`, copy the new
+   `src/pretrain/mine_on_gpus.py`, and add the two settings
    above to your existing config. Keep all existing training settings and paths,
    including the same `output_dir`.
 3. Restart the launcher with `--resume`:
@@ -63,7 +101,7 @@ CUDA_VISIBLE_DEVICES=0,1 CONFIG=/path/to/your/existing-config.json \
 ```
 
 This release accepts the immediately preceding controller's fingerprints and
-evaluation-schedule changes during resume. It records the prior identity in
+evaluation-schedule/mining-concurrency changes during resume. It records the prior identity in
 `run_manifest.json` under `identity_updates`; it does not rewrite round input
 manifests, preferences, checkpoint completion markers, or model weights.
 Training settings, source files, other runtime code, package versions, and
@@ -318,7 +356,8 @@ output_dir/
 ```
 
 Use `--resume` with the same configuration. Committed preparation/mining phases
-are reused after fingerprint checks; an incomplete mining phase is regenerated.
+are reused after fingerprint checks; incomplete single-device mining is
+regenerated, while multi-GPU mining reuses matching completed shards.
 An interrupted training round resumes from its last fully written checkpoint,
 with the **original round-start reference** and the same preferences. If no
 complete training checkpoint exists, that round restarts from its starting
@@ -332,8 +371,8 @@ twice to an already updated reference. `latest_reference` in the run manifest
 points to the reference available for the next round.
 
 Model, tokenizer, source-data, training-configuration, relevant-code and package-version
-changes are rejected on resume, except the compatible evaluation-only upgrade
-and scheduling changes described above. Use a new output directory for a changed
+changes are rejected on resume, except the compatible controller/launcher upgrades,
+evaluation scheduling, and `mining_num_gpus` changes described above. Use a new output directory for a changed
 experiment. Keep all round-start/latest and EMA reference snapshots; checkpoint rotation affects
 only periodic checkpoints inside an individual round. Completion markers and
 atomic manifests prevent an unfinished snapshot from becoming the next reference.
