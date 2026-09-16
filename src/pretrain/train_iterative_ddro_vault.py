@@ -62,9 +62,28 @@ MINING_COMPATIBLE_CONTROLLERS = EVALUATION_COMPATIBLE_CONTROLLERS | {
     "d02f074f416ad1979679458933d8e940e378a32b2771f13b6a34bbab167f8b3c",
 }
 RUNTIME_KEYS = EVALUATION_SCHEDULE_KEYS | {"mining_num_gpus"}
+ROUND_RESUME_COMPATIBLE_CONTROLLERS = MINING_COMPATIBLE_CONTROLLERS | {
+    "a64a0b9ddd8bc57498cf729ccca88eadfb5e807a96ce0c1232a182f37cd33f84",
+    "ef0d41ecb5391c9f3a5f65aaa4b1870cadd884cecc11798303bf39f4abc0a053",
+}
 
 
-def accept_evaluation_resume_update(state: dict, identity: dict) -> None:
+def skipped_round_stage(name: str, start_round: int) -> bool:
+    prefix, _, suffix = name.rpartition("-")
+    return (prefix in {"select", "mine", "round-inputs", "train", "skip", "reference", "evaluate"}
+            and suffix.isdigit() and int(suffix) < start_round)
+
+
+def verify_start_checkpoint(path: str, fingerprint: str, role: str, round_id: int) -> None:
+    try:
+        valid = Path(path).is_dir() and checkpoint_hash(path) == fingerprint
+    except (OSError, ValueError):
+        valid = False
+    if not valid:
+        raise ValueError(f"Cannot start round {round_id}: required {role} checkpoint is missing or changed: {path}")
+
+
+def accept_evaluation_resume_update(state: dict, identity: dict, start_round=0) -> None:
     """Permit scheduling/mining concurrency changes, preserving committed training."""
     previous = state["identity"]
     previous_config = {k: v for k, v in previous["config"].items() if k not in RUNTIME_KEYS}
@@ -72,7 +91,7 @@ def accept_evaluation_resume_update(state: dict, identity: dict) -> None:
     controller = str(Path(__file__))
     previous_code, current_code = previous["code"], identity["code"]
     valid_controller = (previous_code.get(controller) == current_code.get(controller)
-                        or previous_code.get(controller) in MINING_COMPATIBLE_CONTROLLERS)
+                        or previous_code.get(controller) in ROUND_RESUME_COMPATIBLE_CONTROLLERS)
     allowed_code = {controller}
     mining_launcher = str(SRC / "pretrain/mine_on_gpus.py")
     # Only known old releases may add this new file. Future launcher edits
@@ -88,8 +107,9 @@ def accept_evaluation_resume_update(state: dict, identity: dict) -> None:
         raise ValueError("Resume config, source data, code, environment, or SFT checkpoint changed; "
                          "only evaluation scheduling, mining_num_gpus, and the compatible controller upgrade may change")
     # Do not accept an upgrade over altered committed artifacts.
-    for artifacts in state["stages"].values():
-        assert_file_hashes(artifacts)
+    for name, artifacts in state["stages"].items():
+        if not skipped_round_stage(name, start_round):
+            assert_file_hashes(artifacts)
     state.setdefault("identity_updates", []).append({
         "reason": "runtime_configuration_update", "previous_identity": previous,
         "new_schedule": {key: identity["config"][key] for key in sorted(EVALUATION_SCHEDULE_KEYS)},
@@ -330,13 +350,17 @@ def audit_pairs(path: Path, queries: list[dict], documents: Path, target_type: s
             "previous_overlap_fraction": len(seen & previous_keys) / max(1, len(seen))}
 
 
-def run_pipeline(cfg: dict, resume=False, prepare_only=False, runner=run_command) -> dict:
+def run_pipeline(cfg: dict, resume=False, prepare_only=False, runner=run_command, start_round=0) -> dict:
+    if type(start_round) is not int or start_round < 0:
+        raise ValueError("start_round must be a nonnegative integer")
+    if start_round and (not resume or prepare_only):
+        raise ValueError("--start-round requires --resume and cannot be used with --prepare-only")
     output = Path(cfg["output_dir"])
     with run_lock(output):
-        return _run_pipeline(cfg, output, resume, prepare_only, runner)
+        return _run_pipeline(cfg, output, resume, prepare_only, runner, start_round)
 
 
-def _run_pipeline(cfg, output, resume, prepare_only, runner):
+def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0):
     manifest_path = output / "run_manifest.json"
     sources = [cfg["query_file"], *cfg["corpus_files"], *cfg["structure_id_sources"]]
     code = [Path(__file__), SRC / "pretrain/train_ddro_vault.py",
@@ -358,7 +382,7 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner):
             raise ValueError("Run exists; use --resume with the same config or a new output_dir")
         state = read_json(manifest_path)
         if state["identity"] != identity:
-            accept_evaluation_resume_update(state, identity)
+            accept_evaluation_resume_update(state, identity, start_round)
             atomic_json(manifest_path, state)
             print("Resuming with updated runtime settings; committed training artifacts are preserved.", flush=True)
     else:
@@ -392,6 +416,8 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner):
         raise ValueError("Training and validation query families overlap")
     partitions = partition_queries(queries, cfg["queries_per_round"], cfg["seed"]) if cfg["rounds"] is None else None
     total_rounds = len(partitions) if partitions is not None else cfg["rounds"]
+    if start_round >= total_rounds:
+        raise ValueError(f"--start-round must be less than {total_rounds} (round IDs are zero-based)")
     plan = {"mode": "partition_all" if partitions is not None else "fixed_rounds",
             "total_rounds": total_rounds, "training_queries": len(queries), "validation_queries": len(heldout),
             "queries_per_round": cfg["queries_per_round"], "seed": cfg["seed"],
@@ -422,7 +448,47 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner):
     previous = None
     results = []
     completed_epochs = 0.0
-    for round_id in range(total_rounds):
+    if start_round:
+        by_round = {row["round_id"]: row for row in state["rounds"]}
+        if any(i not in by_round for i in range(start_round)):
+            raise ValueError("Cannot skip unfinished rounds: run_manifest.json must record every earlier round as completed")
+        results = [by_round[i] for i in range(start_round)]
+        last = results[-1]
+        checkpoint, fingerprint = last["checkpoint"], last["checkpoint_fingerprint"]
+        verify_start_checkpoint(checkpoint, fingerprint, "policy", start_round)
+        reference_checkpoint = last["next_reference_checkpoint"]
+        if cfg["reference_update"] == "replace":
+            reference_checkpoint, reference_fingerprint = checkpoint, fingerprint
+        elif Path(reference_checkpoint).resolve() == Path(cfg["checkpoint_path"]).resolve():
+            reference_fingerprint = identity["initial_checkpoint"]
+        else:
+            marker = Path(reference_checkpoint) / "reference_complete.json"
+            recorded = {p: h for name, artifacts in state["stages"].items()
+                        if name.startswith("reference-") for p, h in artifacts.items()
+                        if Path(p).resolve() == marker.resolve()}
+            if not recorded:
+                raise ValueError(f"Required reference has no committed completion marker: {marker}")
+            assert_file_hashes(recorded)
+            reference_fingerprint = read_json(marker)["checkpoint_fingerprint"]
+        verify_start_checkpoint(reference_checkpoint, reference_fingerprint, "reference", start_round)
+        completed_epochs = last["completed_training_epochs"]
+        for result in results:
+            metrics = result.get("metrics")
+            if (metrics is not None and metrics[cfg["selection_metric"]] > best["metrics"][cfg["selection_metric"]]
+                    and Path(result["checkpoint"]).is_dir()):
+                if checkpoint_hash(result["checkpoint"]) != result["checkpoint_fingerprint"]:
+                    raise ValueError("Retained best checkpoint changed")
+                best = {key: result[key] for key in ("round_id", "checkpoint", "checkpoint_fingerprint", "metrics")}
+        # Old preference files are optional here; they affect only overlap diagnostics.
+        prior_pairs = output / f"round-{start_round - 1:03d}" / "preferences.jsonl"
+        recorded = state["stages"].get(f"mine-{start_round - 1}", {})
+        if prior_pairs.is_file():
+            matching = {p: h for p, h in recorded.items() if Path(p).resolve() == prior_pairs.resolve()}
+            if matching and all(file_hash(p) == h for p, h in matching.items()):
+                previous = prior_pairs
+        print(f"Starting at round {start_round}; earlier round artifacts are skipped. "
+              f"Policy: {checkpoint}; reference: {reference_checkpoint}", flush=True)
+    for round_id in range(start_round, total_rounds):
         directory = output / f"round-{round_id:03d}"
         selected = directory / "queries.jsonl"
         pairs = directory / "preferences.jsonl"
@@ -539,11 +605,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--start-round", type=int, default=0,
+                        help="With --resume, skip earlier rounds (zero-based); requires the preceding policy/reference snapshots")
     parser.add_argument("--prepare-only", action="store_true", help="Prepare fixed query splits, then exit before generation")
     args = parser.parse_args()
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         raise ValueError("Launch the controller with python; it launches torchrun for each training round")
-    run_pipeline(load_config(args.config.resolve()), args.resume, args.prepare_only)
+    run_pipeline(load_config(args.config.resolve()), args.resume, args.prepare_only, start_round=args.start_round)
 
 
 if __name__ == "__main__":

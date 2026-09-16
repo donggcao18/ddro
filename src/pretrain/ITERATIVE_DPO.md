@@ -372,6 +372,32 @@ targets to fit within `max_target_length`, including EOS.
 
 ## Checkpoints and recovery
 
+If you deleted early round directories, resume from a specific **zero-based**
+round using the same configuration and output directory:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 bash src/scripts/ddro/run_vault_iterative_dpo_ema.sh --resume --start-round 3
+# The same option is supported by the frozen-reference and regular launchers.
+```
+
+This starts at `round-003` and skips artifact checks/work for rounds 0–2.
+The run manifest must record all earlier rounds as completed. Keep the policy
+and reference snapshots used to start round 3 (normally round 2's
+`training/latest` and, for EMA/frozen-reference, `reference`). Those snapshots
+are still fingerprint-checked. If they are missing, restore them from backup or
+choose a later boundary whose required snapshots survive; the launcher cannot
+recreate deleted learned weights. Shared metadata, baseline, and artifacts at
+or after the requested round remain checked normally. Completed stages within
+the requested round are reused, and interrupted training resumes as usual.
+
+Continue to pass `--start-round 3` on subsequent resumes while the historical
+directories remain deleted. Existing epoch counts and round history are
+preserved. Deleted historical best checkpoints are excluded from best-model
+selection. Previous-pair overlap diagnostics use the preceding preferences
+only when that file survives with its recorded hash. To upgrade an existing
+run for this option, copy the updated `train_iterative_ddro_vault.py`; the known
+preceding controller version is accepted without changing training settings.
+
 ```text
 output_dir/
   run_manifest.json
