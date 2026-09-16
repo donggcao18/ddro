@@ -35,6 +35,26 @@ existing replacement experiment; changing the reference rule is not a
 resume-compatible setting. `CONFIG` and `PYTHON_BIN` overrides work as in the
 regular launcher; a custom `CONFIG` must itself specify EMA.
 
+To keep the SFT reference weights frozen while refreshing negatives from the
+latest policy each round, use the dedicated frozen-reference config/launcher:
+
+```bash
+conda activate ddro_env
+CUDA_VISIBLE_DEVICES=0,1 bash src/scripts/ddro/run_vault_iterative_dpo_frozen_ref.sh
+# Resume this same frozen-reference run:
+CUDA_VISIBLE_DEVICES=0,1 bash src/scripts/ddro/run_vault_iterative_dpo_frozen_ref.sh --resume
+```
+
+Edit paths in `src/scripts/configs/iterative_vault_dpo_frozen_ref.json` before
+running. It uses `reference_update: "ema"`, `reference_ema_decay: 1.0`, two GPUs
+for mining/training, and training batch size 16 per GPU. For this T5 experiment,
+decay 1.0 keeps the reference weights at the initial SFT values; policy training
+and policy-based negative mining continue normally. The existing EMA machinery
+still loads and exports reference snapshots each round. Results go to the
+separate `vault-iterative-dpo-frozen-ref` directory. Start fresh when switching
+from replacement or decay-0.9 EMA; do not resume those runs with this config.
+`CONFIG` overrides must themselves retain EMA decay 1.0.
+
 To inspect metadata and splits before GPU work:
 
 ```bash
