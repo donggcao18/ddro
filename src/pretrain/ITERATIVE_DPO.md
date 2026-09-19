@@ -107,6 +107,41 @@ checkpoints are preserved. Arbitrary code changes still fail resume checks.
 
 ## Evaluation frequency and resuming an existing run
 
+### Four 32 GB V100 GPUs on one node
+
+Use `src/scripts/configs/iterative_vault_dpo_ema_v100.json` and the dedicated
+launcher after allocating four GPUs on the same node:
+
+```bash
+conda activate ddro_env
+CUDA_VISIBLE_DEVICES=0,1,2,3 bash src/scripts/ddro/run_vault_iterative_dpo_ema_v100.sh
+# Resume this V100 experiment:
+CUDA_VISIBLE_DEVICES=0,1,2,3 bash src/scripts/ddro/run_vault_iterative_dpo_ema_v100.sh --resume
+```
+
+If your scheduler already sets `CUDA_VISIBLE_DEVICES`, preserve its allocation
+and simply run the bash command without overriding that variable. Launch one
+controller, not four copies of the script. This is a single-node configuration;
+four GPUs spread across multiple nodes require a different distributed launcher.
+
+V100 uses FP16 rather than the previous BF16 setting. Training uses mixed
+precision with gradient scaling; mining loads FP16 model weights. EMA reference
+averaging still uses FP32 on CPU. The config retains EMA decay 0.9, beam width
+10, one epoch per partition, and the evaluation schedule. The initial batch
+sizes target 32 GB V100s: 8 training pairs per GPU with accumulation 1 gives an
+effective batch of 32 (matching 2 GPUs x 16 pairs x accumulation 1); mining uses
+16 queries per GPU. These are starting settings, not a guarantee of memory fit
+for every checkpoint. The existing controller already enables gradient
+checkpointing. For more training headroom, 4 pairs/GPU with accumulation 2 also
+gives effective batch 32. If FP16 produces non-finite losses or scores for your
+checkpoint, use FP32 with smaller batches in a separate run.
+
+Edit checkpoint/query paths for the new cluster. Results default to
+`vault-iterative-dpo-ema-v100-fp16-d09`. Start a fresh experiment: an old
+two-GPU BF16 run cannot use this config with `--resume`, since GPU count,
+precision, and training batch settings are part of its saved identity.
+Once this V100 run exists, `--resume` and `--start-round` work normally.
+
 The example config evaluates after every eight completed training epochs:
 
 ```json
@@ -371,6 +406,21 @@ Every corpus target must have an unambiguous mapping. The selected
 targets to fit within `max_target_length`, including EOS.
 
 ## Checkpoints and recovery
+
+If only a round's `queries.jsonl` was deleted, restore the exact partition
+without rerunning mining or training:
+
+```bash
+python src/pretrain/restore_iterative_queries.py --output-dir /path/to/existing/run --round 16
+```
+
+Stop the running controller first. This command uses the config recorded in
+`run_manifest.json` and the hash-verified `metadata/train_queries.jsonl`. It
+publishes the reconstructed file only if its bytes match the original
+`select-16` hash, and leaves manifests, preferences, and checkpoints unchanged.
+Existing mismatched files are not overwritten. Then resume normally (or use
+`--start-round 16` if earlier round directories were deleted too). Copying this
+standalone recovery script does not change the controller's resume identity.
 
 If you deleted early round directories, resume from a specific **zero-based**
 round using the same configuration and output directory:
