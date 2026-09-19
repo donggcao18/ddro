@@ -2,7 +2,7 @@
   "checkpoint_path": "/home/users/congthanh_le/scratch/veil/CodeGR/outputs/DSI_Ruby_url/checkpoint-630000",
   "input_format": "multilabel",
   "query_file": "/home/users/congthanh_le/scratch/veil/CodeGR/data/updated_url/Ruby_merged_multilabel.jsonl",
-  "output_dir": "/home/users/congthanh_le/scratch/east/ddro/outputs/vault-iterative-dpo-ema-v100-fp16-d09",
+  "output_dir": "/home/users/congthanh_le/scratch/east/ddro/outputs/vault-iterative-dpo-ema-d09",
   "target_type": "url_based_id",
   "queries_per_round": 10000,
   "epochs_per_round": 1,
