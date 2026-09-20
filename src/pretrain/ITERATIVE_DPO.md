@@ -503,6 +503,36 @@ Beam mining is policy-driven hard-negative mining rather than stochastic
 on-policy sampling. Changing references changes the loss anchor; compare
 retrieval metrics across rounds, not raw DPO reward/loss values.
 
+## Second full dataset pass after EMA V100 training
+
+After all partitions finish, start another pass from both the final policy and
+the final EMA reference. Allocate the same four V100 GPUs on one node, then run:
+
+```bash
+bash src/scripts/ddro/run_vault_iterative_dpo_ema_v100_epoch2.sh \
+  --previous-output outputs/vault-iterative-dpo-ema-v100-fp16-d09 \
+  --output-dir outputs/vault-iterative-dpo-ema-v100-fp16-d09-epoch2
+```
+
+The launcher reads the completed run's `run_manifest.json` and inherits its
+configuration (GPU counts, precision, batch sizes, beam count, EMA decay and
+learning rate). It verifies the final policy and EMA reference fingerprints.
+It uses `latest` rather than the best checkpoint, and preserves EMA history
+through the new optional `initial_reference_checkpoint` configuration field.
+The source output is read only. No mining implementation changes are required.
+
+Each partition is mined again using the current policy and trained for one
+epoch. The seed, validation split and partition order stay the same as the
+first pass. Optimizer/scheduler state starts fresh at round boundaries, as in
+the existing pipeline. A baseline evaluation runs once in the new directory;
+the inherited evaluation interval counts from the new run's round zero.
+
+The generated configuration is saved beside the output as
+`<output-dir>.config.json`. Omitting `--output-dir` appends `-epoch2` to the
+source directory name. Repeat the command with `--resume` to resume epoch 2.
+Keep the source run's final policy/reference snapshots and prepared metadata.
+Use `--prepare-only` to prepare the new split first, then `--resume` to train.
+
 ## Verification
 
 ```bash

@@ -28,6 +28,7 @@ from pretrain.update_dpo_reference import reference_identity
 
 
 DEFAULTS = {
+    "initial_reference_checkpoint": None,
     "rounds": None, "queries_per_round": None, "steps_per_round": 1000,
     "epochs_per_round": None, "seed": 42, "validation_fraction": 0.05,
     "target_type": "text_id", "id_mode": "auto", "structure_id_sources": [],
@@ -63,6 +64,8 @@ MINING_COMPATIBLE_CONTROLLERS = EVALUATION_COMPATIBLE_CONTROLLERS | {
 }
 RUNTIME_KEYS = EVALUATION_SCHEDULE_KEYS | {"mining_num_gpus"}
 ROUND_RESUME_COMPATIBLE_CONTROLLERS = MINING_COMPATIBLE_CONTROLLERS | {
+    "0231e8a5f1ed667ff4346cfc5d066947bd0f2f2d8a411a564baba70cb25e38a0",
+    "bcb33716a52ea267bf94187eacadfeeedc648a0fe991ae88e233f61d4d2c9555",
     "a64a0b9ddd8bc57498cf729ccca88eadfb5e807a96ce0c1232a182f37cd33f84",
     "ef0d41ecb5391c9f3a5f65aaa4b1870cadd884cecc11798303bf39f4abc0a053",
 }
@@ -88,6 +91,9 @@ def accept_evaluation_resume_update(state: dict, identity: dict, start_round=0) 
     previous = state["identity"]
     previous_config = {k: v for k, v in previous["config"].items() if k not in RUNTIME_KEYS}
     current_config = {k: v for k, v in identity["config"].items() if k not in RUNTIME_KEYS}
+    # Older runs implicitly initialized the reference from the initial policy.
+    previous_config.setdefault("initial_reference_checkpoint", None)
+    current_config.setdefault("initial_reference_checkpoint", None)
     controller = str(Path(__file__))
     previous_code, current_code = previous["code"], identity["code"]
     valid_controller = (previous_code.get(controller) == current_code.get(controller)
@@ -213,6 +219,9 @@ def load_config(path: Path) -> dict:
     for key in ("checkpoint_path", "query_file", "output_dir"):
         value = Path(cfg[key]).expanduser()
         cfg[key] = str((path.parent / value).resolve())
+    if cfg["initial_reference_checkpoint"] is not None:
+        value = Path(cfg["initial_reference_checkpoint"]).expanduser()
+        cfg["initial_reference_checkpoint"] = str((path.parent / value).resolve())
     for key in ("corpus_files", "structure_id_sources"):
         if not isinstance(cfg[key], list):
             raise ValueError(f"{key} must be a list of paths")
@@ -377,6 +386,8 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0):
     identity = {"config": cfg, "inputs": {str(p): file_hash(p) for p in sources},
                 "code": {str(p): file_hash(p) for p in code}, "versions": versions,
                 "initial_checkpoint": checkpoint_hash(cfg["checkpoint_path"])}
+    if cfg.get("initial_reference_checkpoint"):
+        identity["initial_reference_checkpoint"] = checkpoint_hash(cfg["initial_reference_checkpoint"])
     if manifest_path.exists():
         if not resume:
             raise ValueError("Run exists; use --resume with the same config or a new output_dir")
@@ -442,6 +453,9 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0):
     checkpoint = cfg["checkpoint_path"]
     fingerprint = identity["initial_checkpoint"]
     reference_checkpoint, reference_fingerprint = checkpoint, fingerprint
+    if cfg.get("initial_reference_checkpoint"):
+        reference_checkpoint = cfg["initial_reference_checkpoint"]
+        reference_fingerprint = identity["initial_reference_checkpoint"]
     baseline = evaluate("baseline", checkpoint, fingerprint, -1, output / "baseline")
     best = {"round_id": -1, "checkpoint": checkpoint, "metrics": baseline,
             "checkpoint_fingerprint": fingerprint}
@@ -457,10 +471,13 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0):
         checkpoint, fingerprint = last["checkpoint"], last["checkpoint_fingerprint"]
         verify_start_checkpoint(checkpoint, fingerprint, "policy", start_round)
         reference_checkpoint = last["next_reference_checkpoint"]
-        if cfg["reference_update"] == "replace":
+        if Path(reference_checkpoint).resolve() == Path(checkpoint).resolve():
             reference_checkpoint, reference_fingerprint = checkpoint, fingerprint
         elif Path(reference_checkpoint).resolve() == Path(cfg["checkpoint_path"]).resolve():
             reference_fingerprint = identity["initial_checkpoint"]
+        elif (cfg.get("initial_reference_checkpoint") and Path(reference_checkpoint).resolve()
+              == Path(cfg["initial_reference_checkpoint"]).resolve()):
+            reference_fingerprint = identity["initial_reference_checkpoint"]
         else:
             marker = Path(reference_checkpoint) / "reference_complete.json"
             recorded = {p: h for name, artifacts in state["stages"].items()
