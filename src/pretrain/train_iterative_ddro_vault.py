@@ -28,6 +28,7 @@ from pretrain.update_dpo_reference import reference_identity
 
 
 DEFAULTS = {
+    "bm25_cache": None, "bm25_negatives_per_query": 4,
     "initial_reference_checkpoint": None,
     "rounds": None, "queries_per_round": None, "steps_per_round": 1000,
     "epochs_per_round": None, "seed": 42, "validation_fraction": 0.05,
@@ -64,6 +65,8 @@ MINING_COMPATIBLE_CONTROLLERS = EVALUATION_COMPATIBLE_CONTROLLERS | {
 }
 RUNTIME_KEYS = EVALUATION_SCHEDULE_KEYS | {"mining_num_gpus"}
 ROUND_RESUME_COMPATIBLE_CONTROLLERS = MINING_COMPATIBLE_CONTROLLERS | {
+    "8c56f70909846fe8174c1c357c7e858c44b035d032d64ce348efdb1119f4cd7b",
+    "b169d7fb60162607540180d1c3b7d4a73022fbbaf2b6490edefa1976fd5fff65",
     "0231e8a5f1ed667ff4346cfc5d066947bd0f2f2d8a411a564baba70cb25e38a0",
     "bcb33716a52ea267bf94187eacadfeeedc648a0fe991ae88e233f61d4d2c9555",
     "a64a0b9ddd8bc57498cf729ccca88eadfb5e807a96ce0c1232a182f37cd33f84",
@@ -73,7 +76,7 @@ ROUND_RESUME_COMPATIBLE_CONTROLLERS = MINING_COMPATIBLE_CONTROLLERS | {
 
 def skipped_round_stage(name: str, start_round: int) -> bool:
     prefix, _, suffix = name.rpartition("-")
-    return (prefix in {"select", "mine", "round-inputs", "train", "skip", "reference", "evaluate"}
+    return (prefix in {"select", "mine", "model-mine", "round-inputs", "train", "skip", "reference", "evaluate"}
             and suffix.isdigit() and int(suffix) < start_round)
 
 
@@ -94,6 +97,9 @@ def accept_evaluation_resume_update(state: dict, identity: dict, start_round=0) 
     # Older runs implicitly initialized the reference from the initial policy.
     previous_config.setdefault("initial_reference_checkpoint", None)
     current_config.setdefault("initial_reference_checkpoint", None)
+    for config in (previous_config, current_config):
+        config.setdefault("bm25_cache", None)
+        config.setdefault("bm25_negatives_per_query", 4)
     controller = str(Path(__file__))
     previous_code, current_code = previous["code"], identity["code"]
     valid_controller = (previous_code.get(controller) == current_code.get(controller)
@@ -141,6 +147,14 @@ def load_config(path: Path) -> dict:
     if unknown or required - raw.keys():
         raise ValueError(f"Invalid config keys: unknown={unknown}, missing={required - raw.keys()}")
     cfg = {**DEFAULTS, **raw}
+    if type(cfg["bm25_negatives_per_query"]) is not int or cfg["bm25_negatives_per_query"] <= 0:
+        raise ValueError("bm25_negatives_per_query must be a positive integer")
+    if cfg["bm25_cache"] is not None:
+        if not isinstance(cfg["bm25_cache"], str) or not cfg["bm25_cache"].strip():
+            raise ValueError("bm25_cache must be a nonempty path or null")
+        if cfg["input_format"] != "multilabel":
+            raise ValueError("Hybrid iterative mining requires direct multilabel IDs")
+        cfg["bm25_cache"] = str((path.parent / Path(cfg["bm25_cache"]).expanduser()).resolve())
     if cfg["target_length_policy"] not in {"error", "skip", "truncate"}:
         raise ValueError("target_length_policy must be error, skip, or truncate")
     if cfg["target_collision_policy"] not in {"error", "skip", "allow"}:
@@ -322,14 +336,15 @@ def training_command(cfg: dict, manifest_path: Path, directory: Path,
 
 
 def audit_pairs(path: Path, queries: list[dict], documents: Path, target_type: str,
-                round_id: int, fingerprint: str, quota: int, previous: Path | None) -> dict:
+                round_id: int, fingerprint: str, quota: int, previous: Path | None,
+                bm25_quota: int = 0, cache_fingerprint: str | None = None) -> dict:
     query_map = {r["query_key"]: r for r in queries}
     targets = {r["text_id"]: document_targets(r, target_type) for r in iter_json_records(documents)}
     previous_keys = set()
     if previous:
         previous_keys = {(r["query_key"], r["chosen_text_id"], r["rejected_text_id"])
                          for r in iter_json_records(previous)}
-    seen, counts = set(), Counter()
+    seen, counts, source_counts = set(), Counter(), Counter()
     for row in iter_json_records(path):
         query = query_map.get(row.get("query_key"))
         if query is None or row.get("prompt") != query["prompt"]:
@@ -342,14 +357,22 @@ def audit_pairs(path: Path, queries: list[dict], documents: Path, target_type: s
             raise ValueError("Preference has an invalid/ambiguous decoder target")
         if row.get("round_id") != round_id or row.get("policy_fingerprint") != fingerprint:
             raise ValueError("Stale mining provenance")
-        if row.get("negative_source") != "model_confusion":
-            raise ValueError("Only model-confusion negatives are allowed")
+        source = row.get("negative_source")
+        if source == "bm25" and bm25_quota:
+            if not cache_fingerprint or row.get("bm25_cache_fingerprint") != cache_fingerprint:
+                raise ValueError("Stale BM25 cache provenance")
+            source_quota = bm25_quota
+        elif source == "model_confusion":
+            source_quota = quota
+        else:
+            raise ValueError("Only model-confusion negatives are allowed unless BM25 is configured")
         key = (row["query_key"], chosen, rejected)
         if key in seen or row["chosen"] == row["rejected"]:
             raise ValueError("Duplicate or indistinguishable preference")
         seen.add(key)
         counts[row["query_key"]] += 1
-        if counts[row["query_key"]] > quota:
+        source_counts[(row["query_key"], source)] += 1
+        if source_counts[(row["query_key"], source)] > source_quota:
             raise ValueError("Negative quota exceeded")
     return {"pairs": len(seen), "selected_queries": len(queries), "queries_with_pairs": len(counts),
             "queries_without_negatives": len(queries) - len(counts),
@@ -372,11 +395,16 @@ def run_pipeline(cfg: dict, resume=False, prepare_only=False, runner=run_command
 def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0):
     manifest_path = output / "run_manifest.json"
     sources = [cfg["query_file"], *cfg["corpus_files"], *cfg["structure_id_sources"]]
+    hybrid = bool(cfg.get("bm25_cache"))
+    if hybrid:
+        sources.append(cfg["bm25_cache"])
     code = [Path(__file__), SRC / "pretrain/train_ddro_vault.py",
             SRC / "pretrain/update_dpo_reference.py",
             SRC / "pretrain/iterative_dpo_utils.py", SRC / "data/data_prep/prepare_vault_dpo_metadata.py",
             MINING / "mine_model_confusion_negatives.py", MINING / "prepare_bm25.py", MINING / "common.py",
             SRC / "utils/trie.py", SRC / "pretrain/mine_on_gpus.py"]
+    if hybrid:
+        code.append(SRC / "pretrain/hybrid_preferences.py")
     versions = {}
     for package in ("torch", "transformers", "trl", "datasets", "accelerate", "tokenizers"):
         try:
@@ -442,6 +470,20 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0):
     print(f"Round plan: {total_rounds} rounds for {len(queries)} training queries ({plan['mode']}).", flush=True)
     if prepare_only:
         return state
+
+    if hybrid:
+        from pretrain.hybrid_preferences import BM25Cache, fuse_preferences, query_signature
+        # Fail on incompatible cache before expensive baseline/model inference.
+        cache = BM25Cache(cfg["bm25_cache"], training, documents, cfg["target_type"])
+        try:
+            for query in queries:
+                record = cache.connection.execute("SELECT signature FROM queries WHERE query_key=?",
+                                                  (query["query_key"],)).fetchone()
+                if record is None or record[0] != query_signature(query):
+                    raise ValueError(f"Missing or changed BM25 query: {query['query_key']}")
+        finally:
+            cache.close()
+        cache_fingerprint = identity["inputs"][cfg["bm25_cache"]]
 
     def evaluate(name, checkpoint, fingerprint, round_id, directory):
         predictions = directory / "validation_predictions.jsonl"
@@ -514,10 +556,34 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0):
                          round_queries(queries, cfg["queries_per_round"], round_id, cfg["seed"]))
         stage(f"select-{round_id}", [selected], lambda: atomic_jsonl(selected, selected_rows))
         mining_stats = pairs.with_suffix(".stats.json")
+        if hybrid:
+            model_pairs = directory / "model_preferences.jsonl"
+            model_artifacts = [model_pairs, model_pairs.with_suffix(".stats.json"),
+                               model_pairs.with_suffix(".excluded_text_ids.json")]
+            stage(f"model-mine-{round_id}", model_artifacts, lambda: runner(generation_command(
+                cfg, checkpoint, selected, documents, model_pairs, fingerprint, round_id)))
         def mine_round():
-            runner(generation_command(cfg, checkpoint, selected, documents, pairs, fingerprint, round_id))
+            hybrid_stats = None
+            if hybrid:
+                assert_file_hashes({cfg["bm25_cache"]: cache_fingerprint})
+                audit_pairs(model_pairs, selected_rows, documents, cfg["target_type"],
+                            round_id, fingerprint, cfg["negatives_per_query"], None)
+                cache = BM25Cache(cfg["bm25_cache"], training, documents, cfg["target_type"])
+                try:
+                    hybrid_stats = fuse_preferences(
+                        selected_rows, model_pairs, model_pairs.with_suffix(".excluded_text_ids.json"),
+                        cache, pairs, round_id, fingerprint, cache_fingerprint,
+                        cfg["negatives_per_query"], cfg["bm25_negatives_per_query"])
+                finally:
+                    cache.close()
+            else:
+                runner(generation_command(cfg, checkpoint, selected, documents, pairs, fingerprint, round_id))
             report = audit_pairs(pairs, selected_rows, documents, cfg["target_type"],
-                                 round_id, fingerprint, cfg["negatives_per_query"], previous)
+                                 round_id, fingerprint, cfg["negatives_per_query"], previous,
+                                 cfg["bm25_negatives_per_query"] if hybrid else 0,
+                                 cache_fingerprint if hybrid else None)
+            if hybrid_stats is not None:
+                report["hybrid"] = hybrid_stats
             if cfg["steps_per_round"]:
                 presentations = (cfg["steps_per_round"] * cfg["num_gpus"] *
                                  cfg["training"]["per_device_train_batch_size"] *
@@ -537,6 +603,8 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0):
                    "inputs": {str(p): file_hash(p) for p in [selected, pairs, documents, validation]},
                    "training": training_options(cfg, round_id), "precision": cfg["precision"],
                    "num_gpus": cfg["num_gpus"]}
+        if hybrid:
+            payload["inputs"][cfg["bm25_cache"]] = cache_fingerprint
         stage(f"round-inputs-{round_id}", [round_manifest], lambda: atomic_json(round_manifest, payload))
         if read_json(round_manifest) != payload:
             raise ValueError("Round snapshot or data provenance changed")
@@ -556,7 +624,7 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0):
         report = read_json(audit)
         if report["pairs"] == 0:
             skipped = directory / "round_skipped.json"
-            marker = {"identity": round_identity, "reason": "no_model_negatives",
+            marker = {"identity": round_identity, "reason": "no_hybrid_negatives" if hybrid else "no_model_negatives",
                       "checkpoint": checkpoint, "checkpoint_fingerprint": fingerprint, "global_step": 0}
             stage(f"skip-{round_id}", [skipped], lambda: atomic_json(skipped, marker))
             if read_json(skipped) != marker:

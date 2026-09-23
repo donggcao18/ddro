@@ -533,6 +533,102 @@ source directory name. Repeat the command with `--resume` to resume epoch 2.
 Keep the source run's final policy/reference snapshots and prepared metadata.
 Use `--prepare-only` to prepare the new split first, then `--resume` to train.
 
+## Hybrid iterative DPO: offline BM25 + on-policy negatives
+
+Use `src/scripts/configs/iterative_vault_dpo_hybrid_v100.json` for the separate
+4-V100 FP16 EMA experiment. It keeps beam 10 and requests four on-policy
+negatives (`negatives_per_query`) plus four BM25 negatives
+(`bm25_negatives_per_query`). Set `bm25_cache` to the immutable SQLite cache.
+Existing configurations with no cache continue to use model-only mining.
+The previous trie/inference optimization is not required or reintroduced.
+
+1. Check the query/checkpoint/output paths in the hybrid configuration, then
+   prepare the offline inputs (no Pyserini or model loading needed):
+
+   ```bash
+   bash src/scripts/ddro/prepare_vault_iterative_bm25.sh prepare \
+     --config src/scripts/configs/iterative_vault_dpo_hybrid_v100.json \
+     --work-dir outputs/vault-bm25-offline
+   ```
+
+2. Switch to your existing BM25 environment with Pyserini and Java available.
+   Index and retrieve a deeper pool once, then package the completed retrieval:
+
+   ```bash
+   bash src/scripts/ddro/prepare_vault_iterative_bm25.sh build \
+     --work-dir outputs/vault-bm25-offline \
+     --output-cache outputs/vault-bm25-offline/candidates.sqlite \
+     --hits 200 --threads 16 --batch-size 32
+   ```
+
+3. Switch back to `ddro_env`, allocate four V100 GPUs on one node, and train:
+
+   ```bash
+   bash src/scripts/ddro/run_vault_iterative_dpo_hybrid_v100.sh
+   # To resume this SAME hybrid run:
+   bash src/scripts/ddro/run_vault_iterative_dpo_hybrid_v100.sh --resume
+   ```
+
+The offline workflow uses the same metadata preparation, seed, query keys and
+family split as training. Only training queries are searched; validation
+labels are never added to preferences. The full candidate corpus remains
+searchable, as in model-only retrieval. Corpus text comes exclusively from
+`code` or `original.code`, grouped by the exact selected document ID column;
+query text and positive lists are never inserted into document contents.
+Pseudo-query variants therefore produce one indexed code document per ID.
+The exporter rejects conflicting code bodies for the same ID. Add repeatable
+`--code-file PATH` arguments during preparation if some bodies are stored in
+another file with the same ID column. IDs without code are omitted from Lucene
+and counted in `export_manifest.json`; they remain in the model corpus.
+
+Numeric retrieval IDs avoid URL/parameter whitespace parsing problems. The
+cache maps them back to the original IDs and binds candidates to the prepared
+train/corpus hashes and per-query prompt/positive signatures. SQLite indexed
+lookups fetch just the current partition's candidates without rescanning the
+entire retrieval file or loading all hits into memory. Training needs only
+Python's standard SQLite support, with no Java/Pyserini dependency. The
+index/search commands follow the [Pyserini Lucene workflow](https://github.com/castorini/pyserini/blob/master/docs/experiments-msmarco-passage.md),
+using the repository's existing BM25 settings `k1=0.82`, `b=0.68` and TREC
+output to retain both ranks and scores. These settings are not newly tuned
+for Ruby code.
+
+Each round first commits `model_preferences.jsonl` and its mining sidecars.
+It then selects up to four model negatives and the first four eligible BM25
+hits in rank order, scanning deeper past all positives and previously selected
+IDs. Tokenizer-identical IDs (including collisions caused by target truncation)
+are deduplicated using that round's miner collision report; any alias of a
+positive is ineligible. Excluded model targets are also excluded from BM25
+pairs. The fused `preferences.jsonl` is the only file passed to DPO. Source
+tags, BM25 rank/score, round identity and cache fingerprint are retained.
+No policy/reference log-probabilities are cached with offline BM25 candidates.
+
+Quotas are separate: a shortfall is not filled from the other source and a
+duplicate is never repeated to reach eight. Training continues with fewer
+pairs when necessary, including BM25-only pairs when model mining finds none.
+`preferences.stats.json` and `pair_audit.json` report per-source counts,
+shortfalls and the actual mix (for example `4+4`, `2+4`, `0+4`). Missing cache
+queries, changed labels/corpus, or corrupt artifacts fail explicitly rather
+than masquerading as a genuine candidate shortfall. More pairs normally mean
+more optimizer steps per partition when training for one epoch.
+
+Cache contents, quotas and fusion code are part of the run identity. Resuming
+reuses completed model mining and fused pairs; a failed fusion does not require
+repeating committed inference. The known previous model-only controller can
+still resume its old runs. Enabling hybrid data or changing the cache/quota in
+an existing run is intentionally rejected: use a new output directory. To
+start from previously trained weights, set `checkpoint_path` to that policy
+and `initial_reference_checkpoint` to its EMA reference before starting the
+new hybrid run. A second dataset pass of a hybrid run can reuse the same cache
+as long as the split, IDs and labels are unchanged.
+
+Offline preparation/retrieval never overwrites a cache. If retrieval finished
+but packaging was interrupted, rerun only `pack` with `--work-dir` and
+`--output-cache`. It requires a hash-verified `retrieval_complete.json` from
+successful indexing/search. For an interrupted retrieval without that marker,
+prepare a fresh work directory and rebuild. Keep the final SQLite file for
+training/resume; the Lucene index and raw retrieval output are not needed by
+the training process.
+
 ## Verification
 
 ```bash
