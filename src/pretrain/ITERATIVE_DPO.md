@@ -13,18 +13,32 @@ JSON file unless absolute.
 ```bash
 conda activate ddro_env
 python src/pretrain/train_iterative_ddro_vault.py --config /path/to/experiment.json
-# Or:
-CONFIG=/path/to/experiment.json bash src/scripts/ddro/run_vault_iterative_dpo.sh
+# Or use the one launcher for any iterative DPO config:
+bash src/scripts/ddro/run_vault_iterative_dpo.sh --config /path/to/experiment.json
 ```
 
-For the dedicated EMA experiment, edit the paths in
+The same launcher runs every iterative experiment; choose the JSON file with
+`--config`, then pass controller options such as `--resume` or `--prepare-only`.
+For example, on four V100s with the structure-v6 config:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 bash src/scripts/ddro/run_vault_iterative_dpo.sh \
+  --config src/scripts/configs/iterative_vault_dpo_ema_v100_structure_v6_paper_lr.json
+```
+
+Edit a config before starting a new run. On resume, keep its training settings,
+source paths, and `output_dir` unchanged; the controller verifies them against
+the saved run manifest. `CONFIG=/path/to/experiment.json` remains an alternative
+to `--config` for existing jobs.
+
+For the EMA experiment, edit the paths in
 `src/scripts/configs/iterative_vault_dpo_ema.json`, then run:
 
 ```bash
 conda activate ddro_env
-CUDA_VISIBLE_DEVICES=0,1 bash src/scripts/ddro/run_vault_iterative_dpo_ema.sh
+CUDA_VISIBLE_DEVICES=0,1 bash src/scripts/ddro/run_vault_iterative_dpo.sh --config src/scripts/configs/iterative_vault_dpo_ema.json
 # Continue the same EMA experiment:
-CUDA_VISIBLE_DEVICES=0,1 bash src/scripts/ddro/run_vault_iterative_dpo_ema.sh --resume
+CUDA_VISIBLE_DEVICES=0,1 bash src/scripts/ddro/run_vault_iterative_dpo.sh --config src/scripts/configs/iterative_vault_dpo_ema.json --resume
 ```
 
 This config uses two GPUs for training and mining, one epoch per round, and
@@ -33,16 +47,16 @@ previous reference plus 10% of the just-trained policy. Results go to
 `vault-iterative-dpo-ema-d09`. Start a separate EMA run when switching from an
 existing replacement experiment; changing the reference rule is not a
 resume-compatible setting. `CONFIG` and `PYTHON_BIN` overrides work as in the
-regular launcher; a custom `CONFIG` must itself specify EMA.
+launcher; a custom config must itself specify EMA.
 
 To keep the SFT reference weights frozen while refreshing negatives from the
-latest policy each round, use the dedicated frozen-reference config/launcher:
+latest policy each round, use the frozen-reference config:
 
 ```bash
 conda activate ddro_env
-CUDA_VISIBLE_DEVICES=0,1 bash src/scripts/ddro/run_vault_iterative_dpo_frozen_ref.sh
+CUDA_VISIBLE_DEVICES=0,1 bash src/scripts/ddro/run_vault_iterative_dpo.sh --config src/scripts/configs/iterative_vault_dpo_frozen_ref.json
 # Resume this same frozen-reference run:
-CUDA_VISIBLE_DEVICES=0,1 bash src/scripts/ddro/run_vault_iterative_dpo_frozen_ref.sh --resume
+CUDA_VISIBLE_DEVICES=0,1 bash src/scripts/ddro/run_vault_iterative_dpo.sh --config src/scripts/configs/iterative_vault_dpo_frozen_ref.json --resume
 ```
 
 Edit paths in `src/scripts/configs/iterative_vault_dpo_frozen_ref.json` before
@@ -109,14 +123,14 @@ checkpoints are preserved. Arbitrary code changes still fail resume checks.
 
 ### Four 32 GB V100 GPUs on one node
 
-Use `src/scripts/configs/iterative_vault_dpo_ema_v100.json` and the dedicated
-launcher after allocating four GPUs on the same node:
+Use `src/scripts/configs/iterative_vault_dpo_ema_v100.json` after allocating
+four GPUs on the same node:
 
 ```bash
 conda activate ddro_env
-CUDA_VISIBLE_DEVICES=0,1,2,3 bash src/scripts/ddro/run_vault_iterative_dpo_ema_v100.sh
+CUDA_VISIBLE_DEVICES=0,1,2,3 bash src/scripts/ddro/run_vault_iterative_dpo.sh --config src/scripts/configs/iterative_vault_dpo_ema_v100.json
 # Resume this V100 experiment:
-CUDA_VISIBLE_DEVICES=0,1,2,3 bash src/scripts/ddro/run_vault_iterative_dpo_ema_v100.sh --resume
+CUDA_VISIBLE_DEVICES=0,1,2,3 bash src/scripts/ddro/run_vault_iterative_dpo.sh --config src/scripts/configs/iterative_vault_dpo_ema_v100.json --resume
 ```
 
 If your scheduler already sets `CUDA_VISIBLE_DEVICES`, preserve its allocation
@@ -426,8 +440,8 @@ If you deleted early round directories, resume from a specific **zero-based**
 round using the same configuration and output directory:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 bash src/scripts/ddro/run_vault_iterative_dpo_ema.sh --resume --start-round 3
-# The same option is supported by the frozen-reference and regular launchers.
+CUDA_VISIBLE_DEVICES=0,1 bash src/scripts/ddro/run_vault_iterative_dpo.sh --config src/scripts/configs/iterative_vault_dpo_ema.json --resume --start-round 3
+# The same option works with any compatible iterative DPO config.
 ```
 
 This starts at `round-003` and skips artifact checks/work for rounds 0–2.
