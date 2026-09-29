@@ -48,6 +48,8 @@ TRAIN_ARGS=(
   --startup_debug "${STARTUP_DEBUG:-0}"
   --preference_objective "${PREFERENCE_OBJECTIVE}"
   --tdpo_alpha "${TDPO_ALPHA:-0.5}"
+  --tdpo_prefix_tokens "${TDPO_PREFIX_TOKENS:-3}"
+  --tdpo_prefix_weight "${TDPO_PREFIX_WEIGHT:-3.0}"
   --beta "${BETA:-0.4}"
   --max_prompt_length "${MAX_PROMPT_LENGTH:-256}"
   --max_target_length "${MAX_TARGET_LENGTH:-128}"
@@ -90,6 +92,7 @@ fi
 COMMAND+=("${TRAIN_ARGS[@]}" "$@")
 
 echo "GPUs: ${CUDA_VISIBLE_DEVICES}; effective batch size: $(( NUM_GPUS * TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS ))"
+echo "Objective: ${PREFERENCE_OBJECTIVE}; prefix tokens: ${TDPO_PREFIX_TOKENS:-3}; prefix weight: ${TDPO_PREFIX_WEIGHT:-3.0}; precision: ${PRECISION:-bf16}"
 echo "Resume: ${RESUME_FROM_CHECKPOINT}; dataset cache: ${DATASET_CACHE_DIR}"
 echo "For fast cache reads, set DATASET_CACHE_DIR to sufficiently large node-local disk shared by this node's ranks."
 printf 'Command: '

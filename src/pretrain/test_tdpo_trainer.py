@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from typing import Tuple
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
@@ -16,6 +17,7 @@ from trl import DPOTrainer
 
 from tdpo_trainer import PreferenceConfig, TokenDPOTrainer, sequence_statistics, tdpo_loss
 from preference_cache import TokenizationCacheDataset
+from train_ddro_vault import build_training_args, parse_args
 
 
 class TDPOTest(unittest.TestCase):
@@ -79,16 +81,109 @@ class TDPOTest(unittest.TestCase):
         torch.testing.assert_close(labels, before)
 
     def test_tdpo2_detaches_only_chosen_kl(self):
-        for objective in ["tdpo1", "tdpo2"]:
+        for objective in ["tdpo1", "tdpo2", "tdpo2-weight"]:
             tensors = [torch.tensor([v], requires_grad=True) for v in [0.8, -0.2, 0.1, 0.4]]
             tdpo_loss(*tensors, 0.4, 0.5, objective)[0].sum().backward()
             for index in [0, 1, 3]:
                 self.assertIsNotNone(tensors[index].grad)
                 self.assertNotEqual(tensors[index].grad.item(), 0)
-            if objective == "tdpo2":
+            if objective in {"tdpo2", "tdpo2-weight"}:
                 self.assertIsNone(tensors[2].grad)
             else:
                 self.assertNotEqual(tensors[2].grad.item(), 0)
+
+    def test_weighted_statistics_and_loss_match_manual_values_and_gradients(self):
+        policy = torch.randn(2, 5, 8, requires_grad=True)
+        reference = torch.randn_like(policy, requires_grad=True)
+        # Count valid targets, even with left/interior padding and a short response.
+        labels = torch.tensor([[-100, 2, -100, 3, 1], [4, 1, -100, -100, -100]])
+        weights = torch.tensor([[0., 3., 0., 3., 1.], [3., 3., 0., 0., 0.]])
+        actual = sequence_statistics(policy, reference, labels, prefix_tokens=2, prefix_weight=3.)
+        logp = policy.log_softmax(-1)
+        logr = reference.detach().log_softmax(-1)
+        ids = labels.clamp_min(0).unsqueeze(-1)
+        ratio = (logp - logr).gather(-1, ids).squeeze(-1)
+        token_kl = (logr.exp() * (logr - logp)).sum(-1)
+        expected_margin = (ratio * weights).sum(-1)
+        expected_kl = (token_kl * weights).sum(-1)
+        expected_logps = (logp.gather(-1, ids).squeeze(-1) * (labels != -100)).sum(-1)
+        for result, expected in zip(actual, (expected_margin, expected_kl, expected_logps)):
+            torch.testing.assert_close(result, expected)
+        actual_loss = tdpo_loss(actual[0][:1], actual[0][1:], actual[1][:1], actual[1][1:],
+                                0.4, 0.5, "tdpo2-weight")[0].sum()
+        expected_loss = -F.logsigmoid(0.4 * (
+            expected_margin[0] - expected_margin[1]
+            - 0.5 * (expected_kl[1] - expected_kl[0].detach())
+        ))
+        torch.testing.assert_close(actual_loss, expected_loss)
+        actual_grad = torch.autograd.grad(actual_loss, policy, retain_graph=True)[0]
+        expected_grad = torch.autograd.grad(expected_loss, policy)[0]
+        torch.testing.assert_close(actual_grad, expected_grad)
+        self.assertEqual(actual_grad[labels == -100].abs().sum().item(), 0)
+        self.assertIsNone(reference.grad)
+
+    def test_unit_weight_or_zero_prefix_matches_tdpo2(self):
+        policy = torch.randn(2, 4, 8, requires_grad=True)
+        reference = torch.randn_like(policy)
+        labels = torch.tensor([[2, 3, 1, -100], [4, 1, -100, -100]])
+        baseline = sequence_statistics(policy, reference, labels)
+        baseline_loss = tdpo_loss(baseline[0][:1], baseline[0][1:], baseline[1][:1],
+                                  baseline[1][1:], 0.4, 0.5, "tdpo2")[0].sum()
+        baseline_grad = torch.autograd.grad(baseline_loss, policy, retain_graph=True)[0]
+        for count, weight in [(3, 1.), (0, 3.)]:
+            actual = sequence_statistics(policy, reference, labels,
+                                         prefix_tokens=count, prefix_weight=weight)
+            for a, b in zip(actual, baseline):
+                torch.testing.assert_close(a, b)
+            loss = tdpo_loss(actual[0][:1], actual[0][1:], actual[1][:1], actual[1][1:],
+                             0.4, 0.5, "tdpo2-weight")[0].sum()
+            torch.testing.assert_close(loss, baseline_loss)
+            torch.testing.assert_close(
+                torch.autograd.grad(loss, policy, retain_graph=True)[0], baseline_grad
+            )
+
+    def test_prefix_longer_than_response_and_padding_invariance(self):
+        policy = torch.randn(2, 3, 8, requires_grad=True)
+        reference = torch.randn_like(policy)
+        labels = torch.tensor([[2, 3, 1], [4, 1, -100]])
+        baseline = sequence_statistics(policy, reference, labels)
+        actual = sequence_statistics(policy, reference, labels, prefix_tokens=9, prefix_weight=3.)
+        for index in [0, 1]:
+            torch.testing.assert_close(actual[index], baseline[index] * 3)
+        torch.testing.assert_close(actual[2], baseline[2])
+        extended = sequence_statistics(
+            torch.cat([policy, torch.randn(2, 2, 8) * 1000], dim=1),
+            torch.cat([reference, torch.randn(2, 2, 8) * 1000], dim=1),
+            torch.cat([labels, torch.full((2, 2), -100)], dim=1),
+            prefix_tokens=9, prefix_weight=3.,
+        )
+        for a, b in zip(actual, extended):
+            torch.testing.assert_close(a, b)
+
+    def test_invalid_prefix_settings(self):
+        policy = torch.randn(1, 1, 8)
+        labels = torch.tensor([[2]])
+        for count, weight in [(-1, 3.), (1.5, 3.), (True, 3.), (2, 0.), (2, -1.),
+                              (2, float("nan")), (2, float("inf"))]:
+            with self.subTest(count=count, weight=weight):
+                with self.assertRaises(ValueError):
+                    sequence_statistics(policy, policy, labels,
+                                        prefix_tokens=count, prefix_weight=weight)
+                with self.assertRaises(ValueError):
+                    PreferenceConfig(output_dir="unused", use_cpu=True, report_to=[],
+                                     tdpo_prefix_tokens=count, tdpo_prefix_weight=weight)
+
+    def test_cli_passes_weight_settings_to_training_config(self):
+        with tempfile.TemporaryDirectory() as directory, patch("sys.argv", [
+            "train_ddro_vault.py", "--checkpoint_path", "sft", "--train_file", "pairs.jsonl",
+            "--output_dir", directory, "--preference_objective", "tdpo2-weight",
+            "--tdpo_prefix_tokens", "2", "--tdpo_prefix_weight", "4.5",
+        ]):
+            args = parse_args()
+            config = build_training_args(args, has_eval=False)
+            self.assertEqual(config.preference_objective, "tdpo2-weight")
+            self.assertEqual(config.tdpo_prefix_tokens, 2)
+            self.assertEqual(config.tdpo_prefix_weight, 4.5)
 
     def test_alpha_zero_matches_dpo_values_and_gradients(self):
         policy = torch.randn(2, 3, 8, requires_grad=True)
@@ -132,7 +227,7 @@ class TDPOTest(unittest.TestCase):
             "chosen": ["chosen long", "chosen"] * 2,
             "rejected": ["rejected", "rejected long"] * 2,
         })
-        for objective in ["dpo", "tdpo1", "tdpo2"]:
+        for objective in ["dpo", "tdpo1", "tdpo2", "tdpo2-weight"]:
             with self.subTest(objective=objective), tempfile.TemporaryDirectory() as directory:
                 model = T5ForConditionalGeneration(T5Config(
                     vocab_size=8, d_model=16, d_ff=32, num_layers=1, num_decoder_layers=1,
@@ -142,6 +237,7 @@ class TDPOTest(unittest.TestCase):
                 reference = deepcopy(model).requires_grad_(False).eval()
                 config = PreferenceConfig(
                     output_dir=directory, preference_objective=objective,
+                    tdpo_prefix_tokens=2, tdpo_prefix_weight=2.5,
                     max_steps=1, per_device_train_batch_size=2, per_device_eval_batch_size=2,
                     learning_rate=1e-3, max_prompt_length=8, max_target_length=8,
                     max_length=16, report_to=[], use_cpu=True, save_steps=1,
@@ -156,6 +252,12 @@ class TDPOTest(unittest.TestCase):
                     is_encoder_decoder=True,
                 )
                 before = model.shared.weight.detach().clone()
+                if objective != "dpo":
+                    with patch("tdpo_trainer.sequence_statistics", wraps=sequence_statistics) as stats:
+                        trainer.get_batch_loss_metrics(model, next(iter(trainer.get_train_dataloader())))
+                        weighted = objective == "tdpo2-weight"
+                        self.assertEqual(stats.call_args.kwargs["prefix_tokens"], 2 if weighted else 0)
+                        self.assertEqual(stats.call_args.kwargs["prefix_weight"], 2.5 if weighted else 1.)
                 trainer.train()
                 self.assertFalse(torch.equal(before, model.shared.weight))
                 self.assertTrue(all(parameter.grad is None for parameter in reference.parameters()))
@@ -166,6 +268,8 @@ class TDPOTest(unittest.TestCase):
                 saved = torch.load(Path(directory) / "checkpoint-1/training_args.bin", weights_only=False)
                 self.assertEqual(saved.preference_objective, objective)
                 self.assertEqual(saved.tdpo_alpha, 0.5)
+                self.assertEqual(saved.tdpo_prefix_tokens, 2)
+                self.assertEqual(saved.tdpo_prefix_weight, 2.5)
                 trainer.save_model(str(Path(directory) / "final"))
                 restored = T5ForConditionalGeneration.from_pretrained(Path(directory) / "final")
                 torch.testing.assert_close(restored.shared.weight, model.shared.weight)

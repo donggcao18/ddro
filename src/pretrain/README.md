@@ -3,8 +3,8 @@
 See [the token-level experiment summary and improvement plan](TOKEN_LEVEL_EXPERIMENT.md)
 for the current Ruby URL setup, reported observations, and proposed retrieval-specific ablations.
 
-`train_ddro_vault.py` supports `--preference_objective dpo|tdpo1|tdpo2`.
-The default remains `dpo`. Both TDPO variants reuse the same SFT checkpoint,
+`train_ddro_vault.py` supports `--preference_objective dpo|tdpo1|tdpo2|tdpo2-weight`.
+The default remains `dpo`. All TDPO variants reuse the same SFT checkpoint,
 tokenizer, JSONL `prompt/chosen/rejected` data, validation split, and distributed
 training launcher as DPO. No preprocessing or BM25 rerun is required.
 
@@ -61,6 +61,94 @@ prints tokenization examples; it does not execute the loss or backward pass.
 When resuming through `--resume_from_checkpoint`, pass the same objective,
 alpha, beta, and original SFT checkpoint used for that run. The CLI flags select
 the objective; they are not automatically restored from a checkpoint.
+
+## Prefix-Weighted TDPO2 on Four V100 GPUs
+
+`tdpo2-weight` applies `--tdpo_prefix_weight` (default `3.0`) to the first
+`--tdpo_prefix_tokens` valid decoder targets (default `3`), and weight `1` to
+later targets. Both the token log-ratio and forward-KL sums use these weights,
+for chosen and rejected responses, before the existing TDPO2 loss. The chosen
+KL remains detached. There is no length/weight normalization or auxiliary SFT
+loss. This is an experimental modified objective, not the original TDPO2.
+
+For example, `N=3, weight=3` gives `[3, 3, 3, 1, 1, ...]`. Padding has no
+contribution and does not consume prefix positions. EOS is included and counts
+as a target if the response is shorter than N; the decoder start token and
+encoder prompt are not targets. Weights are assigned independently to each
+response. `--tdpo_prefix_weight 1` or `--tdpo_prefix_tokens 0` reproduces TDPO2.
+The prefix settings have no effect on `dpo`, `tdpo1`, or `tdpo2`.
+
+The four-GPU launcher defaults to a **new run**, four visible GPUs, batch size
+1 preference pair per GPU, accumulation 8 (effective batch 32), gradient
+checkpointing, FP32, and two epochs. It uses the existing URL JSONL and SFT
+checkpoint defaults, without rerunning mining. DDP replicates policy and frozen
+reference on every GPU; it does not combine four GPUs' memory into one pool.
+Batch sizes are conservative starting points, not a guarantee that every model
+size fits a V100. Each preference pair forwards both chosen and rejected.
+
+V100 has no native BF16 support. FP32 is the default because T5 checkpoints can
+overflow in FP16; `PRECISION=fp16` is available after a smoke run confirms finite
+loss and gradients. See [Hugging Face mixed precision guidance](https://huggingface.co/docs/transformers/v5.10.1/mixed_precision_training)
+and [T5 overflow debugging](https://huggingface.co/docs/transformers/main/debugging).
+The launcher rejects `PRECISION=bf16`.
+
+On a Linux training node with four assigned V100 GPUs, activate your existing
+training environment and run from the repository root:
+
+```bash
+CHECKPOINT_PATH=/path/to/sft/checkpoint \
+TRAIN_FILE=/path/to/dpo_pairs_url.jsonl \
+TDPO_PREFIX_TOKENS=3 TDPO_PREFIX_WEIGHT=3 \
+bash src/scripts/ddro/launch_tdpo2_weight_vault_url_4v100.sh
+```
+
+`CUDA_VISIBLE_DEVICES` supplied by the scheduler is honored; otherwise it
+defaults to `0,1,2,3`. This is single-node `torchrun` DDP. Obtain four GPUs from
+your scheduler before launching; the script does not submit a scheduler job.
+`PYTHON_BIN` selects the environment's Python executable.
+
+Compare two and three prefix tokens in separate output directories (the default
+directory includes objective, N, and weight):
+
+```bash
+for n in 2 3; do
+  TDPO_PREFIX_TOKENS="$n" TDPO_PREFIX_WEIGHT=3 \
+    bash src/scripts/ddro/launch_tdpo2_weight_vault_url_4v100.sh
+done
+
+# Same batch/precision defaults, ordinary TDPO2 baseline.
+PREFERENCE_OBJECTIVE=tdpo2 \
+  bash src/scripts/ddro/launch_tdpo2_weight_vault_url_4v100.sh
+
+# Two-step smoke test in a separate directory; performs real forward/backward.
+OUTPUT_DIR=outputs/tdpo2-weight-smoke \
+  bash src/scripts/ddro/launch_tdpo2_weight_vault_url_4v100.sh \
+    --max_steps 2 --save_steps 2 --eval_steps 2 --logging_steps 1
+
+# Print the command without loading data or starting GPU processes.
+PRINT_ONLY=1 bash src/scripts/ddro/launch_tdpo2_weight_vault_url_4v100.sh
+
+# Resume a matching experiment with the same SFT reference and prefix settings.
+RESUME_FROM_CHECKPOINT=latest TDPO_PREFIX_TOKENS=3 TDPO_PREFIX_WEIGHT=3 \
+  bash src/scripts/ddro/launch_tdpo2_weight_vault_url_4v100.sh
+```
+
+Override `OUTPUT_DIR`, `CHECKPOINT_PATH`, `TRAIN_FILE`, `DATASET_CACHE_DIR`,
+`TRAIN_BATCH_SIZE`, `EVAL_BATCH_SIZE`, `GRADIENT_ACCUMULATION_STEPS`, `BETA`,
+`TDPO_ALPHA`, or `PRECISION` as needed. Use the same weight spelling and output
+directory when resuming (`3` and `3.0` produce different default directory names).
+To enable validation, use `VALIDATION_SPLIT=0.01` or pass `--eval_file PATH`.
+The existing default `VALIDATION_SPLIT=0` trains on all pairs. Final portable
+weights are saved under `OUTPUT_DIR/final`; checkpoints are resumable.
+
+The objective, alpha, prefix count, and prefix weight are saved in
+`training_args.bin`, but must still be passed consistently when resuming.
+`logps/*` metrics remain ordinary unweighted log probabilities. With
+`tdpo2-weight`, `kl/*` and reward diagnostics use weighted sums, so their scales
+are not directly comparable to baseline TDPO2. The larger preference score may
+also saturate the sigmoid sooner; compare retrieval performance, not just loss.
+Identical chosen/rejected prefix log ratios cancel, so inspect tokenized URL
+prefixes if the weighted positions mostly contain shared syntax.
 
 ## Faster Tokenization Cache Loading
 
@@ -194,4 +282,7 @@ python -m unittest discover -s src/pretrain -p test_tdpo_trainer.py
 Tests cover loss/gradient parity with the supplied reference when its checkout
 is present, T5 alignment and padding, TDPO2 gradient detachment, alpha-zero DPO
 equivalence, numerical stability, and tiny CPU T5 train/eval/save/resume runs
-for all three objectives. No downloaded model or dataset is needed.
+for all four objectives. Weighted tests also cover manual loss/gradient parity,
+unit-weight equivalence to TDPO2, masked prefix positions, short responses,
+parameter validation, and prefix-setting persistence. No downloaded model or
+dataset is needed.

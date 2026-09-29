@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train DPO, TDPO1, or TDPO2 for Vault from a Hugging Face Trainer checkpoint.
+"""Train DPO, TDPO1, TDPO2, or weighted TDPO2 from a HF Trainer checkpoint.
 
 The input checkpoint must be a directory produced by ``Trainer`` or
 ``save_pretrained``.  In particular, a directory containing ``config.json``,
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -42,8 +43,8 @@ PREFERENCE_COLUMNS = ("prompt", "chosen", "rejected")
 
 def positive_float(value: str) -> float:
     parsed = float(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("value must be greater than zero")
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be finite and greater than zero")
     return parsed
 
 
@@ -51,6 +52,13 @@ def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be greater than zero")
+    return parsed
+
+
+def non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
     return parsed
 
 
@@ -117,11 +125,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup_ratio", type=unit_interval, default=0.1)
     parser.add_argument("--beta", type=positive_float, default=0.4)
     parser.add_argument(
-        "--preference_objective", choices=["dpo", "tdpo1", "tdpo2"], default="dpo"
+        "--preference_objective", choices=["dpo", "tdpo1", "tdpo2", "tdpo2-weight"], default="dpo"
     )
     parser.add_argument(
         "--tdpo_alpha", type=float, default=0.5,
-        help="TDPO2 KL weight; ignored by DPO/TDPO1.",
+        help="TDPO2/tdpo2-weight KL coefficient; ignored by DPO/TDPO1.",
+    )
+    parser.add_argument(
+        "--tdpo_prefix_tokens", type=non_negative_int, default=3,
+        help="First N unmasked target tokens to weight for tdpo2-weight (0 disables).",
+    )
+    parser.add_argument(
+        "--tdpo_prefix_weight", type=positive_float, default=3.0,
+        help="Prefix multiplier for log ratios and KL in tdpo2-weight; later tokens use 1.",
     )
     parser.add_argument(
         "--max_steps", type=int, default=-1,
@@ -387,6 +403,8 @@ def build_training_args(args: argparse.Namespace, has_eval: bool) -> DPOConfig:
     return PreferenceConfig(
         preference_objective=args.preference_objective,
         tdpo_alpha=args.tdpo_alpha,
+        tdpo_prefix_tokens=args.tdpo_prefix_tokens,
+        tdpo_prefix_weight=args.tdpo_prefix_weight,
         max_steps=args.max_steps,
         output_dir=args.output_dir,
         run_name=args.run_name,
@@ -459,6 +477,11 @@ def run_training(args: argparse.Namespace, debug: StartupDiagnostics) -> None:
         f"Preference objective: {args.preference_objective}, "
         f"beta={args.beta}, alpha={args.tdpo_alpha}"
     )
+    if args.preference_objective == "tdpo2-weight":
+        print(
+            f"TDPO prefix weighting: first {args.tdpo_prefix_tokens} target tokens "
+            f"use weight {args.tdpo_prefix_weight}; remaining tokens use weight 1"
+        )
     debug.mark("Loading tokenizer and config BEGIN")
     tokenizer, config = load_tokenizer_and_config(
         checkpoint_path, args.trust_remote_code
