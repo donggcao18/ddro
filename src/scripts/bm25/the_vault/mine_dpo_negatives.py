@@ -231,8 +231,9 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
             }
             positive_targets.update(
                 as_text_id(value)
-                for value in query.get("positive_structure_id_v3s", [])
-                if target_type == "structure_id_v3" and as_text_id(value)
+                for value in query.get(f"positive_{target_type}s", [])
+                if target_type in {"structure_id_v3", "structure_id_v6"}
+                and as_text_id(value)
             )
             usable: list[dict[str, Any]] = []
             seen_candidate_targets: set[str] = set()
@@ -298,10 +299,10 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                         "bm25_score": negative["score"],
                         "rejected_url_based_ids": rejected_metadata.get("url_based_ids", []),
                     }
-                    if target_type == "structure_id_v3":
-                        dpo_row["chosen_structure_id_v3"] = chosen_target
-                        dpo_row["rejected_structure_id_v3"] = rejected_target
-                        dpo_row["positive_structure_id_v3s"] = sorted(positive_targets)
+                    if target_type in {"structure_id_v3", "structure_id_v6"}:
+                        dpo_row[f"chosen_{target_type}"] = chosen_target
+                        dpo_row[f"rejected_{target_type}"] = rejected_target
+                        dpo_row[f"positive_{target_type}s"] = sorted(positive_targets)
                     dpo_handle.write(json.dumps(dpo_row, ensure_ascii=False) + "\n")
                     triples_handle.write(
                         f"{query_key}\t{chosen_target}\t{rejected_target}\n"
@@ -341,7 +342,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True, help="DPO-ready JSONL output")
     parser.add_argument(
         "--target-type",
-        choices=["text_id", "structure_id_v3"],
+        choices=["text_id", "structure_id_v3", "structure_id_v6"],
         default="text_id",
         help="Write chosen/rejected in this decoder target namespace.",
     )

@@ -212,8 +212,9 @@ def combine_group(
         model_ids.add(candidate_id)
 
     bm25_needed = total_per_query - len(prepared_model_rows)
+    model_targets = {str(row["rejected"]) for row in prepared_model_rows}
     selected_bm25 = choose_bm25_rows(
-        bm25_rows,
+        [row for row in bm25_rows if str(row["rejected"]) not in model_targets],
         bm25_needed,
         model_ids,
         stable_rng(seed, key),

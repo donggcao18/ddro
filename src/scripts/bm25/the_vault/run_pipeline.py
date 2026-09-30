@@ -22,6 +22,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-original", required=True)
     parser.add_argument("--test-original", action="append", default=[])
     parser.add_argument("--augmentation", required=True)
+    parser.add_argument(
+        "--augmentation-id-mode",
+        choices=["auto", "numeric", "text_id", "url_based_id"],
+        default="auto",
+        help="How augmentation rows map to original text IDs.",
+    )
     parser.add_argument("--work-dir", required=True)
     parser.add_argument(
         "--structure-id-source",
@@ -31,9 +37,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--target-type",
-        choices=["text_id", "structure_id_v3"],
+        choices=["text_id", "structure_id_v3", "structure_id_v6"],
         default="text_id",
         help="Decoder target namespace for the mined DPO pairs.",
+    )
+    parser.add_argument(
+        "--structure-id-field",
+        help="Field in the structure source; defaults to the structure target type.",
     )
     parser.add_argument(
         "--structure-id-join-key",
@@ -66,6 +76,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    structure_target = args.target_type in {"structure_id_v3", "structure_id_v6"}
+    structure_field = args.structure_id_field or (
+        args.target_type if structure_target else "structure_id_v3"
+    )
     script_dir = Path(__file__).resolve().parent
     work_dir = Path(args.work_dir).resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -77,6 +91,8 @@ def main() -> None:
         args.train_original,
         "--augmentation",
         args.augmentation,
+        "--augmentation-id-mode",
+        args.augmentation_id_mode,
         "--output-dir",
         str(work_dir),
     ]
@@ -85,11 +101,12 @@ def main() -> None:
     for structure_path in args.structure_id_source:
         prepare_command.extend(["--structure-id-source", structure_path])
     prepare_command.extend(
-        ["--structure-id-join-key", args.structure_id_join_key]
+        ["--structure-id-field", structure_field,
+         "--structure-id-join-key", args.structure_id_join_key]
     )
-    if args.target_type == "structure_id_v3" and not args.structure_id_source:
+    if structure_target and not args.structure_id_source:
         raise ValueError(
-            "--target-type structure_id_v3 requires --structure-id-source"
+            f"--target-type {args.target_type} requires --structure-id-source"
         )
     if args.code_only:
         prepare_command.append("--code-only")
@@ -150,9 +167,8 @@ def main() -> None:
     )
 
     output_name = (
-        "dpo_pairs_structure_id_v3.jsonl"
-        if args.target_type == "structure_id_v3"
-        else "dpo_pairs.jsonl"
+        f"dpo_pairs_{args.target_type}.jsonl"
+        if structure_target else "dpo_pairs.jsonl"
     )
     output_path = work_dir / output_name
     mine_command = [

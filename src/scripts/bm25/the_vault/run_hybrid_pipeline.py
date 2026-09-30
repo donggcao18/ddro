@@ -25,6 +25,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-original", action="append", default=[])
     parser.add_argument("--augmentation", required=True)
     parser.add_argument(
+        "--augmentation-id-mode",
+        choices=["auto", "numeric", "text_id", "url_based_id"],
+        default="auto",
+        help="How augmentation rows map to original text IDs.",
+    )
+    parser.add_argument(
         "--structure-id-source",
         action="append",
         default=[],
@@ -34,9 +40,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-path", required=True)
     parser.add_argument(
         "--target-type",
-        choices=["text_id", "url", "structure_id_v3"],
+        choices=["text_id", "url", "structure_id_v3", "structure_id_v6"],
         default="text_id",
         help="Decoder target namespace for model mining and the final hybrid file.",
+    )
+    parser.add_argument(
+        "--structure-id-field",
+        help="Field in the structure source; defaults to the structure target type.",
     )
     parser.add_argument(
         "--structure-id-join-key",
@@ -96,8 +106,8 @@ def build_parser() -> argparse.ArgumentParser:
 def bm25_pair_path(work_dir: Path, target_type: str) -> Path:
     if target_type == "url":
         return work_dir / "dpo_pairs_url.jsonl"
-    if target_type == "structure_id_v3":
-        return work_dir / "dpo_pairs_structure_id_v3.jsonl"
+    if target_type in {"structure_id_v3", "structure_id_v6"}:
+        return work_dir / f"dpo_pairs_{target_type}.jsonl"
     return work_dir / "dpo_pairs.jsonl"
 
 
@@ -122,6 +132,10 @@ def require_reusable_bm25_files(work_dir: Path, target_type: str) -> None:
 
 def main() -> None:
     args = build_parser().parse_args()
+    structure_target = args.target_type in {"structure_id_v3", "structure_id_v6"}
+    structure_field = args.structure_id_field or (
+        args.target_type if structure_target else "structure_id_v3"
+    )
     if args.model_negatives_per_query <= 0:
         raise ValueError("--model-negatives-per-query must be greater than zero")
     if not (
@@ -136,9 +150,9 @@ def main() -> None:
     script_dir = Path(__file__).resolve().parent
     work_dir = Path(args.work_dir).resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
-    if args.target_type == "structure_id_v3" and not args.structure_id_source:
+    if structure_target and not args.structure_id_source:
         raise ValueError(
-            "--target-type structure_id_v3 requires --structure-id-source"
+            f"--target-type {args.target_type} requires --structure-id-source"
         )
 
     if args.reuse_bm25_output:
@@ -152,6 +166,8 @@ def main() -> None:
             args.train_original,
             "--augmentation",
             args.augmentation,
+            "--augmentation-id-mode",
+            args.augmentation_id_mode,
             "--work-dir",
             str(work_dir),
             "--threads",
@@ -172,6 +188,8 @@ def main() -> None:
             args.target_type if args.target_type != "url" else "text_id",
             "--structure-id-join-key",
             args.structure_id_join_key,
+            "--structure-id-field",
+            structure_field,
         ]
         for test_path in args.test_original:
             bm25_command.extend(["--test-original", test_path])
@@ -205,6 +223,7 @@ def main() -> None:
     model_output_name = {
         "url": "model_confusion_pairs_url.jsonl",
         "structure_id_v3": "model_confusion_pairs_structure_id_v3.jsonl",
+        "structure_id_v6": "model_confusion_pairs_structure_id_v6.jsonl",
     }.get(args.target_type, "model_confusion_pairs.jsonl")
     model_output = work_dir / model_output_name
     model_command = [
@@ -250,6 +269,7 @@ def main() -> None:
     hybrid_output_name = {
         "url": "dpo_pairs_hybrid_url.jsonl",
         "structure_id_v3": "dpo_pairs_hybrid_structure_id_v3.jsonl",
+        "structure_id_v6": "dpo_pairs_hybrid_structure_id_v6.jsonl",
     }.get(args.target_type, "dpo_pairs_hybrid.jsonl")
     hybrid_output = work_dir / hybrid_output_name
     combine_command = [
@@ -282,7 +302,7 @@ def main() -> None:
         print(f"BM25 baseline data: {work_dir / 'dpo_pairs.jsonl'}")
         print(f"BM25 URL data: {bm25_pairs}")
     else:
-        print(f"BM25 structure_id_v3 data: {bm25_pairs}")
+        print(f"BM25 {args.target_type} data: {bm25_pairs}")
     print(f"Model-confusion data: {model_output}")
     print(f"Hybrid DPO data: {hybrid_output}")
 

@@ -113,9 +113,9 @@ def document_targets(row: dict[str, Any], target_type: str) -> list[str]:
         return unique_strings(
             row.get("url_based_ids", row.get("url_based_id", row.get("url_id", "")))
         )
-    if target_type == "structure_id_v3":
+    if target_type in {"structure_id_v3", "structure_id_v6"}:
         return unique_strings(
-            row.get("structure_id_v3s", row.get("structure_id_v3", ""))
+            row.get(f"{target_type}s", row.get(target_type, ""))
         )
     raise ValueError(f"Unsupported target type: {target_type!r}")
 

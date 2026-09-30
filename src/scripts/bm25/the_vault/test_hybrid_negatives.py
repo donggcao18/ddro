@@ -56,6 +56,29 @@ class FakeTokenizer:
 
 
 class ModelConfusionHelperTest(unittest.TestCase):
+    def test_v6_shared_structure_target_has_one_generation_sequence(self) -> None:
+        forward, reverse, invalid = build_document_targets(
+            {
+                "a": {"structure_id_v6s": ["same|structure"]},
+                "b": {"structure_id_v6s": ["same|structure"]},
+                "c": {"structure_id_v6s": ["other|structure"]},
+            },
+            "structure_id_v6",
+        )
+        self.assertEqual(invalid, 0)
+        self.assertEqual(forward["a"], forward["b"])
+        self.assertIn(reverse["same|structure"], {"a", "b"})
+        encoded, _, _, collision_groups, _ = build_target_index(
+            FakeTokenizer({
+                "same|structure": [10, 1],
+                "other|structure": [11, 1],
+            }),
+            forward.values(),
+            max_target_length=4,
+        )
+        self.assertEqual(len(encoded), 2)
+        self.assertEqual(collision_groups, [])
+
     def test_canonicalizes_and_filters_model_beams(self) -> None:
         sequence_to_id = {
             (11, 1): "target",
@@ -153,6 +176,29 @@ class ModelConfusionHelperTest(unittest.TestCase):
 
 
 class HybridCombinerTest(unittest.TestCase):
+    def test_shared_structure_target_is_not_selected_twice(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bm25, model, metadata = self.make_inputs(root, [
+                "model-1", "model-2", "model-3", "model-4"
+            ])
+            model_rows = list(iter_json_records(model))
+            model_rows[0]["rejected"] = "shared|structure"
+            write_rows(model, model_rows)
+            bm25_rows = list(iter_json_records(bm25))
+            bm25_rows[0]["rejected"] = "shared|structure"
+            write_rows(bm25, bm25_rows)
+            output = root / "hybrid.jsonl"
+            combine(SimpleNamespace(
+                bm25_input=str(bm25), model_input=str(model),
+                document_metadata=str(metadata), output=str(output),
+                model_per_query=4, total_per_query=8, seed=42,
+                require_exact_mix=False,
+            ))
+            rows = list(iter_json_records(output))
+            self.assertEqual(len(rows), 8)
+            self.assertEqual(len({row["rejected"] for row in rows}), 8)
+
     def make_inputs(
         self,
         root: Path,

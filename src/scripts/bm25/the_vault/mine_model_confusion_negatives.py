@@ -176,13 +176,14 @@ def build_document_targets(
         target = targets[0]
 
         previous_text_id = target_to_text_id.get(target)
-        if previous_text_id is not None and previous_text_id != text_id:
+        if (previous_text_id is not None and previous_text_id != text_id
+                and target_type != "structure_id_v6"):
             raise ValueError(
                 f"Decoder target {target!r} maps to multiple text IDs: "
                 f"{previous_text_id!r} and {text_id!r}"
             )
         text_id_to_target[text_id] = target
-        target_to_text_id[target] = text_id
+        target_to_text_id.setdefault(target, text_id)
 
     if not text_id_to_target:
         raise ValueError(f"No usable {target_type} decoder targets were found")
@@ -321,6 +322,9 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
     text_id_to_target, target_to_text_id, invalid_target_mappings = (
         build_document_targets(document_rows, args.target_type)
     )
+    target_owners: dict[str, set[str]] = {}
+    for text_id, target in text_id_to_target.items():
+        target_owners.setdefault(target, set()).add(text_id)
     (
         encoded_targets,
         sequence_to_target,
@@ -339,19 +343,19 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
     }
     overlength_targets = {target for _, target in overlong_targets}
     collision_excluded_text_ids = {
-        target_to_text_id[target]
+        text_id
         for target in collision_targets
-        if target in target_to_text_id
+        for text_id in target_owners[target]
     }
     overlength_excluded_text_ids = {
-        target_to_text_id[target]
+        text_id
         for target in overlength_targets
-        if target in target_to_text_id
+        for text_id in target_owners[target]
     }
     mining_excluded_text_ids = {
-        target_to_text_id[target]
+        text_id
         for target in mining_excluded_targets
-        if target in target_to_text_id
+        for text_id in target_owners[target]
     }
     docid_trie = Trie(
         [
@@ -396,7 +400,9 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                 "collision_groups": [
                     {
                         "targets": group,
-                        "text_ids": [target_to_text_id[target] for target in group],
+                        "text_ids": sorted(
+                            text_id for target in group for text_id in target_owners[target]
+                        ),
                     }
                     for group in collision_groups
                 ],
@@ -512,6 +518,15 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                         and text_id_to_target[positive_id]
                         not in mining_excluded_targets
                     }
+                    if args.target_type in {"structure_id_v3", "structure_id_v6"}:
+                        positive_targets.update(
+                            str(value)
+                            for value in query.get(
+                                f"positive_{args.target_type}s", []
+                            )
+                            if str(value) in target_to_text_id
+                            and str(value) not in mining_excluded_targets
+                        )
                     if target_text_id not in text_id_to_target:
                         raise ValueError(
                             f"Query {query.get('query_key')!r} targets text_id="
@@ -573,10 +588,10 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                                     "url_based_ids", []
                                 ),
                             }
-                            if args.target_type == "structure_id_v3":
-                                output_row["chosen_structure_id_v3"] = chosen_target
-                                output_row["rejected_structure_id_v3"] = rejected_target
-                                output_row["positive_structure_id_v3s"] = sorted(
+                            if args.target_type in {"structure_id_v3", "structure_id_v6"}:
+                                output_row[f"chosen_{args.target_type}"] = chosen_target
+                                output_row[f"rejected_{args.target_type}"] = rejected_target
+                                output_row[f"positive_{args.target_type}s"] = sorted(
                                     positive_targets
                                 )
                             output_handle.write(
@@ -596,6 +611,9 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
     result.update(
         {
             "documents": len(document_rows),
+            "shared_decoder_target_groups": sum(
+                len(owners) > 1 for owners in target_owners.values()
+            ),
             "usable_decoder_targets": len(sequence_to_target),
             "invalid_document_target_mappings": invalid_target_mappings,
             "invalid_document_url_mappings": (
@@ -639,7 +657,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True)
     parser.add_argument(
         "--target-type",
-        choices=["text_id", "url", "structure_id_v3"],
+        choices=["text_id", "url", "structure_id_v3", "structure_id_v6"],
         default="text_id",
         help="Decoder target namespace. The default preserves the original text_id behavior.",
     )
