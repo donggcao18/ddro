@@ -82,8 +82,10 @@ class VaultPipelineTest(unittest.TestCase):
             source.mkdir()
             structures = root / "structures.jsonl"
             write_rows(structures, [
-                {"url_based_id": "repo/a", "structure_id_v6": "v6|a"},
-                {"url_based_id": "repo/b", "structure_id_v6": "v6|b"},
+                {"numeric_id": "new-900", "url_based_id": "repo/a",
+                 "structure_id_v6": "v6|a",
+                 "positive_structure_id_v6": ["v6|a", "v6|b"]},
+                {"numeric_id": "new-901", "url_based_id": "repo/b", "structure_id_v6": "v6|b"},
                 {"url_based_id": "repo/c", "structure_id_v6": "v6|a"},
                 {"url_based_id": "repo/d", "structure_id_v6": "v6|d"},
             ])
@@ -113,9 +115,10 @@ class VaultPipelineTest(unittest.TestCase):
                 output_document_metadata=str(output_dir / "document_metadata.jsonl"),
             ))
             self.assertEqual(stats["documents_with_unique_structure_id_v6"], 4)
+            self.assertEqual(stats["queries_with_explicit_v6_positives"], 1)
             query = next(iter_json_records(output_dir / "query_metadata.jsonl"))
             self.assertEqual(query["target_structure_id_v6"], "v6|a")
-            self.assertEqual(query["positive_structure_id_v6s"], ["v6|a"])
+            self.assertEqual(query["positive_structure_id_v6s"], ["v6|a", "v6|b"])
             output = output_dir / "dpo_pairs_structure_id_v6.jsonl"
             mined = mine(SimpleNamespace(
                 run=str(run),
@@ -127,10 +130,10 @@ class VaultPipelineTest(unittest.TestCase):
                 target_type="structure_id_v6",
             ))
             self.assertEqual(mined["dpo_pairs"], 1)
-            self.assertEqual(mined["filtered_multi_label_or_target_hits"], 1)
+            self.assertEqual(mined["filtered_multi_label_or_target_hits"], 2)
             pair = next(iter_json_records(output))
             self.assertEqual(pair["chosen"], "v6|a")
-            self.assertNotEqual(pair["rejected"], "v6|a")
+            self.assertEqual(pair["rejected"], "v6|d")
             self.assertEqual(run.read_text(encoding="utf-8").count("\n"), 3)
 
     def test_structure_id_v6_is_used_for_preparation_and_bm25_pairs(self) -> None:

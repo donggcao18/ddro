@@ -179,45 +179,26 @@ many-to-one mappings are reported in the mining stats as
 
 ## structure_id_v6 hybrid DPO on four V100 GPUs
 
-For a **new merged v6 query file**, run fresh BM25 preparation first in the
-Pyserini environment. Use the same merged file as both the augmentation (query
-text and explicit `positive_structure_id_v6` labels) and the structure-ID source.
-`AUGMENTATION_ID_MODE=url_based_id` maps each query to the original train/test
-document by URL; the merged file's `numeric_id` and `semantic_id` are ignored
-for that cross-file join. The original quantized `text_id` remains only the
-internal Lucene document key. This mode requires every query URL to map to one
-original document and every chosen document to have one v6 target.
+The first stage reuses the BM25 run and query/document metadata originally
+built from `Ruby_ready_to_feed_numeric.jsonl`. The old quantized `text_id`
+remains the internal retrieval key; the new
+`Ruby_ready_to_feed_structure_v6.jsonl` supplies `structure_id_v6` and
+`positive_structure_id_v6`. The cross-build join is **only** by exact
+`url_based_id`: numeric IDs and semantic IDs may differ and are not used to
+join the two files. Explicit v6 positives are conservatively unioned by URL
+so none are mined as negatives. Re-mining pairs from the saved rankings is
+necessary to filter same-target and multi-positive candidates; it does not
+rebuild the Lucene index or rerun sparse retrieval.
+
+This produces DPO pairs for the **old BM25 query texts**, with v6 decoder
+targets. It does not replace their prompts with text from the new merged file.
+The second stage mines model confusions on one GPU, combines hybrid negatives,
+and trains DPO on four GPUs. Stage 1 needs Python but not Pyserini.
 
 ```bash
 conda activate pyserini
-RUN_BM25=1 \
-AUGMENTATION_ID_MODE=url_based_id \
-TRAIN_ORIGINAL=/data/Ruby_train_r32.0.json \
-TEST_ORIGINAL=/data/Ruby_test_r32.0.json \
-AUGMENTATION=/data/Ruby_merged_structure_v6.jsonl \
-STRUCTURE_ID_SOURCE=/data/Ruby_merged_structure_v6.jsonl \
-WORK_DIR=/data/vault_bm25_structure_v6 \
-bash src/scripts/ddro/prepare_vault_structure_v6_bm25.sh
-```
-
-This fresh mode rebuilds the Lucene index and searches the merged queries.
-Set `REUSE_INDEX=1` only when `WORK_DIR/index` was built from the identical
-original document corpus; it still reruns search for the new queries.
-
-The default first stage reuses an existing Vault BM25 run and its query/document
-metadata (for example from the v3 work directory). It joins the new v6 IDs to
-the metadata and re-mines eight BM25 pairs per query from the saved retrieval
-results. It does **not** rebuild the Lucene index or rerun sparse retrieval.
-Re-mining is important because a different text ID may decode to the same v6
-target and must not be used as a negative. The second stage uses the DDRO/PyTorch
-environment to mine up to four model-confusion negatives per query on one GPU,
-mixes them with BM25 negatives, and launches DPO on four GPUs. Stage 1 can run
-in any Python environment; it does not import Pyserini in reuse mode.
-
-```bash
-conda activate pyserini
-SOURCE_WORK_DIR=/data/existing_vault_bm25 \
-STRUCTURE_ID_SOURCE=/data/Ruby_structure_id_v6.jsonl \
+SOURCE_WORK_DIR=/data/vault_bm25 \
+STRUCTURE_ID_SOURCE=/data/Ruby_ready_to_feed_structure_v6.jsonl \
 WORK_DIR=/data/vault_bm25_structure_v6 \
 bash src/scripts/ddro/prepare_vault_structure_v6_bm25.sh
 
@@ -231,7 +212,8 @@ bash src/scripts/ddro/train_vault_structure_v6_hybrid_4v100.sh
 `SOURCE_WORK_DIR` must contain `bm25_run.txt`, `query_metadata.jsonl`, and
 `document_metadata.jsonl` from the same original retrieval. Keep `WORK_DIR`
 different from `SOURCE_WORK_DIR`, and use the same `WORK_DIR` in both commands.
-The `STRUCTURE_ID_SOURCE` must contain `url_based_id` and `structure_id_v6`.
+The `STRUCTURE_ID_SOURCE` must contain `url_based_id` and `structure_id_v6`;
+`positive_structure_id_v6` is used when present.
 The `128` above is only an example: set `MAX_TARGET_LENGTH` to the decoder
 limit used by the v6 SFT checkpoint. V100 training defaults to FP16 and an
 effective global batch of 32 (four GPUs, one example per GPU, eight gradient
@@ -241,9 +223,9 @@ files and writes `dpo_pairs_hybrid_structure_id_v6.jsonl`. To reuse completed
 model mining in stage 2, set `RUN_MODEL_MINING=0`; to train from an existing
 hybrid file, also set `RUN_COMBINE=0`.
 
-Only fresh mode needs Pyserini. The saved-run reuse mode is appropriate only
-when the query texts and positive labels represented by that run are still the
-ones intended for DPO.
+The old run, query metadata, and document metadata must belong to the same
+retrieval job. If they do not, generated query keys and document IDs will not
+line up correctly.
 
 ## Performance on large augmentation files
 

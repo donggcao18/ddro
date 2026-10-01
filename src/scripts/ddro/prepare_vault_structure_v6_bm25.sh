@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Stage 1: reuse an existing Vault BM25 run, attach structure_id_v6 targets to
-# its metadata, and re-mine pairs. Set RUN_BM25=1 only for a fresh retrieval.
+# Stage 1: reuse the old Vault BM25 run, attach structure_id_v6 targets by
+# url_based_id, and re-mine pairs. Numeric/semantic IDs need not match builds.
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
 cd "${REPO_ROOT}"
 
-DATA_ROOT="${DATA_ROOT:-/home/users/congthanh_le/scratch/veil/CodeGR/data/indexed}"
+DATA_ROOT="${DATA_ROOT:-/home/users/congthanh_le/scratch/east/CodeGR/data/original_indexed_data_RQ_8_16_decoder_start}"
 TRAIN_ORIGINAL="${TRAIN_ORIGINAL:-${DATA_ROOT}/Ruby_train_r32.0.json}"
 TEST_ORIGINAL="${TEST_ORIGINAL:-${DATA_ROOT}/Ruby_test_r32.0.json}"
-AUGMENTATION="${AUGMENTATION:-/home/users/congthanh_le/scratch/veil/CodeGR/data/updated_v6/Ruby_merged_multilabel.jsonl}"
-AUGMENTATION_ID_MODE="${AUGMENTATION_ID_MODE:-url_based_id}"
-STRUCTURE_ID_SOURCE="${STRUCTURE_ID_SOURCE:-${AUGMENTATION}}"
+AUGMENTATION="${AUGMENTATION:-${DATA_ROOT}/Ruby_ready_to_feed_numeric.jsonl}"
+AUGMENTATION_ID_MODE="${AUGMENTATION_ID_MODE:-auto}"
+STRUCTURE_ID_SOURCE="${STRUCTURE_ID_SOURCE:-}"
 WORK_DIR="${WORK_DIR:-/mnt/beegfs/scratch/congthanh_le/east/ddro/data/vault_bm25_structure_v6}"
-SOURCE_WORK_DIR="${SOURCE_WORK_DIR:-}"
+SOURCE_WORK_DIR="${SOURCE_WORK_DIR:-/mnt/beegfs/scratch/congthanh_le/east/ddro/data/vault_bm25}"
 BM25_PYTHON_BIN="${BM25_PYTHON_BIN:-python}"
-RUN_BM25="${RUN_BM25:-1}"
+RUN_BM25="${RUN_BM25:-0}"
 BM25_THREADS="${BM25_THREADS:-16}"
 BM25_BATCH_SIZE="${BM25_BATCH_SIZE:-16}"
 BM25_HITS="${BM25_HITS:-200}"
@@ -32,7 +32,7 @@ require_file() {
 }
 
 if [[ -z "${STRUCTURE_ID_SOURCE}" ]]; then
-  echo "Set STRUCTURE_ID_SOURCE to JSON/JSONL with url_based_id and structure_id_v6." >&2
+  echo "Set STRUCTURE_ID_SOURCE to Ruby_ready_to_feed_structure_v6.jsonl (url_based_id and structure_id_v6)." >&2
   exit 2
 fi
 require_file "${STRUCTURE_ID_SOURCE}"

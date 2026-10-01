@@ -16,6 +16,21 @@ from common import as_text_id, as_text_id_list, iter_json_records, unique_string
 from prepare_bm25 import load_structure_id_map, structure_join_value
 
 
+def load_explicit_v6_positives(paths: list[Path]) -> dict[str, set[str]]:
+    """Conservatively union known positives for each URL across merged rows."""
+    positives_by_url: dict[str, set[str]] = {}
+    for path in paths:
+        for row in iter_json_records(path):
+            url = structure_join_value(row, "url_based_id")
+            if not url:
+                continue
+            positives = set(unique_strings(row.get("positive_structure_id_v6")))
+            positives.update(unique_strings(row.get("positive_structure_id_v6s")))
+            if positives:
+                positives_by_url.setdefault(url, set()).update(positives)
+    return positives_by_url
+
+
 def relabel(args: argparse.Namespace) -> dict[str, Any]:
     source_documents = Path(args.source_document_metadata)
     source_queries = Path(args.source_query_metadata)
@@ -26,16 +41,19 @@ def relabel(args: argparse.Namespace) -> dict[str, Any]:
     if source_queries.resolve() == output_queries.resolve():
         raise ValueError("Output query metadata must differ from the source")
 
+    structure_sources = [Path(path) for path in args.structure_id_source]
     key_to_v6, source_stats = load_structure_id_map(
-        [Path(path) for path in args.structure_id_source],
+        structure_sources,
         "structure_id_v6",
         "url_based_id",
     )
     if not key_to_v6:
         raise ValueError("No usable url_based_id -> structure_id_v6 mappings found")
+    positives_by_url = load_explicit_v6_positives(structure_sources)
 
     documents: list[dict[str, Any]] = []
     text_id_to_v6: dict[str, list[str]] = {}
+    text_id_to_urls: dict[str, list[str]] = {}
     for row in iter_json_records(source_documents):
         text_id = as_text_id(row.get("text_id"))
         if not text_id:
@@ -48,9 +66,11 @@ def relabel(args: argparse.Namespace) -> dict[str, Any]:
         updated["structure_id_v6s"] = targets
         documents.append(updated)
         text_id_to_v6[text_id] = targets
+        text_id_to_urls[text_id] = keys
 
     queries: list[dict[str, Any]] = []
     seen_query_keys: set[str] = set()
+    queries_with_explicit_positives = 0
     for row in iter_json_records(source_queries):
         query_key = as_text_id(row.get("query_key"))
         chosen_id = as_text_id(row.get("target_text_id"))
@@ -65,8 +85,15 @@ def relabel(args: argparse.Namespace) -> dict[str, Any]:
             )
         chosen_target = chosen_targets[0]
         query_url = structure_join_value(row, "url_based_id")
+        if not query_url and len(text_id_to_urls.get(chosen_id, [])) == 1:
+            query_url = text_id_to_urls[chosen_id][0]
         query_target = key_to_v6.get(query_url)
-        if query_target and query_target != chosen_target:
+        if not query_target:
+            raise ValueError(
+                f"{query_key}: query url_based_id={query_url!r} has no "
+                "structure_id_v6 mapping in the new merged file"
+            )
+        if query_target != chosen_target:
             raise ValueError(
                 f"{query_key}: query URL maps to {query_target!r}, but its "
                 f"chosen document maps to {chosen_target!r}"
@@ -80,6 +107,10 @@ def relabel(args: argparse.Namespace) -> dict[str, Any]:
             for target in text_id_to_v6.get(positive_id, [])
         }
         positive_targets.add(chosen_target)
+        explicit_positives = positives_by_url.get(query_url, set())
+        if explicit_positives:
+            queries_with_explicit_positives += 1
+            positive_targets.update(explicit_positives)
         updated = dict(row)
         updated["target_structure_id_v6"] = chosen_target
         updated["positive_structure_id_v6s"] = sorted(positive_targets)
@@ -102,6 +133,8 @@ def relabel(args: argparse.Namespace) -> dict[str, Any]:
             len(targets) > 1 for targets in text_id_to_v6.values()
         ),
         "queries": len(queries),
+        "queries_with_explicit_v6_positives": queries_with_explicit_positives,
+        "urls_with_explicit_v6_positives": len(positives_by_url),
         "source_document_metadata": str(source_documents),
         "source_query_metadata": str(source_queries),
         "output_document_metadata": str(output_documents),
