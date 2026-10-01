@@ -227,6 +227,27 @@ The old run, query metadata, and document metadata must belong to the same
 retrieval job. If they do not, generated query keys and document IDs will not
 line up correctly.
 
+For a BM25-only DPO baseline, skip model-confusion mining and hybrid
+combination. After the first-stage pair file exists, run this separate launcher
+in the DDRO environment; it reads `dpo_pairs_structure_id_v6.jsonl` directly:
+
+```bash
+conda activate ddro_env
+CHECKPOINT_PATH=/models/ruby-structure-v6-sft/checkpoint-N \
+MAX_TARGET_LENGTH=128 \
+WORK_DIR=/data/vault_bm25_structure_v6 \
+NUM_GPUS=4 \
+PRECISION=fp16 \
+bash src/scripts/ddro/train_vault_structure_v6_bm25_4v100.sh
+```
+
+Set `MAX_TARGET_LENGTH` to the value used by the v6 SFT checkpoint. The BM25-only
+launcher defaults to training batch size 8 per GPU and one accumulation step,
+for an effective global batch of 32 on four GPUs. Evaluation batch size remains
+1 per GPU. Batch size 8 uses more V100 memory than the former 1-by-8 setting;
+if it does not fit, override `TRAIN_BATCH_SIZE=1 GRADIENT_ACCUMULATION_STEPS=8`.
+The launcher writes to a different output directory than the hybrid launcher.
+
 ## Performance on large augmentation files
 
 With 200,000 pseudo-queries and `--hits 200`, Pyserini may write 40 million
