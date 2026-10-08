@@ -411,6 +411,19 @@ Grouping is used only for splitting; it does **not** propagate relevance
 transitively between different queries. At least two independent families are
 required. A large family may make the realized validation fraction differ from
 the requested value; counts and input hashes are saved in `split_manifest.json`.
+Families are selected for validation only when they improve its distance from
+the requested query count, while keeping training nonempty. If no family fits
+that rule, the smallest family is held out. This prevents a giant component
+formed by shared multilabel positives from consuming nearly the whole dataset
+as validation. Family membership and per-query labels remain unchanged.
+The manifest reports input rows, duplicates, prepared queries, family counts,
+the largest family, and the actual validation fraction. Round counts depend on
+the prepared **training** queries, not raw file lines or mined pair counts.
+For example, 69,000 unique queries with a 5% holdout yield approximately 65,550
+training queries, or six rounds at 11,000 queries per round. Family sizes can
+change that count. After updating this preparation code, start a new run with a
+new output directory; `--resume` preserves the existing prepared split and
+checks code identity.
 
 In legacy mode, `target_type` supports `text_id`, `url`, and `structure_id_v3`. For structure
 targets, provide `structure_id_sources` with URL-to-structure mappings, or

@@ -24,7 +24,8 @@ from prepare_bm25 import load_structure_id_map
 from pretrain.iterative_dpo_utils import atomic_json, atomic_jsonl, file_hash
 
 
-def multilabel_rows(corpus_files: list[str], query_file: str, doc_id_type: str) -> tuple[dict, list]:
+def multilabel_rows(corpus_files: list[str], query_file: str, doc_id_type: str,
+                    statistics: dict | None = None) -> tuple[dict, list]:
     """Read type A and positive_A directly, without mapping or expanding labels."""
     documents, seen = {}, {}
     positive_field = f"positive_{doc_id_type}"
@@ -46,7 +47,9 @@ def multilabel_rows(corpus_files: list[str], query_file: str, doc_id_type: str) 
         for raw in iter_json_records(source):
             add_document(doc_id(raw.get(doc_id_type), f"corpus {doc_id_type}"))
 
+    input_rows = 0
     for line, raw in enumerate(iter_json_records(query_file), 1):
+        input_rows += 1
         prompt_value = raw.get("prompt", raw.get("text", ""))
         if not isinstance(prompt_value, str):
             raise ValueError(f"Training query must be a string at record {line}")
@@ -75,6 +78,8 @@ def multilabel_rows(corpus_files: list[str], query_file: str, doc_id_type: str) 
                      "numeric_id": str(raw.get("numeric_id", ""))}
     if not seen:
         raise ValueError("Empty multilabel query file")
+    if statistics is not None:
+        statistics.update(input_query_rows=input_rows, duplicate_query_rows=input_rows - len(seen))
     return documents, list(seen.values())
 
 
@@ -87,14 +92,15 @@ def prepare(corpus_files: list[str], query_file: str, output_dir: str,
         raise ValueError("validation_fraction must be between zero and one")
     if input_format not in {"legacy", "multilabel"}:
         raise ValueError("Invalid input_format")
+    input_statistics = {}
     if input_format == "multilabel":
         if not isinstance(doc_id_type, str) or not doc_id_type.strip() or doc_id_type != doc_id_type.strip():
             raise ValueError("doc_id_type must name a document ID column")
         if id_mode != "auto" or structure_sources:
             raise ValueError("multilabel reads IDs directly; omit id_mode and structure_id_sources")
-        documents, rows = multilabel_rows(corpus_files, query_file, doc_id_type)
+        documents, rows = multilabel_rows(corpus_files, query_file, doc_id_type, input_statistics)
     else:
-        documents, rows = legacy_rows(corpus_files, query_file, structure_sources, id_mode)
+        documents, rows = legacy_rows(corpus_files, query_file, structure_sources, id_mode, input_statistics)
 
     # Connected components are used ONLY for split membership, not relevance.
     parent = list(range(len(rows)))
@@ -124,8 +130,22 @@ def prepare(corpus_files: list[str], query_file: str, output_dir: str,
     random.Random(seed).shuffle(components)
     validation, train = [], []
     wanted = max(1, round(len(rows) * validation_fraction))
+    # Keep families intact, but never fill validation by blindly accepting a
+    # giant connected component. Multi-positive datasets can link most queries.
+    validation_groups = set()
+    validation_count = 0
     for index, group in enumerate(components):
-        destination = validation if len(validation) < wanted and index < len(components) - 1 else train
+        next_count = validation_count + len(group)
+        if (next_count < len(rows)
+                and abs(next_count - wanted) < abs(validation_count - wanted)):
+            validation_groups.add(index)
+            validation_count = next_count
+    if not validation_groups:
+        # No group improves the empty split: the smallest family is the
+        # closest feasible nonempty validation set, leaving training nonempty.
+        validation_groups.add(min(range(len(components)), key=lambda i: len(components[i])))
+    for index, group in enumerate(components):
+        destination = validation if index in validation_groups else train
         family_id = min(r["query_key"] for r in group)
         for row in group:
             row["family_id"] = family_id
@@ -140,8 +160,15 @@ def prepare(corpus_files: list[str], query_file: str, output_dir: str,
     atomic_jsonl(artifacts["train"], sorted(train, key=lambda r: r["query_key"]))
     atomic_jsonl(artifacts["validation"], sorted(validation, key=lambda r: r["query_key"]))
     manifest = {
+        **input_statistics,
         "seed": seed, "validation_fraction": validation_fraction,
         "input_format": input_format, "candidate_documents": len(documents),
+        "prepared_queries": len(rows), "query_families": len(components),
+        "largest_query_family": max(len(group) for group in components),
+        "requested_validation_queries": wanted,
+        "actual_validation_fraction": len(validation) / len(rows),
+        "train_families": len(components) - len(validation_groups),
+        "validation_families": len(validation_groups),
         "train_queries": len(train), "validation_queries": len(validation),
         "relevance_policy": (f"per-row positive_{doc_id_type} only; no label expansion"
                              if input_format == "multilabel" else
@@ -150,10 +177,16 @@ def prepare(corpus_files: list[str], query_file: str, output_dir: str,
         "artifacts": {str(p.resolve()): file_hash(p) for p in artifacts.values()},
     }
     atomic_json(output / "split_manifest.json", manifest)
+    print(f"Query preparation: {manifest['input_query_rows']} input rows, "
+          f"{len(rows)} unique queries, {manifest['duplicate_query_rows']} duplicates; "
+          f"{len(components)} families (largest: {manifest['largest_query_family']}); "
+          f"{len(train)} train, {len(validation)} validation "
+          f"({manifest['actual_validation_fraction']:.2%}, requested {validation_fraction:.2%}).",
+          flush=True)
     return manifest
 
 
-def legacy_rows(corpus_files, query_file, structure_sources, id_mode):
+def legacy_rows(corpus_files, query_file, structure_sources, id_mode, statistics=None):
     documents: dict[str, dict] = {}
     numeric_map: dict[str, str] = {}
     structures, _ = load_structure_id_map(
@@ -183,7 +216,9 @@ def legacy_rows(corpus_files, query_file, structure_sources, id_mode):
     rows = []
     prompt_positives: dict[str, set[str]] = defaultdict(set)
     seen = {}
+    input_rows = 0
     for raw in iter_json_records(query_file):
+        input_rows += 1
         prompt = clean_prompt(raw.get("prompt", raw.get("text", "")))
         if not prompt:
             raise ValueError("Empty training query")
@@ -230,6 +265,8 @@ def legacy_rows(corpus_files, query_file, structure_sources, id_mode):
     for row in rows:
         normalized = normalize_query(row["prompt"])
         row["positive_text_ids"] = sorted(prompt_positives[normalized])
+    if statistics is not None:
+        statistics.update(input_query_rows=input_rows, duplicate_query_rows=input_rows - len(rows))
     return documents, rows
 
 
