@@ -22,7 +22,35 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-original", required=True)
     parser.add_argument("--test-original", action="append", default=[])
     parser.add_argument("--augmentation", required=True)
+    parser.add_argument(
+        "--augmentation-id-mode",
+        choices=["auto", "numeric", "text_id", "url_based_id"],
+        default="auto",
+        help="How augmentation rows map to original text IDs.",
+    )
     parser.add_argument("--work-dir", required=True)
+    parser.add_argument(
+        "--structure-id-source",
+        action="append",
+        default=[],
+        help="JSON/JSONL containing url_based_id -> structure_id_v3 mappings.",
+    )
+    parser.add_argument(
+        "--target-type",
+        choices=["text_id", "structure_id_v3", "structure_id_v6"],
+        default="text_id",
+        help="Decoder target namespace for the mined DPO pairs.",
+    )
+    parser.add_argument(
+        "--structure-id-field",
+        help="Field in the structure source; defaults to the structure target type.",
+    )
+    parser.add_argument(
+        "--structure-id-join-key",
+        choices=["url_based_id", "numeric_id"],
+        default="url_based_id",
+        help="Cross-file key used to attach structure_id_v3 metadata.",
+    )
     parser.add_argument("--threads", type=int, default=16)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--hits", type=int, default=200)
@@ -48,6 +76,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    structure_target = args.target_type in {"structure_id_v3", "structure_id_v6"}
+    structure_field = args.structure_id_field or (
+        args.target_type if structure_target else "structure_id_v3"
+    )
     script_dir = Path(__file__).resolve().parent
     work_dir = Path(args.work_dir).resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -59,11 +91,23 @@ def main() -> None:
         args.train_original,
         "--augmentation",
         args.augmentation,
+        "--augmentation-id-mode",
+        args.augmentation_id_mode,
         "--output-dir",
         str(work_dir),
     ]
     for test_path in args.test_original:
         prepare_command.extend(["--test-original", test_path])
+    for structure_path in args.structure_id_source:
+        prepare_command.extend(["--structure-id-source", structure_path])
+    prepare_command.extend(
+        ["--structure-id-field", structure_field,
+         "--structure-id-join-key", args.structure_id_join_key]
+    )
+    if structure_target and not args.structure_id_source:
+        raise ValueError(
+            f"--target-type {args.target_type} requires --structure-id-source"
+        )
     if args.code_only:
         prepare_command.append("--code-only")
     if args.strict:
@@ -122,6 +166,11 @@ def main() -> None:
         ]
     )
 
+    output_name = (
+        f"dpo_pairs_{args.target_type}.jsonl"
+        if structure_target else "dpo_pairs.jsonl"
+    )
+    output_path = work_dir / output_name
     mine_command = [
         sys.executable,
         str(script_dir / "mine_dpo_negatives.py"),
@@ -132,7 +181,9 @@ def main() -> None:
         "--document-metadata",
         str(work_dir / "document_metadata.jsonl"),
         "--output",
-        str(work_dir / "dpo_pairs.jsonl"),
+        str(output_path),
+        "--target-type",
+        args.target_type,
         "--negatives-per-query",
         str(args.negatives_per_query),
         "--seed",
@@ -148,7 +199,7 @@ def main() -> None:
         mine_command.append("--fill-shortfall")
     run(mine_command)
 
-    print(f"DPO-ready data: {work_dir / 'dpo_pairs.jsonl'}")
+    print(f"DPO-ready data: {output_path}")
 
 
 if __name__ == "__main__":
