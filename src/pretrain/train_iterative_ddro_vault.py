@@ -73,7 +73,7 @@ ROUND_RESUME_COMPATIBLE_CONTROLLERS = MINING_COMPATIBLE_CONTROLLERS | {
 
 def skipped_round_stage(name: str, start_round: int) -> bool:
     prefix, _, suffix = name.rpartition("-")
-    return (prefix in {"select", "mine", "round-inputs", "train", "skip", "reference", "evaluate"}
+    return (prefix in {"select", "mine", "branches", "round-inputs", "train", "skip", "reference", "evaluate"}
             and suffix.isdigit() and int(suffix) < start_round)
 
 
@@ -183,9 +183,26 @@ def load_config(path: Path) -> dict:
     if cfg["id_mode"] not in {"auto", "numeric", "text_id"}:
         raise ValueError("Invalid id_mode")
     training = cfg["training"]
-    if training.keys() - TRAIN_DEFAULTS.keys():
-        raise ValueError(f"Unsupported training options: {training.keys() - TRAIN_DEFAULTS.keys()}")
+    branch_keys = {"preference_objective", "branch_loss_weight", "branch_beta"}
+    if training.keys() - TRAIN_DEFAULTS.keys() - branch_keys:
+        raise ValueError(f"Unsupported training options: {training.keys() - TRAIN_DEFAULTS.keys() - branch_keys}")
     cfg["training"] = {**TRAIN_DEFAULTS, **training}
+    objective = cfg["training"].get("preference_objective", "dpo")
+    if objective not in {"dpo", "branch-dpo"}:
+        raise ValueError("preference_objective must be dpo or branch-dpo")
+    if objective == "branch-dpo":
+        cfg["training"].setdefault("branch_loss_weight", 0.1)
+        cfg["training"].setdefault("branch_beta", cfg["training"]["beta"])
+        if cfg["target_length_policy"] != "error" or cfg["target_collision_policy"] != "error":
+            raise ValueError("Branch DPO requires error policies for target length and collisions")
+    if "branch_loss_weight" in cfg["training"]:
+        value = cfg["training"]["branch_loss_weight"]
+        if type(value) not in {int, float} or not math.isfinite(value) or value < 0:
+            raise ValueError("branch_loss_weight must be finite and nonnegative")
+    if "branch_beta" in cfg["training"]:
+        value = cfg["training"]["branch_beta"]
+        if type(value) not in {int, float} or not math.isfinite(value) or value <= 0:
+            raise ValueError("branch_beta must be finite and positive")
     for key in ("rounds", "num_gpus", "num_beams", "negatives_per_query", "mining_batch_size",
                 "max_prompt_length", "max_target_length", "queries_per_round", "steps_per_round"):
         value = cfg[key]
@@ -207,6 +224,8 @@ def load_config(path: Path) -> dict:
     if cfg["selection_metric"] not in metrics:
         raise ValueError(f"selection_metric must be one of {sorted(metrics)}")
     for key, value in cfg["training"].items():
+        if key in branch_keys:
+            continue
         if key in {"warmup_ratio", "weight_decay", "dataloader_num_workers"}:
             if value < 0 or not math.isfinite(value):
                 raise ValueError(f"{key} must be finite and nonnegative")
@@ -377,6 +396,10 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0):
             SRC / "pretrain/iterative_dpo_utils.py", SRC / "data/data_prep/prepare_vault_dpo_metadata.py",
             MINING / "mine_model_confusion_negatives.py", MINING / "prepare_bm25.py", MINING / "common.py",
             SRC / "utils/trie.py", SRC / "pretrain/mine_on_gpus.py"]
+    branch_mode = cfg["training"].get("preference_objective", "dpo") == "branch-dpo"
+    if branch_mode:
+        code.extend(SRC / "pretrain" / filename for filename in (
+            "branch_preference_utils.py", "prepare_branch_preferences.py", "branch_preference_trainer.py"))
     versions = {}
     for package in ("torch", "transformers", "trl", "datasets", "accelerate", "tokenizers"):
         try:
@@ -530,13 +553,25 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0):
             atomic_json(audit, report)
             print("Round preferences:", json.dumps(report), flush=True)
         stage(f"mine-{round_id}", [pairs, mining_stats, audit, pairs.with_suffix(".excluded_text_ids.json")], mine_round)
+        training_pairs = pairs
+        branch_audit_path = None
+        if branch_mode:
+            from pretrain.prepare_branch_preferences import prepare_branch_preferences
+            training_pairs = directory / "branch_preferences.jsonl"
+            branch_audit_path = directory / "branch_audit.json"
+            stage(f"branches-{round_id}", [training_pairs, branch_audit_path], lambda: prepare_branch_preferences(
+                pairs, selected, documents, checkpoint, training_pairs, cfg["target_type"],
+                cfg["max_target_length"], cfg["target_token_policy"], branch_audit_path))
         round_manifest = directory / "round_inputs.json"
         payload = {"round_id": round_id, "policy_checkpoint": checkpoint,
-                   "policy_fingerprint": fingerprint, "pairs_file": str(pairs),
+                   "policy_fingerprint": fingerprint, "pairs_file": str(training_pairs),
                    "reference_checkpoint": reference_checkpoint, "reference_fingerprint": reference_fingerprint,
                    "inputs": {str(p): file_hash(p) for p in [selected, pairs, documents, validation]},
                    "training": training_options(cfg, round_id), "precision": cfg["precision"],
                    "num_gpus": cfg["num_gpus"]}
+        if branch_mode:
+            payload["original_pairs_file"] = str(pairs)
+            payload["inputs"].update({str(p): file_hash(p) for p in (training_pairs, branch_audit_path)})
         stage(f"round-inputs-{round_id}", [round_manifest], lambda: atomic_json(round_manifest, payload))
         if read_json(round_manifest) != payload:
             raise ValueError("Round snapshot or data provenance changed")
@@ -604,6 +639,8 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0):
                   "reference_checkpoint": payload["reference_checkpoint"],
                   "next_reference_checkpoint": reference_checkpoint,
                   "status": "trained" if report["pairs"] else "skipped_no_negatives"}
+        if branch_mode:
+            result["branch_audit"] = read_json(branch_audit_path)
         results.append(result)
         if metrics is not None and metrics[cfg["selection_metric"]] > best["metrics"][cfg["selection_metric"]]:
             best = {key: result[key] for key in ("round_id", "checkpoint", "checkpoint_fingerprint", "metrics")}

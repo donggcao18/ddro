@@ -12,13 +12,16 @@ The preference data is JSON or JSONL with at least these string fields:
 
     {"prompt": "...", "chosen": "...", "rejected": "..."}
 
-Extra audit fields written by ``mine_dpo_negatives.py`` are discarded.
+Ordinary DPO discards extra audit fields. ``--preference_objective branch-dpo``
+retains and verifies annotations from ``prepare_branch_preferences.py``.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +56,13 @@ def unit_interval(value: str) -> float:
     parsed = float(value)
     if not 0 <= parsed < 1:
         raise argparse.ArgumentTypeError("value must be in the interval [0, 1)")
+    return parsed
+
+
+def nonnegative_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("value must be finite and nonnegative")
     return parsed
 
 
@@ -100,6 +110,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--warmup_ratio", type=unit_interval, default=0.1)
     parser.add_argument("--beta", type=positive_float, default=0.4)
+    parser.add_argument("--preference_objective", choices=["dpo", "branch-dpo"], default="dpo")
+    parser.add_argument("--branch_loss_weight", type=nonnegative_float, default=0.1)
+    parser.add_argument("--branch_beta", type=positive_float, default=None)
     parser.add_argument("--max_grad_norm", type=positive_float, default=0.5)
 
     parser.add_argument("--logging_steps", type=int, default=10)
@@ -236,6 +249,24 @@ def load_preference_datasets(args: argparse.Namespace) -> DatasetDict:
         data_files["validation"] = args.eval_file
 
     datasets = load_dataset("json", data_files=data_files)
+    if args.preference_objective == "branch-dpo":
+        if args.validation_split:
+            raise ValueError("Branch DPO requires --validation_split 0; use a separately annotated --eval_file")
+        try:
+            from .branch_preference_utils import BRANCH_COLUMNS
+        except ImportError:
+            from branch_preference_utils import BRANCH_COLUMNS
+        columns = list(dict.fromkeys((*PREFERENCE_COLUMNS, *BRANCH_COLUMNS)))
+        for name, split in datasets.items():
+            missing = set(columns) - set(split.column_names)
+            if missing or len(split) == 0:
+                raise ValueError(f"Invalid {name} branch dataset: missing={sorted(missing)}, rows={len(split)}")
+            for row in split:
+                if any(not isinstance(row[key], str) or not row[key] or row[key] != row[key].strip()
+                       for key in PREFERENCE_COLUMNS) or row["chosen"] == row["rejected"]:
+                    raise ValueError("Branch datasets must retain valid, unmodified sequence rows")
+            datasets[name] = split.select_columns(columns)
+        return datasets
     datasets = DatasetDict(
         {
             name: clean_preference_dataset(split, name, args.dataset_num_proc)
@@ -353,7 +384,18 @@ def print_preflight(
 def build_training_args(args: argparse.Namespace, has_eval: bool) -> DPOConfig:
     report_to = [] if args.report_to.lower() == "none" else [args.report_to]
     strategy = "steps" if has_eval else "no"
-    return DPOConfig(
+    config_class = DPOConfig
+    extra = {}
+    if args.preference_objective == "branch-dpo":
+        try:
+            from .branch_preference_trainer import BranchDPOConfig
+        except ImportError:
+            from branch_preference_trainer import BranchDPOConfig
+        config_class = BranchDPOConfig
+        extra = {"branch_loss_weight": args.branch_loss_weight,
+                 "branch_beta": args.branch_beta if args.branch_beta is not None else args.beta}
+    return config_class(
+        **extra,
         output_dir=args.output_dir,
         run_name=args.run_name,
         seed=args.seed,
@@ -393,6 +435,41 @@ def build_training_args(args: argparse.Namespace, has_eval: bool) -> DPOConfig:
         precompute_ref_log_probs=False,
         sync_ref_model=False,
     )
+
+
+def validate_branch_datasets(datasets, tokenizer, config, args):
+    try:
+        from .branch_preference_utils import tokenizer_fingerprint, validate_branch_rows
+    except ImportError:
+        from branch_preference_utils import tokenizer_fingerprint, validate_branch_rows
+    fingerprint = tokenizer_fingerprint(tokenizer, config)
+    owners = {}
+
+    @lru_cache(maxsize=None)
+    def encode(target):
+        tokens = tuple(tokenizer(target, add_special_tokens=True, truncation=False)["input_ids"])
+        if (len(tokens) > args.max_target_length or not tokens
+                or tokenizer.eos_token_id is None or tokens[-1] != tokenizer.eos_token_id
+                or tokens.count(tokenizer.eos_token_id) != 1):
+            raise ValueError("Branch target must fit completely and have exactly one terminal EOS")
+        if args.target_token_policy == "error" and (
+            tokenizer.pad_token_id in tokens or tokenizer.unk_token_id in tokens
+        ):
+            raise ValueError("Branch target contains padding/unknown tokens")
+        if tokens in owners and owners[tokens] != target:
+            raise ValueError("Different branch targets have identical tokenizer sequences")
+        owners[tokens] = target
+        return tokens
+
+    for name, dataset in datasets.items():
+        rows = list(dataset)
+        validate_branch_rows(rows, encode, fingerprint)
+        eligible = sum(row["branch_active"] for row in rows)
+        print(f"{name} branch rows: {eligible}/{len(rows)} eligible", flush=True)
+        for row in rows[:3]:
+            print("Branch example:", {key: row[key] for key in (
+                "branch_prefix_tokens", "branch_preferred_token", "branch_rejected_token",
+                "branch_position", "branch_skip_reason", "branch_loss_weight")}, flush=True)
 
 
 def validate_target_sequences(datasets: DatasetDict, tokenizer: Any, limit: int,
@@ -446,6 +523,12 @@ def disable_t5_attention_dropout(model: Any) -> None:
 
 
 def train_round(args: argparse.Namespace) -> None:
+    if args.preference_objective == "branch-dpo":
+        if args.target_length_policy != "error" or args.target_collision_policy != "error":
+            raise ValueError("Branch DPO requires complete targets and unique token sequences (error policies)")
+        if (not math.isfinite(args.branch_loss_weight) or args.branch_loss_weight < 0
+                or (args.branch_beta is not None and (not math.isfinite(args.branch_beta) or args.branch_beta <= 0))):
+            raise ValueError("Invalid branch coefficient/beta")
     if args.max_prompt_length <= 0 or args.max_target_length <= 0:
         raise ValueError("Token length limits must be greater than zero")
     if args.dataset_num_proc <= 0:
@@ -495,7 +578,9 @@ def train_round(args: argparse.Namespace) -> None:
     tokenizer, config = load_tokenizer_and_config(
         checkpoint_path, args.trust_remote_code
     )
-    if args.strict_targets:
+    if args.preference_objective == "branch-dpo":
+        validate_branch_datasets(datasets, tokenizer, config, args)
+    if args.strict_targets or args.preference_objective == "branch-dpo":
         validate_target_sequences(datasets, tokenizer, args.max_target_length,
                                   args.target_length_policy, args.target_collision_policy,
                                   args.target_token_policy)
@@ -527,7 +612,7 @@ def train_round(args: argparse.Namespace) -> None:
     validate_model_tokenizer(reference_model, tokenizer)
     reference_model.requires_grad_(False)
     reference_model.eval()
-    if args.round_manifest:
+    if args.round_manifest or args.preference_objective == "branch-dpo":
         disable_t5_attention_dropout(model)
         disable_t5_attention_dropout(reference_model)
 
@@ -551,7 +636,14 @@ def train_round(args: argparse.Namespace) -> None:
             )
         )
 
-    trainer = DPOTrainer(
+    trainer_class = DPOTrainer
+    if args.preference_objective == "branch-dpo":
+        try:
+            from .branch_preference_trainer import BranchDPOTrainer
+        except ImportError:
+            from branch_preference_trainer import BranchDPOTrainer
+        trainer_class = BranchDPOTrainer
+    trainer = trainer_class(
         model=model,
         ref_model=reference_model,
         args=training_args,

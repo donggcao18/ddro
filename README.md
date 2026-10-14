@@ -173,6 +173,11 @@ bash scripts/ddro/slurm_submit_ddro_training.sh
 
 DDRO is implemented using a custom version of HuggingFace's [DPOTrainer](https://github.com/huggingface/trl).
 
+For continuation from a completed DPO checkpoint, [branch-preference training](src/pretrain/BRANCH_PREFERENCE.md)
+adds a local preference at the first ID-token divergence using the existing
+model-mined pairs. Run `bash src/scripts/ddro/run_vault_branch_preference.sh --help`
+for the URL/structure-ID launcher and ordinary-DPO/zero-coefficient controls.
+
 For Vault, [iterative DPO](src/pretrain/ITERATIVE_DPO.md) mines model-confusion
 preferences before each round, freezes those pairs and the reference during
 training, then continues from the latest policy snapshot. It runs entirely in
