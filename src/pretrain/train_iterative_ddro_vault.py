@@ -193,8 +193,6 @@ def load_config(path: Path) -> dict:
     if objective == "branch-dpo":
         cfg["training"].setdefault("branch_loss_weight", 0.1)
         cfg["training"].setdefault("branch_beta", cfg["training"]["beta"])
-        if cfg["target_length_policy"] != "error" or cfg["target_collision_policy"] != "error":
-            raise ValueError("Branch DPO requires error policies for target length and collisions")
     if "branch_loss_weight" in cfg["training"]:
         value = cfg["training"]["branch_loss_weight"]
         if type(value) not in {int, float} or not math.isfinite(value) or value < 0:
@@ -561,7 +559,9 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0):
             branch_audit_path = directory / "branch_audit.json"
             stage(f"branches-{round_id}", [training_pairs, branch_audit_path], lambda: prepare_branch_preferences(
                 pairs, selected, documents, checkpoint, training_pairs, cfg["target_type"],
-                cfg["max_target_length"], cfg["target_token_policy"], branch_audit_path))
+                cfg["max_target_length"], cfg["target_token_policy"], branch_audit_path,
+                target_length_policy=cfg["target_length_policy"],
+                target_collision_policy=cfg["target_collision_policy"]))
         round_manifest = directory / "round_inputs.json"
         payload = {"round_id": round_id, "policy_checkpoint": checkpoint,
                    "policy_fingerprint": fingerprint, "pairs_file": str(training_pairs),

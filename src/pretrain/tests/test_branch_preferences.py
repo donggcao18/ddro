@@ -97,6 +97,9 @@ class BranchConfigTest(unittest.TestCase):
                 loaded = load_config(path)
                 self.assertEqual(loaded["reference_ema_decay"], 1)
                 self.assertEqual(loaded["rounds"], 1)
+                self.assertEqual(loaded["target_length_policy"], "truncate")
+                self.assertEqual(loaded["target_collision_policy"], "allow")
+                self.assertEqual(loaded["target_token_policy"], "allow")
                 if arm != "dpo":
                     self.assertEqual(loaded["training"]["branch_loss_weight"], 0 if arm == "zero" else 0.1)
                 else:
@@ -114,11 +117,20 @@ class BranchConfigTest(unittest.TestCase):
                 atomic_json(path, bad)
                 with self.assertRaises(ValueError):
                     load_config(path)
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "config.json"
-            atomic_json(path, {**config, "target_length_policy": "truncate"})
-            with self.assertRaisesRegex(ValueError, "error policies"):
-                load_config(path)
+
+    def test_explicit_target_policies_are_preserved(self):
+        for length, collision in (("error", "error"), ("skip", "skip"), ("truncate", "allow")):
+            with tempfile.TemporaryDirectory() as temp, self.subTest(length=length):
+                args = build_parser().parse_args([
+                    "--checkpoint", "dpo", "--query-file", "q.jsonl", "--output-dir", "run",
+                    "--target-length-policy", length, "--target-collision-policy", collision,
+                    "--target-token-policy", "error"])
+                path = Path(temp) / "config.json"
+                atomic_json(path, experiment_config(args))
+                loaded = load_config(path)
+                self.assertEqual(loaded["target_length_policy"], length)
+                self.assertEqual(loaded["target_collision_policy"], collision)
+                self.assertEqual(loaded["target_token_policy"], "error")
 
 
 if __name__ == "__main__":

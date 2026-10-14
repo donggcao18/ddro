@@ -4,6 +4,7 @@ from copy import deepcopy
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 SRC = Path(__file__).resolve().parents[2]
@@ -20,8 +21,10 @@ from trl import DPOConfig, DPOTrainer
 from pretrain.branch_preference_trainer import (
     BranchCollator, BranchDPOConfig, BranchDPOTrainer, local_branch_statistics,
 )
-from pretrain.branch_preference_utils import assign_branch_weights, describe_branch, tokenizer_fingerprint
-from pretrain.train_ddro_vault import disable_t5_attention_dropout
+from pretrain.branch_preference_utils import (
+    assign_branch_weights, describe_branch, encode_branch_target, tokenizer_fingerprint,
+)
+from pretrain.train_ddro_vault import disable_t5_attention_dropout, validate_branch_datasets
 
 torch.set_num_threads(1)
 
@@ -57,6 +60,79 @@ def annotated_rows(tokenizer, model):
         rows.append(row)
     assign_branch_weights(rows)
     return rows
+
+
+class TargetPolicyTest(unittest.TestCase):
+    def test_effective_encoding_matches_trl_and_token_policy(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _, tokenizer = tiny_checkpoint(Path(temp) / "model")
+            target = "A B C0 D0 C1 D1"
+            tokens = encode_branch_target(tokenizer, target, 4, "truncate", "allow")
+            self.assertEqual(tokens, tuple(tokenizer(
+                target, truncation=True, max_length=4, add_special_tokens=True)["input_ids"]))
+            self.assertEqual(tokens[-1], tokenizer.eos_token_id)
+            with self.assertRaisesRegex(ValueError, "length policy"):
+                encode_branch_target(tokenizer, target, 4, "error", "allow")
+            for special in ("unseen", "<pad>"):
+                target = f"A {special} C0"
+                with self.subTest(special=special):
+                    encode_branch_target(tokenizer, target, 8, "error", "allow")
+                    with self.assertRaisesRegex(ValueError, "padding/unknown"):
+                        encode_branch_target(tokenizer, target, 8, "error", "error")
+
+    def test_preparation_validation_and_skipped_positives(self):
+        from pretrain.prepare_branch_preferences import prepare_branch_preferences
+        from common import iter_json_records
+        from pretrain.iterative_dpo_utils import atomic_jsonl
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            model, tokenizer = tiny_checkpoint(root / "model")
+            ids = {"p": "A B C0 D0", "n": "A B C2 D2",
+                   "alias": "A B C0 D1 unseen", "long": "A B C7 D7 C7 D7"}
+            atomic_jsonl(root / "docs.jsonl", [
+                {"text_id": key, "url_based_id": target} for key, target in ids.items()])
+            query = {"query_key": "q", "prompt": "find", "target_text_id": "p",
+                     "positive_text_ids": ["p", "long"]}
+            atomic_jsonl(root / "queries.jsonl", [query])
+            pair = {**query, "chosen_text_id": "p", "rejected_text_id": "n",
+                    "chosen": ids["p"], "rejected": ids["n"]}
+            identical = {**pair, "rejected_text_id": "alias", "rejected": ids["alias"]}
+            atomic_jsonl(root / "pairs.jsonl", [pair, identical])
+
+            def prepare(limit, length, collision):
+                return prepare_branch_preferences(
+                    root / "pairs.jsonl", root / "queries.jsonl", root / "docs.jsonl",
+                    root / "model", root / "annotated.jsonl", "url", limit,
+                    target_token_policy="allow", target_length_policy=length,
+                    target_collision_policy=collision)
+
+            audit = prepare(4, "truncate", "allow")
+            rows = list(iter_json_records(root / "annotated.jsonl"))
+            self.assertEqual(audit["overlength_targets"], 4)
+            self.assertEqual(audit["collision_groups"], 1)
+            self.assertTrue(rows[0]["branch_active"])
+            self.assertEqual(rows[1]["branch_skip_reason"], "identical_tokens")
+            self.assertEqual(rows[1]["branch_loss_weight"], 0)
+            args = SimpleNamespace(max_target_length=4, target_length_policy="truncate",
+                                   target_collision_policy="allow", target_token_policy="allow")
+            validate_branch_datasets({"train": rows}, tokenizer, model.config, args)
+            args.target_collision_policy = "error"
+            with self.assertRaisesRegex(ValueError, "identical tokenizer"):
+                validate_branch_datasets({"train": rows}, tokenizer, model.config, args)
+            with self.assertRaisesRegex(ValueError, "exceed"):
+                prepare(4, "error", "allow")
+            with self.assertRaisesRegex(ValueError, "same tokenizer"):
+                prepare(4, "truncate", "error")
+
+            atomic_jsonl(root / "pairs.jsonl", [pair])
+            audit = prepare(5, "skip", "skip")
+            rows = list(iter_json_records(root / "annotated.jsonl"))
+            self.assertEqual(audit["excluded_positive_targets"], 1)
+            self.assertEqual(rows[0]["branch_positive_targets"], [ids["p"]])
+            self.assertEqual(rows[0]["positive_text_ids"], ["p", "long"])
+            args = SimpleNamespace(max_target_length=5, target_length_policy="skip",
+                                   target_collision_policy="skip", target_token_policy="allow")
+            validate_branch_datasets({"train": rows}, tokenizer, model.config, args)
 
 
 class BranchLossTest(unittest.TestCase):

@@ -15,6 +15,12 @@ sys.path.insert(0, str(SRC / "scripts/bm25/the_vault"))
 @unittest.skipUnless(os.environ.get("RUN_DPO_INTEGRATION") == "1", "Set RUN_DPO_INTEGRATION=1")
 class BranchPipelineTest(unittest.TestCase):
     def test_real_generation_training_interruption_and_resume(self):
+        self.check_pipeline()
+
+    def test_truncated_aliases_generation_training_and_resume(self):
+        self.check_pipeline(compatibility=True)
+
+    def check_pipeline(self, compatibility=False):
         import torch
         from transformers import T5ForConditionalGeneration, TrainerCallback
         import mine_model_confusion_negatives as miner
@@ -31,9 +37,13 @@ class BranchPipelineTest(unittest.TestCase):
             initial, _ = tiny_checkpoint(root / "dpo")
             initial_state = {k: v.detach().clone() for k, v in initial.state_dict().items()}
             ids = [f"A B C{i} D{i}" for i in range(8)]
+            aliases = [target + " unknown_suffix" for target in ids] if compatibility else []
+            if compatibility:
+                atomic_jsonl(root / "corpus.jsonl", [{"semantic_id": target} for target in aliases])
             atomic_jsonl(root / "queries.jsonl", [
                 {"text": f"find C{i}", "semantic_id": target,
-                 "positive_semantic_id": [target, ids[i ^ 1]], "family_id": f"family-{i // 2}"}
+                 "positive_semantic_id": [target, ids[i ^ 1]] + ([aliases[i]] if compatibility else []),
+                 "family_id": f"family-{i // 2}"}
                 for i, target in enumerate(ids)])
             config_path = root / "config.json"
             atomic_json(config_path, {
@@ -43,7 +53,12 @@ class BranchPipelineTest(unittest.TestCase):
                 "reference_update": "ema", "reference_ema_decay": 1.0,
                 "precision": "fp32", "device": "cpu", "num_beams": 8,
                 "negatives_per_query": 2, "mining_batch_size": 2, "max_prompt_length": 8,
-                "max_target_length": 8, "selection_metric": "mrr@8", "training": {
+                "max_target_length": 4 if compatibility else 8,
+                "target_length_policy": "truncate" if compatibility else "error",
+                "target_collision_policy": "allow" if compatibility else "error",
+                "target_token_policy": "allow" if compatibility else "error",
+                "corpus_files": ["corpus.jsonl"] if compatibility else [],
+                "selection_metric": "mrr@8", "training": {
                     "preference_objective": "branch-dpo", "branch_loss_weight": 0.1,
                     "per_device_train_batch_size": 2, "gradient_accumulation_steps": 1,
                     "learning_rate": 1e-3, "warmup_ratio": 0, "save_steps": 1,
@@ -84,6 +99,11 @@ class BranchPipelineTest(unittest.TestCase):
             straight = run_pipeline(cfg, runner=runner)
             self.assertTrue(straight["complete"])
             self.assertTrue(all(r["branch_audit"]["eligible_rows"] > 0 for r in straight["rounds"]))
+            if compatibility:
+                for result in straight["rounds"]:
+                    self.assertEqual(result["branch_audit"]["overlength_targets"], 16)
+                    self.assertEqual(result["branch_audit"]["collision_groups"], 8)
+                    self.assertEqual(result["branch_audit"]["excluded_targets"], 0)
             for index in range(2):
                 from common import iter_json_records
                 directory = root / f"straight/round-{index:03d}"
@@ -97,6 +117,10 @@ class BranchPipelineTest(unittest.TestCase):
                                  file_hash(directory / "branch_preferences.jsonl"))
                 args = torch.load(directory / "training/latest/training_args.bin", weights_only=False)
                 self.assertEqual(args.branch_loss_weight, 0.1)
+                if compatibility:
+                    self.assertTrue(all(row["branch_position"] < 4 for row in annotated))
+                    self.assertTrue(all(row["rejected_text_id"] not in row["positive_text_ids"]
+                                        for row in annotated))
 
             interrupted_cfg = {**cfg, "output_dir": str(root / "resumed")}
             interrupt[0] = True

@@ -4,6 +4,8 @@ Prepared 2026-10-15 for the current `branch-preference` checkout. This document 
 
 Run C has now been implemented. See [BRANCH_PREFERENCE.md](BRANCH_PREFERENCE.md) for the current launcher and behavior. The adaptive/curriculum items below remain follow-up experiments.
 
+Compatibility update: at the user's request, Run C now honors the existing on-policy target policies. The launcher defaults to truncation, allowed token aliases, and allowed unknown/padding tokens. These supersede the complete/unique-target requirements below; local decisions are extracted and validated on the effective training tokens, and token-identical pairs have no auxiliary preference.
+
 ## 1. First implementation and experimental question
 
 Implement Run C: continue from a completed normal-DPO checkpoint with the existing whole-ID sigmoid DPO loss plus a local DPO loss at the first token divergence between an existing chosen/rejected pair.

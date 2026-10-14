@@ -39,7 +39,9 @@ def build_parser():
     parser.add_argument("--max-prompt-length", type=int, default=256)
     parser.add_argument("--max-target-length", type=int, default=128)
     parser.add_argument("--length-penalty", type=float, default=1.0)
-    parser.add_argument("--target-token-policy", choices=["error", "allow"], default="error")
+    parser.add_argument("--target-length-policy", choices=["error", "skip", "truncate"], default="truncate")
+    parser.add_argument("--target-collision-policy", choices=["error", "skip", "allow"], default="allow")
+    parser.add_argument("--target-token-policy", choices=["error", "allow"], default="allow")
     parser.add_argument("--validation-fraction", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-steps", type=int, default=100)
@@ -76,8 +78,8 @@ def experiment_config(args):
             "num_beams": args.num_beams, "negatives_per_query": args.negatives_per_query,
             "mining_batch_size": args.mining_batch_size,
             "max_prompt_length": args.max_prompt_length, "max_target_length": args.max_target_length,
-            "length_penalty": args.length_penalty, "target_length_policy": "error",
-            "target_collision_policy": "error", "target_token_policy": args.target_token_policy,
+            "length_penalty": args.length_penalty, "target_length_policy": args.target_length_policy,
+            "target_collision_policy": args.target_collision_policy, "target_token_policy": args.target_token_policy,
             "selection_metric": "mrr@10", "training": training}
 
 

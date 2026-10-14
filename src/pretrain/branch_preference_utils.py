@@ -14,6 +14,23 @@ BRANCH_COLUMNS = (
 )
 
 
+def encode_branch_target(tokenizer, target, limit, length_policy="error", token_policy="error"):
+    """Use the same effective target tokens as constrained mining and TRL."""
+    options = {"add_special_tokens": True, "truncation": length_policy == "truncate"}
+    if length_policy == "truncate":
+        options["max_length"] = limit
+    tokens = tuple(tokenizer(target, **options)["input_ids"])
+    if not tokens or len(tokens) > limit:
+        raise ValueError(f"Branch target exceeds the configured length policy: {target!r}")
+    if tokenizer.eos_token_id is not None and tokens[-1] != tokenizer.eos_token_id:
+        raise ValueError(f"Branch target does not end in EOS: {target!r}")
+    if token_policy != "allow" and (tokenizer.pad_token_id in tokens or (
+        tokenizer.unk_token_id is not None and tokenizer.unk_token_id in tokens
+    )):
+        raise ValueError(f"Branch target contains padding/unknown tokens: {target!r}")
+    return tokens
+
+
 def tokenizer_fingerprint(tokenizer, config):
     identity = {"vocab": tokenizer.get_vocab(), "special_tokens": tokenizer.special_tokens_map,
                 "decoder_start": config.decoder_start_token_id,

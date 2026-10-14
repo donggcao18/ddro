@@ -55,11 +55,19 @@ The launcher writes a resolved config beside the output directory, e.g.
 the controller starts the mining and training workers. Do not wrap the launcher
 in `torchrun`.
 
-All IDs must fit completely and tokenize uniquely. Truncation and collision
-policies are `error` for every arm. Increase `--max-target-length` if the
-preflight reports overlength IDs; resolve aliases explicitly. Padding/unknown
-target tokens fail by default; `--target-token-policy allow` is an explicit
-compatibility option, while uniqueness and one terminal EOS remain required.
+The launcher uses the on-policy compatibility defaults for every arm:
+`--target-length-policy truncate --target-collision-policy allow
+--target-token-policy allow`. Mining, branch extraction, and training use the
+same effective token sequences, including tokenizer truncation and terminal EOS.
+The target limit can remain 128 when some original IDs are longer. Alias groups
+use the existing miner's representative IDs and positive filtering. Pairs whose
+effective sequences are identical receive zero auxiliary loss. The branch audit
+records overlength IDs, alias groups, excluded targets, and inactive pairs.
+
+To require complete, distinct encodings, select `--target-length-policy error
+--target-collision-policy error --target-token-policy error` and set an adequate
+`--max-target-length`. The `skip` length/collision policies exclude affected IDs
+from mining and branch-positive support; original relevance labels are preserved.
 
 ## Controls and refreshing negatives
 
@@ -91,7 +99,9 @@ python src/pretrain/train_iterative_ddro_vault.py \
 ```
 
 Use a new output directory when changing objective, coefficient, checkpoint,
-data, or training settings. Existing pre-update manifests do not silently
+data, target policies, or training settings. After this compatibility update,
+restart a previously failed strict-policy run with a new output directory.
+Existing pre-update manifests do not silently
 migrate into branch experiments. `--prepare-only` prepares the split; continue
 that run with `--resume` after removing `--prepare-only`.
 
@@ -122,5 +132,6 @@ RUN_DPO_INTEGRATION=1 python -m unittest discover \
 ```
 
 The integration flag enables real mining, annotation, training, frozen-reference
-checks, interrupted checkpoint resume, and stale-artifact rejection. Tests also
+checks, interrupted checkpoint resume, and stale-artifact rejection under both
+strict policies and truncated aliases. Tests also
 verify zero-coefficient loss/gradient parity and same-state local gradients.

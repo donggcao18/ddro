@@ -439,24 +439,18 @@ def build_training_args(args: argparse.Namespace, has_eval: bool) -> DPOConfig:
 
 def validate_branch_datasets(datasets, tokenizer, config, args):
     try:
-        from .branch_preference_utils import tokenizer_fingerprint, validate_branch_rows
+        from .branch_preference_utils import encode_branch_target, tokenizer_fingerprint, validate_branch_rows
     except ImportError:
-        from branch_preference_utils import tokenizer_fingerprint, validate_branch_rows
+        from branch_preference_utils import encode_branch_target, tokenizer_fingerprint, validate_branch_rows
     fingerprint = tokenizer_fingerprint(tokenizer, config)
     owners = {}
 
     @lru_cache(maxsize=None)
     def encode(target):
-        tokens = tuple(tokenizer(target, add_special_tokens=True, truncation=False)["input_ids"])
-        if (len(tokens) > args.max_target_length or not tokens
-                or tokenizer.eos_token_id is None or tokens[-1] != tokenizer.eos_token_id
-                or tokens.count(tokenizer.eos_token_id) != 1):
-            raise ValueError("Branch target must fit completely and have exactly one terminal EOS")
-        if args.target_token_policy == "error" and (
-            tokenizer.pad_token_id in tokens or tokenizer.unk_token_id in tokens
-        ):
-            raise ValueError("Branch target contains padding/unknown tokens")
-        if tokens in owners and owners[tokens] != target:
+        tokens = encode_branch_target(tokenizer, target, args.max_target_length,
+                                      args.target_length_policy, args.target_token_policy)
+        if (args.target_collision_policy != "allow"
+                and tokens in owners and owners[tokens] != target):
             raise ValueError("Different branch targets have identical tokenizer sequences")
         owners[tokens] = target
         return tokens
@@ -524,8 +518,6 @@ def disable_t5_attention_dropout(model: Any) -> None:
 
 def train_round(args: argparse.Namespace) -> None:
     if args.preference_objective == "branch-dpo":
-        if args.target_length_policy != "error" or args.target_collision_policy != "error":
-            raise ValueError("Branch DPO requires complete targets and unique token sequences (error policies)")
         if (not math.isfinite(args.branch_loss_weight) or args.branch_loss_weight < 0
                 or (args.branch_beta is not None and (not math.isfinite(args.branch_beta) or args.branch_beta <= 0))):
             raise ValueError("Invalid branch coefficient/beta")
