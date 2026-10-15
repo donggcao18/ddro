@@ -41,7 +41,7 @@ DEFAULTS = {
     "target_collision_policy": "error",
     "target_token_policy": "error",
     "selection_metric": "mrr@10",
-    "eval_every_epochs": None, "eval_at_end": True,
+    "eval_every_epochs": None, "eval_every_rounds": None, "eval_at_end": True,
     "training": {},
 }
 TRAIN_DEFAULTS = {
@@ -57,13 +57,16 @@ EVALUATION_COMPATIBLE_CONTROLLERS = {
     "1bae0608a2e5ad79141d31b228553f98f2f21afe6ecbe453991dd039b8e60280",
     "8edf71dcade31b08f67f1f581cb77eadd93f56df086c14ac7ea09de320951452",
 }
-EVALUATION_SCHEDULE_KEYS = {"eval_every_epochs", "eval_at_end"}
+EVALUATION_SCHEDULE_KEYS = {"eval_every_epochs", "eval_every_rounds", "eval_at_end"}
 MINING_COMPATIBLE_CONTROLLERS = EVALUATION_COMPATIBLE_CONTROLLERS | {
     "13c07e6d53f273b021498b572469322782b6af52333bbe6173a7466f50d88e1c",
     "d02f074f416ad1979679458933d8e940e378a32b2771f13b6a34bbab167f8b3c",
 }
 RUNTIME_KEYS = EVALUATION_SCHEDULE_KEYS | {"mining_num_gpus"}
 ROUND_RESUME_COMPATIBLE_CONTROLLERS = MINING_COMPATIBLE_CONTROLLERS | {
+    # Full-query continuation controller before round-based eval (LF / CRLF).
+    "0121e102c09adc742c8bd9e48a2cb70ecff90dc00c0165b1b1af4b29afa2d0b9",
+    "9bcbd5dcff88a2262c04c17822da1808235ddc9ad8cdcb1cee1525e72e61ba82",
     # Branch-preference controller before explicit round extension (LF / CRLF).
     "54640a8be5e13db7899f9cc106740ab0488c7b44cc5d182a45309d357d13bbb3",
     "75616c5b872accbbca0b0889f3880b50aa0152a1693868457c3ce541c63004bf",
@@ -153,7 +156,13 @@ def accept_evaluation_resume_update(state: dict, identity: dict, start_round=0,
     state["identity"] = identity
 
 
-def evaluation_due(cfg: dict, previous_epochs: float, completed_epochs: float, final_round: bool) -> bool:
+def evaluation_due(cfg: dict, previous_epochs: float, completed_epochs: float, final_round: bool,
+                   completed_rounds: int | None = None) -> bool:
+    round_interval = cfg.get("eval_every_rounds")
+    if round_interval is not None:
+        if completed_rounds is None:
+            raise ValueError("Round-based evaluation requires the completed round count")
+        return completed_rounds % round_interval == 0 or (cfg["eval_at_end"] and final_round)
     interval = cfg["eval_every_epochs"]
     if interval is None:
         return True  # Preserve the old per-round default for existing configs.
@@ -188,6 +197,12 @@ def load_config(path: Path) -> dict:
     if (cfg["steps_per_round"] is None) == (cfg["epochs_per_round"] is None):
         raise ValueError("Specify exactly one of steps_per_round or epochs_per_round")
     interval = cfg["eval_every_epochs"]
+    round_interval = cfg["eval_every_rounds"]
+    if round_interval is not None:
+        if type(round_interval) is not int or round_interval <= 0:
+            raise ValueError("eval_every_rounds must be null or a positive integer")
+        if interval is not None:
+            raise ValueError("Choose either eval_every_epochs or eval_every_rounds")
     if interval is not None:
         if type(interval) not in {int, float} or not math.isfinite(interval) or interval <= 0:
             raise ValueError("eval_every_epochs must be null or a finite positive number")
@@ -405,11 +420,19 @@ def audit_pairs(path: Path, queries: list[dict], documents: Path, target_type: s
 
 
 def run_pipeline(cfg: dict, resume=False, prepare_only=False, runner=run_command, start_round=0,
-                 extend_rounds=None) -> dict:
+                 extend_rounds=None, eval_every_rounds=None, eval_at_end=None) -> dict:
     if type(start_round) is not int or start_round < 0:
         raise ValueError("start_round must be a nonnegative integer")
     if start_round and (not resume or prepare_only):
         raise ValueError("--start-round requires --resume and cannot be used with --prepare-only")
+    if eval_every_rounds is not None:
+        if type(eval_every_rounds) is not int or eval_every_rounds <= 0:
+            raise ValueError("eval_every_rounds must be a positive integer")
+        cfg = {**cfg, "eval_every_rounds": eval_every_rounds, "eval_every_epochs": None}
+    if eval_at_end is not None:
+        if type(eval_at_end) is not bool:
+            raise ValueError("eval_at_end must be a boolean")
+        cfg = {**cfg, "eval_at_end": eval_at_end}
     if extend_rounds is not None:
         if (not resume or prepare_only or not (extend_rounds == "all" or (
                 type(extend_rounds) is int and extend_rounds > 0))):
@@ -701,13 +724,16 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0, exte
             completed_epochs += cfg["epochs_per_round"]
         evaluation_stage = f"evaluate-{round_id}"
         cached_evaluation = evaluation_stage in state["stages"]
-        if cached_evaluation or evaluation_due(cfg, previous_epochs, completed_epochs, round_id == total_rounds - 1):
+        if cached_evaluation or evaluation_due(cfg, previous_epochs, completed_epochs,
+                                               round_id == total_rounds - 1, completed_rounds=round_id + 1):
             metrics = evaluate(evaluation_stage, checkpoint, fingerprint, round_id, directory)
             evaluation_status = "reused" if cached_evaluation else "evaluated"
         else:
             metrics = None
             evaluation_status = "deferred"
-            print(f"Round {round_id}: evaluation deferred ({completed_epochs:g} completed training epochs).", flush=True)
+            progress = (f"{round_id + 1} rounds completed; evaluate every {cfg['eval_every_rounds']} rounds"
+                        if cfg["eval_every_rounds"] is not None else f"{completed_epochs:g} completed training epochs")
+            print(f"Round {round_id}: evaluation deferred ({progress}).", flush=True)
         result = {"round_id": round_id, "checkpoint": checkpoint, "checkpoint_fingerprint": fingerprint,
                   "metrics": metrics, "pair_audit": report, "optimizer_steps": info["global_step"],
                   "completed_training_epochs": completed_epochs, "evaluation_status": evaluation_status,
@@ -734,6 +760,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--eval-every-rounds", type=int,
+                        help="Override retrieval evaluation to every N completed rounds (compatible with --resume)")
+    parser.add_argument("--eval-at-end", action=argparse.BooleanOptionalAction, default=None,
+                        help="Override whether to also evaluate at the end of the run")
     parser.add_argument("--extend-rounds", type=lambda value: "all" if value == "all" else int(value),
                         help="With --resume, extend a completed run to a total count or 'all' training queries; repeat on resume")
     parser.add_argument("--start-round", type=int, default=0,
@@ -743,7 +773,8 @@ def main():
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         raise ValueError("Launch the controller with python; it launches torchrun for each training round")
     run_pipeline(load_config(args.config.resolve()), args.resume, args.prepare_only,
-                 start_round=args.start_round, extend_rounds=args.extend_rounds)
+                 start_round=args.start_round, extend_rounds=args.extend_rounds,
+                 eval_every_rounds=args.eval_every_rounds, eval_at_end=args.eval_at_end)
 
 
 if __name__ == "__main__":

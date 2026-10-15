@@ -137,6 +137,29 @@ Only completed fixed-round runs can be extended; data, package versions, model
 code, training settings, and checkpoint identities must still match. The update
 accepts the known preceding controller version without altering trained outputs.
 
+### Resume at round 3 and evaluate every 8 completed rounds
+
+```bash
+export MKL_THREADING_LAYER=GNU
+unset MKL_SERVICE_FORCE_INTEL
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -u src/pretrain/train_iterative_ddro_vault.py \
+  --config outputs/vault-url-branch-C.config.json \
+  --resume --start-round 3 --extend-rounds all --eval-every-rounds 8
+```
+
+Round IDs are zero-based: this preserves rounds 0, 1, and 2 and resumes
+`round-003` from the retained round-2 policy and reference. Retrieval evaluation
+runs after 8, 16, 24, ... completed rounds (directories `round-007`, `round-015`,
+`round-023`, ...), plus the final round. Add `--no-eval-at-end` to evaluate only
+at exact multiples of eight. Previously committed metrics are retained.
+
+The round interval works with the saved 1,000-step training budget; it does not
+change the number of optimizer updates or treat each round as an epoch. It
+overrides an existing epoch-based evaluation interval. Repeat the full command,
+including `--eval-every-rounds 8`, after any interruption. The saved config file
+stays unchanged; the runtime schedule update is recorded in the run manifest.
+
 Use a new output directory when changing objective, coefficient, checkpoint,
 data, target policies, or training settings. Extending the round plan through
 the command above keeps the existing output directory. After this compatibility update,

@@ -8,7 +8,7 @@ from unittest.mock import patch
 from test_iterative_dpo import FixtureWorker, fixture
 from pretrain.iterative_dpo_utils import atomic_json, file_hash, read_json
 from common import iter_json_records
-from pretrain.train_iterative_ddro_vault import SRC, load_config, run_pipeline
+from pretrain.train_iterative_ddro_vault import SRC, evaluation_due, load_config, run_pipeline
 
 
 class CompletedRunExtensionTest(unittest.TestCase):
@@ -149,6 +149,85 @@ class CompletedRunExtensionTest(unittest.TestCase):
                 result = run_pipeline(cfg, resume=True, runner=worker, start_round=1, extend_rounds=3)
                 self.assertTrue(result["complete"])
                 self.assertEqual(len(result["round_extensions"]), 1)
+
+
+class RoundEvaluationResumeTest(unittest.TestCase):
+    def test_resume_full_query_run_at_round_three_updates_only_evaluation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = fixture(root)
+            atomic_json(path, {**read_json(path), "rounds": 1, "queries_per_round": 1,
+                               "reference_update": "ema", "reference_ema_decay": 1.0})
+            cfg = load_config(path)
+            worker = FixtureWorker()
+            run_pipeline(cfg, runner=worker)
+
+            def interrupt(command):
+                if ("--checkpoint-path" in command and "--evaluation-only" not in command
+                        and command[command.index("--round-id") + 1] == "3"):
+                    raise RuntimeError("interrupt before round three mining")
+                worker(command)
+
+            with self.assertRaisesRegex(RuntimeError, "interrupt before round three"):
+                run_pipeline(cfg, resume=True, runner=interrupt, start_round=1, extend_rounds="all")
+            manifest = root / "run/run_manifest.json"
+            old = read_json(manifest)
+            old_rounds = old["rounds"]
+            old["identity"]["code"][str(SRC / "pretrain/train_iterative_ddro_vault.py")] = (
+                "0121e102c09adc742c8bd9e48a2cb70ecff90dc00c0165b1b1af4b29afa2d0b9")
+            old["identity"]["config"].pop("eval_every_rounds")
+            atomic_json(manifest, old)
+            preserved = {p: file_hash(p) for i in range(3)
+                         for p in (root / f"run/round-{i:03d}").rglob("*") if p.is_file()}
+            preserved[path] = file_hash(path)
+            worker.calls.clear()
+            result = run_pipeline(cfg, resume=True, runner=worker, start_round=3,
+                                  extend_rounds="all", eval_every_rounds=8)
+            self.assertTrue(result["complete"])
+            self.assertEqual(result["identity"]["config"]["eval_every_rounds"], 8)
+            self.assertIsNone(result["identity"]["config"]["epochs_per_round"])
+            evaluated = [c[c.index("--round-id") + 1] for c in worker.calls if "--evaluation-only" in c]
+            self.assertEqual(evaluated, ["7", "13"])
+            self.assertEqual(result["rounds"][:3], old_rounds)
+            self.assertEqual({p: file_hash(p) for p in preserved}, preserved)
+            self.assertFalse(any("--round-id" in c and int(c[c.index("--round-id") + 1]) < 3
+                                 for c in worker.calls))
+            boundary = read_json(root / "run/round-003/round_inputs.json")
+            self.assertEqual(boundary["policy_checkpoint"], old_rounds[2]["checkpoint"])
+            self.assertEqual(boundary["reference_checkpoint"], old_rounds[2]["next_reference_checkpoint"])
+            self.assertEqual(len([c for c in worker.calls if "--round_manifest" in c]), 11)
+            worker.calls.clear()
+            run_pipeline(cfg, resume=True, runner=worker, start_round=3,
+                         extend_rounds="all", eval_every_rounds=8)
+            self.assertFalse(worker.calls)
+
+    def test_round_schedule_boundaries_and_final_round(self):
+        cfg = {"eval_every_rounds": 8, "eval_every_epochs": None, "eval_at_end": True}
+        for completed in (1, 3, 7, 9, 15):
+            with self.subTest(completed=completed):
+                self.assertFalse(evaluation_due(cfg, 0, 0, False, completed_rounds=completed))
+        for completed in (8, 16, 24):
+            with self.subTest(completed=completed):
+                self.assertTrue(evaluation_due(cfg, 0, 0, False, completed_rounds=completed))
+        self.assertTrue(evaluation_due(cfg, 0, 0, True, completed_rounds=18))
+        self.assertFalse(evaluation_due({**cfg, "eval_at_end": False}, 0, 0, True, completed_rounds=18))
+
+    def test_round_schedule_accepts_step_based_config_and_rejects_invalid_intervals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = fixture(Path(tmp))
+            raw = read_json(path)
+            atomic_json(path, {**raw, "eval_every_rounds": 8})
+            self.assertEqual(load_config(path)["eval_every_rounds"], 8)
+            for value in (0, -1, True, 1.5):
+                with self.subTest(value=value):
+                    atomic_json(path, {**raw, "eval_every_rounds": value})
+                    with self.assertRaisesRegex(ValueError, "positive integer"):
+                        load_config(path)
+            epoch_raw = {k: v for k, v in raw.items() if k != "steps_per_round"}
+            atomic_json(path, {**epoch_raw, "epochs_per_round": 1,
+                               "eval_every_rounds": 8, "eval_every_epochs": 8})
+            with self.assertRaisesRegex(ValueError, "Choose either"):
+                load_config(path)
 
 
 class RoundResumeTest(unittest.TestCase):
