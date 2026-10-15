@@ -16,7 +16,7 @@ kept frozen through the existing EMA-decay-1 mechanism. This implementation
 uses uniform decision preferences with query/decision normalization; adaptive
 weights and prefix SFT are separate follow-up experiments.
 
-## Run three on-policy rounds
+## Start a fresh full-query run
 
 Run in the repository root with the existing training environment (TRL 0.11.4,
 Transformers 4.45.2). Supply the path to your **completed DPO checkpoint**:
@@ -32,10 +32,18 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 bash src/scripts/ddro/run_vault_branch_preference.s
   --target-type url_based_id \
   --output-dir outputs/vault-url-branch-C \
   --arm branch \
-  --rounds 3 \
+  --rounds all \
   --num-beams 15 \
-  --mining-batch-size 25
+  --mining-batch-size 25 \
+  --eval-every-rounds 8
 ```
+
+For the configured Ruby URL experiment, the complete launch script is
+`src/scripts/ddro/run_vault_branch_preference_full.sh`. It initializes from
+the original normal-DPO checkpoint, uses a new `vault-url-branch-preference-full-fresh`
+output directory, and contains all training/mining settings explicitly. Run
+it with `bash`; override `CHECKPOINT_PATH`, `QUERY_FILE`, or `OUTPUT_DIR` through
+environment variables when needed.
 
 For structure IDs, use the matching checkpoint/data and
 `--target-type structure_id_v6`. The query file requires `positive_url_based_id`
@@ -48,8 +56,9 @@ If the query file does not cover the full intended retrieval collection, add
 selected ID column. Additional corpus files provide identities, not query
 relevance labels.
 
-Defaults: 4 GPUs, FP16, three rounds, up to 10,000 selected training queries
-per round, 1,000 optimizer updates per round (3,000 total), 15 beams,
+Defaults: 4 GPUs, FP16, enough rounds to cover the prepared training queries
+once, up to 10,000 selected queries per round, 1,000 optimizer updates per round,
+retrieval evaluation every 8 completed rounds plus the final round, 15 beams,
 4 negatives/query, mining batch 25/GPU,
 training batch 4/GPU with accumulation 4, LR 1e-6, beta 0.4, branch coefficient
 0.1, prompt limit 256, target limit 128. These are pilot settings, not verified
@@ -91,12 +100,13 @@ All arms use the same initial snapshot, selection seed, mining settings, and
 frozen reference. Original sequence row order/content is preserved during
 branch extraction.
 
-The launcher defaults to three iterative on-policy rounds. Each round mines
+The launcher defaults to full-query coverage (`--rounds all`). Each round mines
 from the latest policy and re-extracts its branch preferences. The reference
 remains frozen at the initial DPO checkpoint. The existing controller restarts
 optimizer/scheduler state between rounds; use the same lifecycle in comparison
-arms. Select `--rounds 1` explicitly for a single-round pilot. The fixed-round
-mode does not guarantee a pass over every query in the full training dataset.
+arms. Select `--rounds 1` explicitly for a single-round pilot or another integer
+for a fixed-round budget. Full-query mode keeps a smaller final round without
+wrapping; a fixed-round budget does not guarantee full query coverage.
 
 To resume an interruption, repeat the same command with `--resume`. You can
 also run the saved config directly:

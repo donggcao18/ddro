@@ -13,7 +13,7 @@ from pretrain.train_iterative_ddro_vault import load_config, run_pipeline
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", required=True, help="Completed normal-DPO checkpoint, not an SFT checkpoint")
+    parser.add_argument("--checkpoint", required=True, help="Initial policy/reference checkpoint, e.g. your completed normal-DPO model")
     parser.add_argument("--query-file", required=True, help="Multilabel query JSON/JSONL")
     parser.add_argument("--output-dir", required=True, help="Separate, initially empty directory for this arm")
     parser.add_argument("--target-type", default="url_based_id", help="ID column; requires positive_<column> labels")
@@ -26,8 +26,11 @@ def build_parser():
     parser.add_argument("--mining-num-gpus", type=int)
     parser.add_argument("--precision", choices=["fp16", "bf16", "fp32"], default="fp16")
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--rounds", type=int, default=3,
-                        help="Mining/training rounds; refresh negatives from the latest policy each round")
+    parser.add_argument("--rounds", type=lambda value: None if value == "all" else int(value), default=None,
+                        help="Total rounds or 'all' (default: cover every training query once without wrapping)")
+    parser.add_argument("--eval-every-rounds", type=int, default=8,
+                        help="Evaluate retrieval every N completed rounds")
+    parser.add_argument("--eval-at-end", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--queries-per-round", type=int, default=10000)
     parser.add_argument("--steps-per-round", type=int, default=1000)
     parser.add_argument("--num-beams", type=int, default=15)
@@ -81,7 +84,8 @@ def experiment_config(args):
             "max_prompt_length": args.max_prompt_length, "max_target_length": args.max_target_length,
             "length_penalty": args.length_penalty, "target_length_policy": args.target_length_policy,
             "target_collision_policy": args.target_collision_policy, "target_token_policy": args.target_token_policy,
-            "selection_metric": "mrr@10", "training": training}
+            "selection_metric": "mrr@10", "eval_every_rounds": args.eval_every_rounds,
+            "eval_at_end": args.eval_at_end, "training": training}
 
 
 def main():
