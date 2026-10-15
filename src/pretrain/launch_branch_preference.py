@@ -26,7 +26,8 @@ def build_parser():
     parser.add_argument("--mining-num-gpus", type=int)
     parser.add_argument("--precision", choices=["fp16", "bf16", "fp32"], default="fp16")
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--rounds", type=int, default=1, help="One fixed-snapshot pilot; >1 refreshes negatives each round")
+    parser.add_argument("--rounds", type=int, default=3,
+                        help="Mining/training rounds; refresh negatives from the latest policy each round")
     parser.add_argument("--queries-per-round", type=int, default=10000)
     parser.add_argument("--steps-per-round", type=int, default=1000)
     parser.add_argument("--num-beams", type=int, default=15)

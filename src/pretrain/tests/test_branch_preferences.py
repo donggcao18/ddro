@@ -96,7 +96,7 @@ class BranchConfigTest(unittest.TestCase):
                 atomic_json(path, config)
                 loaded = load_config(path)
                 self.assertEqual(loaded["reference_ema_decay"], 1)
-                self.assertEqual(loaded["rounds"], 1)
+                self.assertEqual(loaded["rounds"], 3)
                 self.assertEqual(loaded["target_length_policy"], "truncate")
                 self.assertEqual(loaded["target_collision_policy"], "allow")
                 self.assertEqual(loaded["target_token_policy"], "allow")

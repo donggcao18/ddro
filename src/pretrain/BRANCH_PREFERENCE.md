@@ -16,20 +16,25 @@ kept frozen through the existing EMA-decay-1 mechanism. This implementation
 uses uniform decision preferences with query/decision normalization; adaptive
 weights and prefix SFT are separate follow-up experiments.
 
-## Run the first pilot
+## Run three on-policy rounds
 
 Run in the repository root with the existing training environment (TRL 0.11.4,
 Transformers 4.45.2). Supply the path to your **completed DPO checkpoint**:
 
 ```bash
 conda activate ddro_env
+export MKL_THREADING_LAYER=GNU
+unset MKL_SERVICE_FORCE_INTEL
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 bash src/scripts/ddro/run_vault_branch_preference.sh \
   --checkpoint /path/to/completed-dpo-checkpoint \
   --query-file /path/to/Ruby_merged_multilabel.jsonl \
   --target-type url_based_id \
   --output-dir outputs/vault-url-branch-C \
-  --arm branch
+  --arm branch \
+  --rounds 3 \
+  --num-beams 15 \
+  --mining-batch-size 25
 ```
 
 For structure IDs, use the matching checkpoint/data and
@@ -43,8 +48,9 @@ If the query file does not cover the full intended retrieval collection, add
 selected ID column. Additional corpus files provide identities, not query
 relevance labels.
 
-Defaults: 4 GPUs, FP16, one round, up to 10,000 selected training queries,
-1,000 optimizer updates, 30 beams, 4 negatives/query, mining batch 8/GPU,
+Defaults: 4 GPUs, FP16, three rounds, up to 10,000 selected training queries
+per round, 1,000 optimizer updates per round (3,000 total), 15 beams,
+4 negatives/query, mining batch 25/GPU,
 training batch 4/GPU with accumulation 4, LR 1e-6, beta 0.4, branch coefficient
 0.1, prompt limit 256, target limit 128. These are pilot settings, not verified
 V100 memory/throughput measurements. Lower `--mining-batch-size` or `--batch-size`
@@ -85,10 +91,12 @@ All arms use the same initial snapshot, selection seed, mining settings, and
 frozen reference. Original sequence row order/content is preserved during
 branch extraction.
 
-For iterative on-policy mining, select `--rounds 3` when starting a **new**
-experiment. Each round mines from the latest policy and re-extracts its branch
-preferences. The existing controller restarts optimizer/scheduler state
-between rounds; use the same lifecycle in comparison arms.
+The launcher defaults to three iterative on-policy rounds. Each round mines
+from the latest policy and re-extracts its branch preferences. The reference
+remains frozen at the initial DPO checkpoint. The existing controller restarts
+optimizer/scheduler state between rounds; use the same lifecycle in comparison
+arms. Select `--rounds 1` explicitly for a single-round pilot. The fixed-round
+mode does not guarantee a pass over every query in the full training dataset.
 
 To resume an interruption, repeat the same command with `--resume`. You can
 also run the saved config directly:
@@ -98,8 +106,40 @@ python src/pretrain/train_iterative_ddro_vault.py \
   --config outputs/vault-url-branch-C.config.json --resume
 ```
 
+### Continue a completed one-round pilot over the full dataset
+
+Use the updated controller with the **original saved config and output directory**:
+
+```bash
+conda activate ddro_env
+export MKL_THREADING_LAYER=GNU
+unset MKL_SERVICE_FORCE_INTEL
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -u src/pretrain/train_iterative_ddro_vault.py \
+  --config outputs/vault-url-branch-C.config.json \
+  --resume --start-round 1 --extend-rounds all
+```
+
+`--extend-rounds all` derives the total from the number of prepared training
+queries and the saved queries-per-round value. The existing round 0 remains
+unchanged. Round 1 starts from its latest policy and recorded reference;
+branch runs keep their original frozen reference. The final round uses the
+remaining queries without wrapping, so each prepared training query is selected
+once across the pilot and continuation. Queries with no negatives still produce
+no preference pairs. Each added round retains the saved training budget.
+
+Repeat this exact command after any interruption. Keep the original config
+file unchanged; the extension is recorded in `run_manifest.json`, with an
+additional `round_plan_extended_NNN.json`. The initial `round_plan.json` stays
+unchanged. For an explicit total instead, use e.g. `--extend-rounds 5` (five
+rounds total, including the pilot), which retains the fixed rotating schedule.
+Only completed fixed-round runs can be extended; data, package versions, model
+code, training settings, and checkpoint identities must still match. The update
+accepts the known preceding controller version without altering trained outputs.
+
 Use a new output directory when changing objective, coefficient, checkpoint,
-data, target policies, or training settings. After this compatibility update,
+data, target policies, or training settings. Extending the round plan through
+the command above keeps the existing output directory. After this compatibility update,
 restart a previously failed strict-policy run with a new output directory.
 Existing pre-update manifests do not silently
 migrate into branch experiments. `--prepare-only` prepares the split; continue

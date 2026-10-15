@@ -64,6 +64,9 @@ MINING_COMPATIBLE_CONTROLLERS = EVALUATION_COMPATIBLE_CONTROLLERS | {
 }
 RUNTIME_KEYS = EVALUATION_SCHEDULE_KEYS | {"mining_num_gpus"}
 ROUND_RESUME_COMPATIBLE_CONTROLLERS = MINING_COMPATIBLE_CONTROLLERS | {
+    # Branch-preference controller before explicit round extension (LF / CRLF).
+    "54640a8be5e13db7899f9cc106740ab0488c7b44cc5d182a45309d357d13bbb3",
+    "75616c5b872accbbca0b0889f3880b50aa0152a1693868457c3ce541c63004bf",
     "0231e8a5f1ed667ff4346cfc5d066947bd0f2f2d8a411a564baba70cb25e38a0",
     "bcb33716a52ea267bf94187eacadfeeedc648a0fe991ae88e233f61d4d2c9555",
     "a64a0b9ddd8bc57498cf729ccca88eadfb5e807a96ce0c1232a182f37cd33f84",
@@ -86,7 +89,8 @@ def verify_start_checkpoint(path: str, fingerprint: str, role: str, round_id: in
         raise ValueError(f"Cannot start round {round_id}: required {role} checkpoint is missing or changed: {path}")
 
 
-def accept_evaluation_resume_update(state: dict, identity: dict, start_round=0) -> None:
+def accept_evaluation_resume_update(state: dict, identity: dict, start_round=0,
+                                    allow_round_extension=False) -> None:
     """Permit scheduling/mining concurrency changes, preserving committed training."""
     previous = state["identity"]
     previous_config = {k: v for k, v in previous["config"].items() if k not in RUNTIME_KEYS}
@@ -94,6 +98,20 @@ def accept_evaluation_resume_update(state: dict, identity: dict, start_round=0) 
     # Older runs implicitly initialized the reference from the initial policy.
     previous_config.setdefault("initial_reference_checkpoint", None)
     current_config.setdefault("initial_reference_checkpoint", None)
+    old_rounds, new_rounds = previous_config.get("rounds"), current_config.get("rounds")
+    extending = allow_round_extension and old_rounds != new_rounds
+    if extending:
+        if state.get("full_query_pass"):
+            raise ValueError("The full-query pass already has its total; resume that plan without adding more rounds")
+        if (type(old_rounds) is not int or type(new_rounds) is not int
+                or new_rounds <= old_rounds):
+            raise ValueError("--extend-rounds must increase the total of a fixed-round run")
+        if (not state.get("complete") or state.get("planned_rounds") != old_rounds
+                or [r["round_id"] for r in state.get("rounds", [])] != list(range(old_rounds))):
+            raise ValueError("Only a fully completed run can be extended; resume its current plan first")
+        # Only the total changes; training and the frozen-reference configuration
+        # remain part of the normal immutable identity check below.
+        previous_config = {**previous_config, "rounds": new_rounds}
     controller = str(Path(__file__))
     previous_code, current_code = previous["code"], identity["code"]
     valid_controller = (previous_code.get(controller) == current_code.get(controller)
@@ -111,13 +129,23 @@ def accept_evaluation_resume_update(state: dict, identity: dict, start_round=0) 
             or {k: v for k, v in previous.items() if k not in {"code", "config"}}
             != {k: v for k, v in identity.items() if k not in {"code", "config"}}):
         raise ValueError("Resume config, source data, code, environment, or SFT checkpoint changed; "
-                         "only evaluation scheduling, mining_num_gpus, and the compatible controller upgrade may change")
+                         "only evaluation scheduling, mining_num_gpus, explicit round extension, "
+                         "and the compatible controller upgrade may change")
     # Do not accept an upgrade over altered committed artifacts.
     for name, artifacts in state["stages"].items():
-        if not skipped_round_stage(name, start_round):
+        if extending or not skipped_round_stage(name, start_round):
             assert_file_hashes(artifacts)
+    if extending:
+        last = state["rounds"][-1]
+        verify_start_checkpoint(last["checkpoint"], last["checkpoint_fingerprint"], "policy", old_rounds)
+        state.setdefault("round_extensions", []).append({
+            "from_rounds": old_rounds, "to_rounds": new_rounds,
+            "completed_rounds": len(state["rounds"]),
+        })
+        state["complete"] = False
     state.setdefault("identity_updates", []).append({
-        "reason": "runtime_configuration_update", "previous_identity": previous,
+        "reason": "round_count_extension" if extending else "runtime_configuration_update",
+        "previous_identity": previous,
         "new_schedule": {key: identity["config"][key] for key in sorted(EVALUATION_SCHEDULE_KEYS)},
         "mining_num_gpus": identity["config"].get("mining_num_gpus"),
         "new_controller_fingerprint": current_code[controller],
@@ -376,18 +404,49 @@ def audit_pairs(path: Path, queries: list[dict], documents: Path, target_type: s
             "previous_overlap_fraction": len(seen & previous_keys) / max(1, len(seen))}
 
 
-def run_pipeline(cfg: dict, resume=False, prepare_only=False, runner=run_command, start_round=0) -> dict:
+def run_pipeline(cfg: dict, resume=False, prepare_only=False, runner=run_command, start_round=0,
+                 extend_rounds=None) -> dict:
     if type(start_round) is not int or start_round < 0:
         raise ValueError("start_round must be a nonnegative integer")
     if start_round and (not resume or prepare_only):
         raise ValueError("--start-round requires --resume and cannot be used with --prepare-only")
+    if extend_rounds is not None:
+        if (not resume or prepare_only or not (extend_rounds == "all" or (
+                type(extend_rounds) is int and extend_rounds > 0))):
+            raise ValueError("--extend-rounds requires --resume, a positive total, and no --prepare-only")
+        if extend_rounds != "all":
+            cfg = {**cfg, "rounds": extend_rounds}
     output = Path(cfg["output_dir"])
     with run_lock(output):
-        return _run_pipeline(cfg, output, resume, prepare_only, runner, start_round)
+        return _run_pipeline(cfg, output, resume, prepare_only, runner, start_round, extend_rounds)
 
 
-def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0):
+def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0, extend_rounds=None):
     manifest_path = output / "run_manifest.json"
+    cover_all = extend_rounds == "all"
+    coverage_queries = coverage_partitions = None
+    if cover_all:
+        if not manifest_path.is_file():
+            raise ValueError("No run_manifest.json to extend")
+        saved = read_json(manifest_path)
+        if "prepare" not in saved["stages"]:
+            raise ValueError("Prepare the query dataset before extending the run")
+        assert_file_hashes(saved["stages"]["prepare"])
+        coverage_queries = list(iter_json_records(output / "metadata/train_queries.jsonl"))
+        coverage_partitions = partition_queries(coverage_queries, cfg["queries_per_round"], cfg["seed"])
+        extend_rounds = len(coverage_partitions)
+        cfg = {**cfg, "rounds": extend_rounds}
+        old_total = saved["identity"]["config"].get("rounds")
+        if old_total == extend_rounds and not saved.get("full_query_pass"):
+            raise ValueError("The saved plan already covers all training queries; no round extension is needed")
+        # A completed fixed-round pilot must be exactly the initial portion of
+        # the full-pass order. Never reinterpret already trained query batches.
+        for item in saved.get("rounds", []):
+            index = item["round_id"]
+            selected = output / f"round-{index:03d}" / "queries.jsonl"
+            assert_file_hashes(saved["stages"][f"select-{index}"])
+            if index >= len(coverage_partitions) or list(iter_json_records(selected)) != coverage_partitions[index]:
+                raise ValueError("Completed query selections are not a prefix of a full dataset pass")
     sources = [cfg["query_file"], *cfg["corpus_files"], *cfg["structure_id_sources"]]
     code = [Path(__file__), SRC / "pretrain/train_ddro_vault.py",
             SRC / "pretrain/update_dpo_reference.py",
@@ -413,8 +472,15 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0):
         if not resume:
             raise ValueError("Run exists; use --resume with the same config or a new output_dir")
         state = read_json(manifest_path)
+        if (extend_rounds is not None and state["identity"]["config"].get("rounds") == extend_rounds
+                and not any(item["to_rounds"] == extend_rounds for item in state.get("round_extensions", []))):
+            raise ValueError("--extend-rounds must increase the saved total round count")
         if state["identity"] != identity:
-            accept_evaluation_resume_update(state, identity, start_round)
+            accept_evaluation_resume_update(state, identity, start_round,
+                                             allow_round_extension=extend_rounds is not None)
+            if cover_all:
+                state["full_query_pass"] = {"training_queries": len(coverage_queries),
+                                            "partition_sizes": [len(p) for p in coverage_partitions]}
             atomic_json(manifest_path, state)
             print("Resuming with updated runtime settings; committed training artifacts are preserved.", flush=True)
     else:
@@ -441,21 +507,30 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0):
     stage("prepare", [documents, training, validation, metadata / "split_manifest.json"], lambda: prepare(
         cfg["corpus_files"], cfg["query_file"], str(metadata), cfg["validation_fraction"], cfg["seed"],
         cfg["structure_id_sources"], cfg["id_mode"], cfg["input_format"], cfg["target_type"]))
-    queries = list(iter_json_records(training))
+    queries = coverage_queries if coverage_queries is not None else list(iter_json_records(training))
     heldout = list(iter_json_records(validation))
     if ({normalize_query(r["prompt"]) for r in queries} & {normalize_query(r["prompt"]) for r in heldout}
             or {r["family_id"] for r in queries} & {r["family_id"] for r in heldout}):
         raise ValueError("Training and validation query families overlap")
-    partitions = partition_queries(queries, cfg["queries_per_round"], cfg["seed"]) if cfg["rounds"] is None else None
-    total_rounds = len(partitions) if partitions is not None else cfg["rounds"]
+    full_pass = cfg["rounds"] is None or bool(state.get("full_query_pass"))
+    partitions = (coverage_partitions if coverage_partitions is not None else
+                  partition_queries(queries, cfg["queries_per_round"], cfg["seed"]) if full_pass else None)
+    total_rounds = len(partitions) if cfg["rounds"] is None else cfg["rounds"]
     if start_round >= total_rounds:
         raise ValueError(f"--start-round must be less than {total_rounds} (round IDs are zero-based)")
     plan = {"mode": "partition_all" if partitions is not None else "fixed_rounds",
             "total_rounds": total_rounds, "training_queries": len(queries), "validation_queries": len(heldout),
             "queries_per_round": cfg["queries_per_round"], "seed": cfg["seed"],
             "partition_sizes": [len(part) for part in partitions] if partitions is not None else None}
-    plan_path = output / "round_plan.json"
-    stage("round-plan", [plan_path], lambda: atomic_json(plan_path, plan))
+    # Keep the initial plan immutable. Append a separate extension plan so a
+    # crash between writing it and committing its hash is safely resumable.
+    for name, artifacts in state["stages"].items():
+        if name == "round-plan" or name.startswith("round-plan-extended-"):
+            assert_file_hashes(artifacts)
+    extended = bool(state.get("round_extensions"))
+    plan_path = output / (f"round_plan_extended_{total_rounds:03d}.json" if extended else "round_plan.json")
+    plan_stage = f"round-plan-extended-{total_rounds}" if extended else "round-plan"
+    stage(plan_stage, [plan_path], lambda: atomic_json(plan_path, plan))
     if read_json(plan_path) != plan:
         raise ValueError("Round partition plan changed")
     state["planned_rounds"] = total_rounds
@@ -659,13 +734,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--extend-rounds", type=lambda value: "all" if value == "all" else int(value),
+                        help="With --resume, extend a completed run to a total count or 'all' training queries; repeat on resume")
     parser.add_argument("--start-round", type=int, default=0,
                         help="With --resume, skip earlier rounds (zero-based); requires the preceding policy/reference snapshots")
     parser.add_argument("--prepare-only", action="store_true", help="Prepare fixed query splits, then exit before generation")
     args = parser.parse_args()
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         raise ValueError("Launch the controller with python; it launches torchrun for each training round")
-    run_pipeline(load_config(args.config.resolve()), args.resume, args.prepare_only, start_round=args.start_round)
+    run_pipeline(load_config(args.config.resolve()), args.resume, args.prepare_only,
+                 start_round=args.start_round, extend_rounds=args.extend_rounds)
 
 
 if __name__ == "__main__":

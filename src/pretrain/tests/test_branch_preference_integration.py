@@ -122,8 +122,34 @@ class BranchPipelineTest(unittest.TestCase):
                     self.assertTrue(all(row["rejected_text_id"] not in row["positive_text_ids"]
                                         for row in annotated))
 
+            # Extend a completed pilot through the remaining queries without
+            # retraining round zero or replacing the initial frozen reference.
+            pilot_cfg = {**cfg, "output_dir": str(root / "extended"), "rounds": 1}
+            run_pipeline(pilot_cfg, runner=runner)
+            preserved = {p: file_hash(p) for p in (root / "extended/round-000").rglob("*") if p.is_file()}
+            calls.clear()
+            interrupt[0] = True
+            with self.assertRaisesRegex(RuntimeError, "branch test interruption"):
+                run_pipeline(pilot_cfg, resume=True, runner=runner, start_round=1, extend_rounds="all")
+            self.assertEqual({p: file_hash(p) for p in preserved}, preserved)
+            extended = run_pipeline(pilot_cfg, resume=True, runner=runner, start_round=1, extend_rounds="all")
+            self.assertTrue(extended["complete"])
+            self.assertEqual(extended["full_query_pass"]["partition_sizes"], [4, 2])
+            self.assertEqual({p: file_hash(p) for p in preserved}, preserved)
+            self.assertFalse(any("--round-id" in c and c[c.index("--round-id") + 1] in {"-1", "0"}
+                                 for c in calls))
+            # The full-pass continuation uses only two remaining queries in
+            # its final round, whereas the fixed two-round run wraps to four.
+            # Assert real updates and the original reference, rather than
+            # expecting identical weights from different preference datasets.
+            final_weights = T5ForConditionalGeneration.from_pretrained(extended["latest"]).state_dict()
+            pilot_weights = T5ForConditionalGeneration.from_pretrained(
+                root / "extended/round-000/training/latest").state_dict()
+            self.assertTrue(any(not torch.equal(final_weights[k], pilot_weights[k]) for k in final_weights))
+
             interrupted_cfg = {**cfg, "output_dir": str(root / "resumed")}
             interrupt[0] = True
+            interrupted[0] = False
             with self.assertRaisesRegex(RuntimeError, "branch test interruption"):
                 run_pipeline(interrupted_cfg, runner=runner)
             committed_pairs = root / "resumed/round-000/branch_preferences.jsonl"
