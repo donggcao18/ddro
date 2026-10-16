@@ -170,6 +170,29 @@ overrides an existing epoch-based evaluation interval. Repeat the full command,
 including `--eval-every-rounds 8`, after any interruption. The saved config file
 stays unchanged; the runtime schedule update is recorded in the run manifest.
 
+### Resume mining after GPU out-of-memory
+
+Use the controller to lower the generation batch while retaining the saved
+config and output directory. For a failure during `round-004`:
+
+```bash
+export MKL_THREADING_LAYER=GNU
+unset MKL_SERVICE_FORCE_INTEL
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -u src/pretrain/train_iterative_ddro_vault.py \
+  --config outputs/vault-url-branch-preference-full-fresh.config.json \
+  --resume --start-round 4 --mining-batch-size 8 --eval-every-rounds 8
+```
+
+The override changes mining/evaluation generation batch size per GPU. Beam
+count, training batch, optimizer settings, and existing trained checkpoints
+remain unchanged. Completed rounds and committed mining datasets are retained.
+The failed round's shard identities include batch size, so its mining shards
+are regenerated at the new batch size; outputs from different batch settings
+are never mixed. Shards completed with the new setting can be reused on a
+subsequent retry. Repeat the same override on later resumes. The controller
+records this runtime change without rewriting the original config file.
+
 Use a new output directory when changing objective, coefficient, checkpoint,
 data, target policies, or training settings. Extending the round plan through
 the command above keeps the existing output directory. After this compatibility update,

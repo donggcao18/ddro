@@ -141,6 +141,35 @@ class MiningGPUTest(unittest.TestCase):
             self.assertEqual(result["queries_seen"], 1)
             self.assertEqual((root / "preferences.jsonl").read_text(), "")
 
+    def test_changed_batch_regenerates_shards_and_never_merges_old_batch_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            argv = self.setup_mining(root)
+
+            def fail(jobs, commit):
+                self.complete_fixture(jobs[0])
+                commit(jobs[0])
+                raise RuntimeError("mining out of memory")
+
+            with self.assertRaisesRegex(RuntimeError, "out of memory"):
+                run_sharded(argv, 2, fail, lambda *_: None)
+            smaller = list(argv)
+            smaller[smaller.index("--batch-size") + 1] = "1"
+
+            def restart(jobs, commit):
+                self.assertEqual([job["rank"] for job in jobs], [0, 1])
+                for job in jobs:
+                    self.assertEqual(job["command"][job["command"].index("--batch-size") + 1], "1")
+                    self.complete_fixture(job)
+                    commit(job)
+
+            result = run_sharded(smaller, 2, restart, lambda *_: None)
+            self.assertEqual(result["queries_seen"], 7)
+            for rank in range(2):
+                marker = read_json(root / f"preferences.shards/gpu-{rank:03d}/complete.json")
+                self.assertEqual(marker["identity"]["args"]["batch_size"], 1)
+            run_sharded(smaller, 2, lambda *_: self.fail("Unexpected recomputation"), lambda *_: None)
+
     def test_old_controller_resume_keeps_trained_round(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

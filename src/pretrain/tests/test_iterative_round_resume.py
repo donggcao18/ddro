@@ -230,6 +230,75 @@ class RoundEvaluationResumeTest(unittest.TestCase):
                 load_config(path)
 
 
+class MiningBatchResumeTest(unittest.TestCase):
+    def test_resume_mining_oom_at_round_four_with_smaller_batch_preserves_training(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = fixture(root)
+            atomic_json(path, {**read_json(path), "rounds": 6, "mining_batch_size": 25,
+                               "reference_update": "ema", "reference_ema_decay": 1.0,
+                               "eval_every_rounds": 8})
+            cfg = load_config(path)
+            worker = FixtureWorker()
+
+            def oom(command):
+                if ("--checkpoint-path" in command and "--evaluation-only" not in command
+                        and command[command.index("--round-id") + 1] == "4"):
+                    Path(command[command.index("--output") + 1]).write_text("partial mining\n", encoding="utf-8")
+                    raise RuntimeError("mining CUDA out of memory")
+                worker(command)
+
+            with self.assertRaisesRegex(RuntimeError, "out of memory"):
+                run_pipeline(cfg, runner=oom)
+            manifest = root / "run/run_manifest.json"
+            old = read_json(manifest)
+            old_rounds = old["rounds"]
+            old["identity"]["code"][str(SRC / "pretrain/train_iterative_ddro_vault.py")] = (
+                "709f0ded15135eeac6d0708dad36db49d08ba458347c0852ccea0279980e692c")
+            atomic_json(manifest, old)
+            preserved = {p: file_hash(p) for i in range(4)
+                         for p in (root / f"run/round-{i:03d}").rglob("*") if p.is_file()}
+            preserved[path] = file_hash(path)
+            worker.calls.clear()
+            result = run_pipeline(cfg, resume=True, runner=worker, start_round=4, mining_batch_size=8)
+            self.assertTrue(result["complete"])
+            self.assertEqual(result["rounds"][:4], old_rounds)
+            self.assertEqual({p: file_hash(p) for p in preserved}, preserved)
+            self.assertEqual(result["identity"]["config"]["mining_batch_size"], 8)
+            self.assertEqual(result["identity_updates"][-1]["mining_batch_size"], 8)
+            for command in worker.calls:
+                if "--checkpoint-path" in command:
+                    self.assertEqual(command[command.index("--batch-size") + 1], "8")
+                    self.assertEqual(command[command.index("--num-beams") + 1], str(cfg["num_beams"]))
+                    self.assertGreaterEqual(int(command[command.index("--round-id") + 1]), 4)
+                elif "--round_manifest" in command:
+                    for key in ("per_device_train_batch_size", "gradient_accumulation_steps", "learning_rate"):
+                        self.assertEqual(command[command.index("--" + key) + 1], str(cfg["training"][key]))
+            self.assertEqual(len([c for c in worker.calls if "--round_manifest" in c]), 2)
+            boundary = read_json(root / "run/round-004/round_inputs.json")
+            self.assertEqual(boundary["policy_checkpoint"], old_rounds[3]["checkpoint"])
+            self.assertEqual(boundary["reference_checkpoint"], old_rounds[3]["next_reference_checkpoint"])
+            worker.calls.clear()
+            run_pipeline(cfg, resume=True, runner=worker, start_round=4, mining_batch_size=8)
+            self.assertFalse(worker.calls)
+
+    def test_mining_override_rejects_invalid_sizes_and_unrelated_training_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = load_config(fixture(root))
+            worker = FixtureWorker()
+            for size in (0, -1, True, 1.5):
+                with self.subTest(size=size), self.assertRaisesRegex(ValueError, "positive integer"):
+                    run_pipeline(cfg, resume=True, runner=worker, mining_batch_size=size)
+            run_pipeline(cfg, runner=worker)
+            manifest = root / "run/run_manifest.json"
+            before = file_hash(manifest)
+            changed = {**cfg, "training": {**cfg["training"], "per_device_train_batch_size": 2}}
+            with self.assertRaisesRegex(ValueError, "Resume config"):
+                run_pipeline(changed, resume=True, runner=worker, mining_batch_size=8)
+            self.assertEqual(file_hash(manifest), before)
+
+
 class RoundResumeTest(unittest.TestCase):
     def test_skip_deleted_history_preserves_policy_reference_and_epoch_count(self):
         for mode, decay in (("replace", 0.9), ("ema", 0.9), ("ema", 1.0)):

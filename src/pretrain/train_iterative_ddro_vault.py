@@ -62,8 +62,11 @@ MINING_COMPATIBLE_CONTROLLERS = EVALUATION_COMPATIBLE_CONTROLLERS | {
     "13c07e6d53f273b021498b572469322782b6af52333bbe6173a7466f50d88e1c",
     "d02f074f416ad1979679458933d8e940e378a32b2771f13b6a34bbab167f8b3c",
 }
-RUNTIME_KEYS = EVALUATION_SCHEDULE_KEYS | {"mining_num_gpus"}
+RUNTIME_KEYS = EVALUATION_SCHEDULE_KEYS | {"mining_num_gpus", "mining_batch_size"}
 ROUND_RESUME_COMPATIBLE_CONTROLLERS = MINING_COMPATIBLE_CONTROLLERS | {
+    # Controller before resumable mining-batch overrides (LF / CRLF).
+    "709f0ded15135eeac6d0708dad36db49d08ba458347c0852ccea0279980e692c",
+    "195997e31b5bca344cbb1a5f708acf140ff29787d1ed573637f18058c6acb4e3",
     # Full-query continuation controller before round-based eval (LF / CRLF).
     "0121e102c09adc742c8bd9e48a2cb70ecff90dc00c0165b1b1af4b29afa2d0b9",
     "9bcbd5dcff88a2262c04c17822da1808235ddc9ad8cdcb1cee1525e72e61ba82",
@@ -132,7 +135,7 @@ def accept_evaluation_resume_update(state: dict, identity: dict, start_round=0,
             or {k: v for k, v in previous.items() if k not in {"code", "config"}}
             != {k: v for k, v in identity.items() if k not in {"code", "config"}}):
         raise ValueError("Resume config, source data, code, environment, or SFT checkpoint changed; "
-                         "only evaluation scheduling, mining_num_gpus, explicit round extension, "
+                         "only evaluation scheduling, mining_num_gpus, mining_batch_size, explicit round extension, "
                          "and the compatible controller upgrade may change")
     # Do not accept an upgrade over altered committed artifacts.
     for name, artifacts in state["stages"].items():
@@ -151,6 +154,7 @@ def accept_evaluation_resume_update(state: dict, identity: dict, start_round=0,
         "previous_identity": previous,
         "new_schedule": {key: identity["config"][key] for key in sorted(EVALUATION_SCHEDULE_KEYS)},
         "mining_num_gpus": identity["config"].get("mining_num_gpus"),
+        "mining_batch_size": identity["config"]["mining_batch_size"],
         "new_controller_fingerprint": current_code[controller],
     })
     state["identity"] = identity
@@ -420,11 +424,16 @@ def audit_pairs(path: Path, queries: list[dict], documents: Path, target_type: s
 
 
 def run_pipeline(cfg: dict, resume=False, prepare_only=False, runner=run_command, start_round=0,
-                 extend_rounds=None, eval_every_rounds=None, eval_at_end=None) -> dict:
+                 extend_rounds=None, eval_every_rounds=None, eval_at_end=None,
+                 mining_batch_size=None) -> dict:
     if type(start_round) is not int or start_round < 0:
         raise ValueError("start_round must be a nonnegative integer")
     if start_round and (not resume or prepare_only):
         raise ValueError("--start-round requires --resume and cannot be used with --prepare-only")
+    if mining_batch_size is not None:
+        if type(mining_batch_size) is not int or mining_batch_size <= 0:
+            raise ValueError("mining_batch_size must be a positive integer")
+        cfg = {**cfg, "mining_batch_size": mining_batch_size}
     if eval_every_rounds is not None:
         if type(eval_every_rounds) is not int or eval_every_rounds <= 0:
             raise ValueError("eval_every_rounds must be a positive integer")
@@ -760,6 +769,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--mining-batch-size", type=int,
+                        help="Override generation batch per GPU, including on resume after mining OOM")
     parser.add_argument("--eval-every-rounds", type=int,
                         help="Override retrieval evaluation to every N completed rounds (compatible with --resume)")
     parser.add_argument("--eval-at-end", action=argparse.BooleanOptionalAction, default=None,
@@ -774,7 +785,8 @@ def main():
         raise ValueError("Launch the controller with python; it launches torchrun for each training round")
     run_pipeline(load_config(args.config.resolve()), args.resume, args.prepare_only,
                  start_round=args.start_round, extend_rounds=args.extend_rounds,
-                 eval_every_rounds=args.eval_every_rounds, eval_at_end=args.eval_at_end)
+                 eval_every_rounds=args.eval_every_rounds, eval_at_end=args.eval_at_end,
+                 mining_batch_size=args.mining_batch_size)
 
 
 if __name__ == "__main__":
