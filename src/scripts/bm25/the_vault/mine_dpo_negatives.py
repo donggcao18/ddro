@@ -45,6 +45,7 @@ def build_document_target_map(
 
 def iter_run_groups(
     path: str | Path,
+    id_key: str = "text_id",
 ) -> Iterator[tuple[str, list[dict[str, Any]]]]:
     """Stream grouped Pyserini output while retaining at most one query's hits."""
     current_query: str | None = None
@@ -107,7 +108,7 @@ def iter_run_groups(
                 continue
             current_ids.add(document_id)
             current_candidates.append(
-                {"text_id": document_id, "rank": rank, "score": score}
+                {id_key: document_id, "rank": rank, "score": score}
             )
 
     group = finish_group()
@@ -144,6 +145,7 @@ def stratified_sample(
     rng: random.Random,
     fill_shortfall: bool = False,
     rank_quotas: list[int] | None = None,
+    id_key: str = "text_id",
 ) -> list[dict[str, Any]]:
     """Sample a configured quota from each BM25 rank band."""
     if count <= 0:
@@ -171,31 +173,93 @@ def stratified_sample(
             # configured bands cannot provide the full requested sample.
             return []
         for candidate in rng.sample(bucket, min(quota, len(bucket))):
-            if candidate["text_id"] not in selected_ids:
-                selected_ids.add(candidate["text_id"])
+            if candidate[id_key] not in selected_ids:
+                selected_ids.add(candidate[id_key])
                 selected.append(candidate)
 
     missing = count - len(selected)
     if missing > 0 and fill_shortfall:
         remaining = [
-            candidate for candidate in candidates if candidate["text_id"] not in selected_ids
+            candidate for candidate in candidates if candidate[id_key] not in selected_ids
         ]
         for candidate in rng.sample(remaining, min(missing, len(remaining))):
-            selected_ids.add(candidate["text_id"])
+            selected_ids.add(candidate[id_key])
             selected.append(candidate)
 
     selected.sort(key=lambda candidate: candidate["rank"])
     return selected
 
 
+def mine_single_file(args: argparse.Namespace, query_rows: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Filter explicitly labeled positives and emit IDs directly, without mapping tables."""
+    document_ids = {row["id"] for row in iter_json_records(args.document_metadata)}
+    if getattr(args, "target_type", None) is not None:
+        raise ValueError("Single-file metadata already defines its ID namespace; omit --target-type")
+    rng = random.Random(args.seed)
+    output_path = Path(args.output)
+    triples_path = Path(args.triples_output) if args.triples_output else output_path.with_suffix(".tsv")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    triples_path.parent.mkdir(parents=True, exist_ok=True)
+    filtered_positives = filtered_unknown = without_negatives = pair_count = 0
+    seen_queries: set[str] = set()
+    with output_path.open("w", encoding="utf-8") as output, \
+         triples_path.open("w", encoding="utf-8") as triples:
+        for query_key, candidates in iter_run_groups(args.run, id_key="id"):
+            query = query_rows.get(query_key)
+            if query is None:
+                raise ValueError(f"Run query {query_key!r} is absent from query metadata; check the work directory")
+            seen_queries.add(query_key)
+            positive_ids = set(query["positive_ids"]) | {query["target_id"]}
+            usable = []
+            for candidate in candidates:
+                if candidate["id"] in positive_ids:
+                    filtered_positives += 1
+                elif candidate["id"] not in document_ids:
+                    filtered_unknown += 1
+                else:
+                    usable.append(candidate)
+            negatives = stratified_sample(
+                usable, args.negatives_per_query, args.rank_ranges, rng,
+                args.fill_shortfall, args.rank_quotas, id_key="id",
+            )
+            if not negatives:
+                without_negatives += 1
+                continue
+            chosen_ids = sorted(positive_ids) if args.pair_all_positives else [query["target_id"]]
+            for chosen_id in chosen_ids:
+                for negative in negatives:
+                    record = {
+                        "prompt": query["prompt"], "chosen": chosen_id, "rejected": negative["id"],
+                        "query_key": query_key, "positive_ids": sorted(positive_ids),
+                        "id_field": query["id_field"], "positive_id_field": query["positive_id_field"],
+                        "bm25_rank": negative["rank"], "bm25_score": negative["score"],
+                    }
+                    output.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    triples.write(f"{query_key}\t{chosen_id}\t{negative['id']}\n")
+                    pair_count += 1
+    stats = {
+        "schema": "single_file", "queries": len(query_rows),
+        "queries_in_bm25_run": len(seen_queries),
+        "queries_without_run": len(set(query_rows) - seen_queries),
+        "queries_without_usable_negatives": without_negatives,
+        "filtered_multi_label_or_target_hits": filtered_positives,
+        "filtered_unknown_document_hits": filtered_unknown,
+        "dpo_pairs": pair_count, "output": str(output_path), "triples_output": str(triples_path),
+    }
+    output_path.with_suffix(".stats.json").write_text(json.dumps(stats, indent=2) + "\n", encoding="utf-8")
+    return stats
+
+
 def mine(args: argparse.Namespace) -> dict[str, Any]:
     query_rows = {
         row["query_key"]: row for row in iter_json_records(args.query_metadata)
     }
+    if query_rows and "target_id" in next(iter(query_rows.values())):
+        return mine_single_file(args, query_rows)
     document_rows = {
         row["text_id"]: row for row in iter_json_records(args.document_metadata)
     }
-    target_type = getattr(args, "target_type", "text_id")
+    target_type = getattr(args, "target_type", None) or "text_id"
     (
         text_id_to_target,
         invalid_target_mappings,
@@ -343,8 +407,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--target-type",
         choices=["text_id", "structure_id_v3", "structure_id_v6"],
-        default="text_id",
-        help="Write chosen/rejected in this decoder target namespace.",
+        default=None,
+        help="Legacy decoder namespace (default: text_id). Omit for single-file metadata.",
     )
     parser.add_argument("--triples-output", help="Optional qid/chosen/rejected TSV output")
     parser.add_argument(
@@ -379,7 +443,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Emit each known multi-label positive as chosen. By default only the "
-            "augmentation row's mapped target is chosen, while all positives are filtered."
+            "input row's target is chosen, while all positives are filtered."
         ),
     )
     return parser

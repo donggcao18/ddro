@@ -1,4 +1,105 @@
-# Vault BM25 hard-negative pipeline
+# Vault BM25: one labeled JSONL file
+
+The BM25-only workflow accepts the merged query records directly. Each row
+contains `text` (the query), `original.code` (the searchable document),
+`url_based_id` (the document primary key), and `positive_url_based_id` (a list of
+positive document IDs).
+
+Run preparation, retrieval, positive filtering, and DPO export with:
+
+```bash
+python src/scripts/bm25/the_vault/run_pipeline.py \
+  --input /data/Ruby_dpo.jsonl \
+  --id-field url_based_id \
+  --positive-id-field positive_url_based_id \
+  --work-dir /data/vault_bm25_url
+```
+
+The final training file is `/data/vault_bm25_url/dpo_pairs_url.jsonl`.
+Run this in the Pyserini environment, using a fresh work directory for the
+first run. The input file is only read.
+
+`--id-field` defaults to `url_based_id`. `--positive-id-field` defaults to
+`positive_<id-field>`, so both options can be omitted for the example schema.
+To use a different primary key, select its field and the matching positive list;
+both must use the same ID namespace. IDs must be non-empty strings or integers
+without whitespace, because retrieval run files and qrels use whitespace as a
+separator. `numeric_id`, `semantic_id`, and legacy `text_id` fields are ignored.
+
+For every input row:
+
+- The query is its `text`; optional `Query:` prefixes are removed.
+- The indexed document is its `original.code`, with repository/path/function
+  metadata by default. Use `--code-only` to search only source code.
+- One document is indexed per unique primary key. Three or six pseudo-queries
+  for the same URL still create only one code document; every query row is kept.
+  Conflicting document contents for the same key cause an error.
+- Its positives are its own primary key plus the IDs in the selected positive
+  field. The field must be present and contain a list. Duplicates are removed.
+- Every positive is excluded before negative sampling. Labels stay local to the
+  input row: there is no query-text grouping or transitive label expansion.
+- `chosen` is the row's primary key and `rejected` is a retrieved negative's
+  primary key. No ID conversion step is needed.
+
+Example output (additional audit fields omitted):
+
+```json
+{"prompt":"find definitions","chosen":"repo/a.rb/a()","rejected":"repo/b.rb/b()","positive_ids":["repo/a.rb/a()","repo/c.rb/c()"]}
+```
+
+Only documents represented by input rows enter the corpus. A positive ID can
+refer to a document absent from this file: it remains a positive label, but its
+code cannot be indexed from that reference alone. Preparation reports the number
+of such IDs in `positive_ids_missing_from_corpus`.
+
+The generated files use the primary key directly:
+
+```text
+work/
+  corpus/documents.jsonl    # {"id": "<URL>", "contents": "<code + metadata>"}
+  document_metadata.jsonl   # {"id": "<URL>", "id_field": "url_based_id"}
+  query_metadata.jsonl      # query_key, prompt, target_id, positive_ids
+  queries.tsv              # unique query_key + query text (one per input row)
+  qrels.tsv                # query_key + positive document ID
+  prepare_stats.json       # validation counts and corpus fingerprint
+  index/                   # Lucene BM25 inverted index, keyed by URL
+  bm25_run.txt             # TREC results: query_key Q0 URL rank score tag
+  dpo_pairs_url.jsonl       # prompt / chosen URL / rejected URL + audit fields
+  dpo_pairs_url.tsv
+  dpo_pairs_url.stats.json
+```
+
+The synthetic query key distinguishes different pseudo-queries for the same
+document; it is never a document or decoder ID. The Lucene index stores the
+searchable code's term postings. The input's full `original` object and its other
+ID variants are not copied into the prepared metadata.
+
+Sampling keeps the existing default: retrieve 200 hits with `k1=0.82`, `b=0.68`,
+then sample 8 negatives using seed 42: 3 from ranks 1–20, 2 from 21–100, and 3
+from 101–200. A query is skipped if its bands cannot supply those quotas after
+filtering. Use `--fill-shortfall` to allow fallback sampling, or set
+`--negatives-per-query`, `--rank-ranges`, and matching `--rank-quotas` explicitly.
+`--pair-all-positives` emits each explicitly listed positive as `chosen`.
+
+For preparation only:
+
+```bash
+python src/scripts/bm25/the_vault/prepare_bm25.py \
+  --input /data/Ruby_dpo.jsonl \
+  --positive-id-field positive_url_based_id \
+  --output-dir /data/vault_bm25_url
+```
+
+To rerun retrieval with an existing index built by `run_pipeline.py`, add
+`--reuse-index`. The runner verifies that the indexed IDs and code contents
+match the prepared corpus. Query text and positive labels can change while
+reusing the same code corpus. A changed or unverified corpus requires a new
+work directory.
+
+The single-file metadata belongs to this BM25-only flow. The older hybrid and
+model-confusion scripts below still use their legacy metadata format.
+
+# Legacy multi-file and hybrid workflows
 
 This pipeline mines DPO negatives for the Vault generative code retriever.
 

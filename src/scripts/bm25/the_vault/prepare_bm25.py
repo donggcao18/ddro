@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare a Vault corpus, pseudo-queries, qrels, and mappings for BM25."""
+"""Prepare Vault BM25 data from labeled JSONL or legacy multi-file inputs."""
 
 from __future__ import annotations
 
@@ -257,6 +257,10 @@ def resolve_augmentation_target(
 
 
 def prepare(args: argparse.Namespace) -> dict[str, Any]:
+    if getattr(args, "input", None):
+        from prepare_single_file import prepare_single_file
+
+        return prepare_single_file(args)
     original_paths = [Path(args.train_original)]
     original_paths.extend(Path(path) for path in args.test_original)
     output_dir = Path(args.output_dir)
@@ -464,16 +468,19 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Prepare the Vault Code: corpus and augmented pseudo-queries for BM25."
+        description="Prepare BM25 from one labeled JSONL (--input) or legacy corpus/augmentation files."
     )
-    parser.add_argument("--train-original", required=True)
+    parser.add_argument("--input", help="Single JSONL with query text, original.code, IDs and positive IDs.")
+    parser.add_argument("--id-field", default="url_based_id", help="Document primary-key field for --input.")
+    parser.add_argument("--positive-id-field", help="Positive list field; defaults to positive_<id-field>.")
+    parser.add_argument("--train-original", help="Legacy original corpus (use --input for the single-file flow).")
     parser.add_argument(
         "--test-original",
         action="append",
         default=[],
         help="Optional test/original files used for corpus coverage and multi-label detection. Repeatable.",
     )
-    parser.add_argument("--augmentation", required=True)
+    parser.add_argument("--augmentation", help="Legacy augmentation file.")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
         "--structure-id-source",
@@ -509,14 +516,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--code-only",
         action="store_true",
-        help="Index only Code: text; by default repository/path/function metadata is also searchable.",
+        help="Index only source code; by default repository/path/function metadata is also searchable.",
     )
     parser.add_argument("--strict", action="store_true", help="Fail on the first unmapped augmentation row.")
     return parser
 
 
 def main() -> None:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.input:
+        if args.train_original or args.augmentation or args.test_original or args.structure_id_source:
+            parser.error("--input cannot be combined with legacy corpus/augmentation/structure sources")
+    elif not (args.train_original and args.augmentation):
+        parser.error("provide --input (recommended), or both --train-original and --augmentation")
     stats = prepare(args)
     print(json.dumps(stats, indent=2))
 
