@@ -65,6 +65,9 @@ MINING_COMPATIBLE_CONTROLLERS = EVALUATION_COMPATIBLE_CONTROLLERS | {
 }
 RUNTIME_KEYS = EVALUATION_SCHEDULE_KEYS | {"mining_num_gpus", "mining_batch_size"}
 ROUND_RESUME_COMPATIBLE_CONTROLLERS = MINING_COMPATIBLE_CONTROLLERS | {
+    # Controller before Hit@K reporting (LF / CRLF).
+    "d4ee0bcfea5cb70c9f008643d113f1cbd7ea8393f34e44a9ff6818bc6816f143",
+    "377bb3166bfd1fca9ae627ec232a9897d560154af84c29d8263cfc08375105ac",
     # Controller before final-only inference support (LF / CRLF).
     "4d0aae9a82ce5544b5c3200fa7d793a78450096bc675c8bc0a3c5740ffe27d01",
     "70504116621d26cfcb0b7253653667ca9b8d0ed34148a3e6e81b873088c39d0d",
@@ -84,6 +87,9 @@ ROUND_RESUME_COMPATIBLE_CONTROLLERS = MINING_COMPATIBLE_CONTROLLERS | {
 }
 INFERENCE_COMPATIBLE_CODE = {
     str(MINING / "mine_model_confusion_negatives.py"): {
+        # Final-inference miner before additive Hit@K statistics (LF / CRLF).
+        "1c094e8c57d1fe09beccfece6fd8f26c15ece4cb130b46c44bdcea4d24ae87a8",
+        "227f5fc3f34a0c83f13a9960087ae7085c256a450022aef4ea6879ad7b99a342",
         "9692800ba1b4b98e322dd6f699a5a464c353845fa28408c44f95e9bb894b77be",
         "bcdd40a7b3c91d38398dae3d35105a3e4fa07244a41dfbaacb6703a8b9e2f597",
     },
@@ -137,7 +143,7 @@ def accept_evaluation_resume_update(state: dict, identity: dict, start_round=0,
     valid_controller = (previous_code.get(controller) == current_code.get(controller)
                         or previous_code.get(controller) in ROUND_RESUME_COMPATIBLE_CONTROLLERS)
     allowed_code = {controller}
-    # The known upgrade only adds an optional generation flag/statistic;
+    # Known upgrades add an optional generation flag or evaluation statistics;
     # existing mining and validation keep early_stopping=True.
     allowed_code.update(path for path, versions in INFERENCE_COMPATIBLE_CODE.items()
                         if previous_code.get(path) in versions)

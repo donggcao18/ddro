@@ -112,7 +112,13 @@ GPU work; the inference file does not silently expand the training corpus.
 Outputs are `round-NNN/infer_predictions.jsonl`, its `.stats.json`,
 `round-NNN/infer_summary.json`, and the top-level `final_inference.json` summary.
 They record retrieval metrics, final checkpoint identity, and disabled beam
-early stopping. Inference inputs and prepared artifacts are fingerprinted;
+early stopping. Metrics include `hit@1`, `hit@5`, and `hit@10` with the default
+15 beams, alongside MRR and Recall at each reported cutoff (including 15).
+Hit@K is the fraction of evaluated queries with at least one relevant document
+in the top K; Recall@K measures the fraction of all relevant documents retrieved
+per query. GPU shard metrics are averaged by their evaluated query counts.
+Previously committed evaluation results are preserved on resume; newly run
+evaluations include Hit@K. Inference inputs and prepared artifacts are fingerprinted;
 interrupted final inference can resume without retraining completed rounds.
 
 To add inference to an existing run, use the updated controller with its saved

@@ -203,7 +203,22 @@ class MetadataTest(unittest.TestCase):
         metrics = retrieval_metrics([None, "yes", "yes", "no"], {"yes", "other"}, [1, 4])
         self.assertEqual(metrics["mrr@4"], 0.5)
         self.assertEqual(metrics["recall@4"], 0.5)
+        self.assertEqual(metrics["hit@1"], 0.0)
+        self.assertEqual(metrics["hit@4"], 1.0)
         self.assertEqual(metrics["valid_generation_rate"], 0.75)
+
+    def test_hits_measure_any_positive_at_each_cutoff(self):
+        cutoffs = [1, 5, 10, 15]
+        for rank in (1, 5, 10, 11):
+            with self.subTest(rank=rank):
+                targets = [None] * 15
+                targets[rank - 1] = "yes"
+                metrics = retrieval_metrics(targets, {"yes", "other"}, cutoffs)
+                for k in cutoffs:
+                    self.assertEqual(metrics[f"hit@{k}"], float(rank <= k))
+                    self.assertEqual(metrics[f"recall@{k}"], 0.5 if rank <= k else 0.0)
+        metrics = retrieval_metrics([None, "no", "no"], {"yes"}, cutoffs)
+        self.assertTrue(all(metrics[f"hit@{k}"] == 0.0 for k in cutoffs))
 
     def test_raw_numeric_queries_resolve_without_importing_corpus_query_labels(self):
         with tempfile.TemporaryDirectory() as tmp:

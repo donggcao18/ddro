@@ -285,6 +285,7 @@ def retrieval_metrics(targets: Sequence[str | None], positives: set[str],
     result = {}
     for k in cutoffs:
         prefix = targets[:k]
+        result[f"hit@{k}"] = float(bool(set(prefix) & positives))
         result[f"recall@{k}"] = len(set(prefix) & positives) / len(positives)
         result[f"mrr@{k}"] = next(
             (1.0 / rank for rank, target in enumerate(prefix, 1) if target in positives), 0.0

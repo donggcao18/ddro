@@ -113,6 +113,15 @@ class FinalInferenceControllerTest(unittest.TestCase):
                 run_pipeline(cfg, runner=fail)
             self.assertEqual(len(read_json(root / "run/run_manifest.json")["rounds"]), 2)
             original = file_hash(root / "run/round-001/training/latest/model.safetensors")
+            # A running pre-Hit@K experiment can upgrade before final inference.
+            manifest = root / "run/run_manifest.json"
+            state = read_json(manifest)
+            for relative, fingerprint in {
+                "pretrain/train_iterative_ddro_vault.py": "d4ee0bcfea5cb70c9f008643d113f1cbd7ea8393f34e44a9ff6818bc6816f143",
+                "scripts/bm25/the_vault/mine_model_confusion_negatives.py": "1c094e8c57d1fe09beccfece6fd8f26c15ece4cb130b46c44bdcea4d24ae87a8",
+            }.items():
+                state["identity"]["code"][str(SRC / relative)] = fingerprint
+            atomic_json(manifest, state)
             worker.calls.clear()
             result = run_pipeline(cfg, resume=True, runner=worker, start_round=1)
             self.assertTrue(result["complete"])
@@ -222,6 +231,11 @@ class RealFinalInferenceTest(unittest.TestCase):
                 stats = read_json(root / "run/round-001/infer_predictions.stats.json")
                 self.assertFalse(stats["beam_early_stopping"])
                 self.assertEqual(stats["queries_processed"], 2)
+                for k in (1, 4):
+                    hit = stats["metrics"][f"hit@{k}"]
+                    self.assertGreaterEqual(hit, 0.0)
+                    self.assertLessEqual(hit, 1.0)
+                    self.assertEqual(result["final_inference"]["metrics"][f"hit@{k}"], hit)
                 calls.clear()
                 run_pipeline(cfg, resume=True, runner=runner, start_round=1)
                 self.assertFalse(calls)

@@ -77,13 +77,14 @@ class MiningGPUTest(unittest.TestCase):
 
     def test_merge_statistics_are_weighted_and_corpus_not_summed(self):
         result = merge_stats([
-            {"documents": 8, "queries_processed": 4, "metrics": {"mrr@10": 1.0}, "positive_beams_filtered": 3},
-            {"documents": 8, "queries_processed": 1, "metrics": {"mrr@10": 0.0}},
+            {"documents": 8, "queries_processed": 4, "metrics": {"mrr@10": 1.0, "hit@10": 1.0}, "positive_beams_filtered": 3},
+            {"documents": 8, "queries_processed": 1, "metrics": {"mrr@10": 0.0, "hit@10": 0.0}},
         ], Path("out.jsonl"), 2)
         self.assertEqual(result["documents"], 8)
         self.assertEqual(result["queries_processed"], 5)
         self.assertEqual(result["positive_beams_filtered"], 3)
         self.assertEqual(result["metrics"]["mrr@10"], 0.8)
+        self.assertEqual(result["metrics"]["hit@10"], 0.8)
         with self.assertRaisesRegex(ValueError, "metadata differs"):
             merge_stats([{"documents": 1}, {"documents": 2}], Path("out"), 2)
 
