@@ -29,6 +29,7 @@ from pretrain.update_dpo_reference import reference_identity
 
 DEFAULTS = {
     "initial_reference_checkpoint": None,
+    "infer_file": None,
     "rounds": None, "queries_per_round": None, "steps_per_round": 1000,
     "epochs_per_round": None, "seed": 42, "validation_fraction": 0.05,
     "target_type": "text_id", "id_mode": "auto", "structure_id_sources": [],
@@ -64,6 +65,9 @@ MINING_COMPATIBLE_CONTROLLERS = EVALUATION_COMPATIBLE_CONTROLLERS | {
 }
 RUNTIME_KEYS = EVALUATION_SCHEDULE_KEYS | {"mining_num_gpus", "mining_batch_size"}
 ROUND_RESUME_COMPATIBLE_CONTROLLERS = MINING_COMPATIBLE_CONTROLLERS | {
+    # Controller before final-only inference support (LF / CRLF).
+    "4d0aae9a82ce5544b5c3200fa7d793a78450096bc675c8bc0a3c5740ffe27d01",
+    "70504116621d26cfcb0b7253653667ca9b8d0ed34148a3e6e81b873088c39d0d",
     # Controller before resumable mining-batch overrides (LF / CRLF).
     "709f0ded15135eeac6d0708dad36db49d08ba458347c0852ccea0279980e692c",
     "195997e31b5bca344cbb1a5f708acf140ff29787d1ed573637f18058c6acb4e3",
@@ -78,11 +82,21 @@ ROUND_RESUME_COMPATIBLE_CONTROLLERS = MINING_COMPATIBLE_CONTROLLERS | {
     "a64a0b9ddd8bc57498cf729ccca88eadfb5e807a96ce0c1232a182f37cd33f84",
     "ef0d41ecb5391c9f3a5f65aaa4b1870cadd884cecc11798303bf39f4abc0a053",
 }
+INFERENCE_COMPATIBLE_CODE = {
+    str(MINING / "mine_model_confusion_negatives.py"): {
+        "9692800ba1b4b98e322dd6f699a5a464c353845fa28408c44f95e9bb894b77be",
+        "bcdd40a7b3c91d38398dae3d35105a3e4fa07244a41dfbaacb6703a8b9e2f597",
+    },
+    str(SRC / "pretrain/mine_on_gpus.py"): {
+        "fe6cbce8e6348979ba2978ca6eba98a9a82a92fe9e3aebf1a3c2b5b8744abea6",
+        "6f232d6678897cec254830f4a1c4d264435c0df6ad57907db6d8300c349125fd",
+    },
+}
 
 
 def skipped_round_stage(name: str, start_round: int) -> bool:
     prefix, _, suffix = name.rpartition("-")
-    return (prefix in {"select", "mine", "branches", "round-inputs", "train", "skip", "reference", "evaluate"}
+    return (prefix in {"select", "mine", "branches", "round-inputs", "train", "skip", "reference", "evaluate", "infer"}
             and suffix.isdigit() and int(suffix) < start_round)
 
 
@@ -123,6 +137,10 @@ def accept_evaluation_resume_update(state: dict, identity: dict, start_round=0,
     valid_controller = (previous_code.get(controller) == current_code.get(controller)
                         or previous_code.get(controller) in ROUND_RESUME_COMPATIBLE_CONTROLLERS)
     allowed_code = {controller}
+    # The known upgrade only adds an optional generation flag/statistic;
+    # existing mining and validation keep early_stopping=True.
+    allowed_code.update(path for path, versions in INFERENCE_COMPATIBLE_CODE.items()
+                        if previous_code.get(path) in versions)
     mining_launcher = str(SRC / "pretrain/mine_on_gpus.py")
     # Only known old releases may add this new file. Future launcher edits
     # must still fail the normal code-identity check.
@@ -283,6 +301,11 @@ def load_config(path: Path) -> dict:
     for key in ("checkpoint_path", "query_file", "output_dir"):
         value = Path(cfg[key]).expanduser()
         cfg[key] = str((path.parent / value).resolve())
+    if cfg["infer_file"] is not None:
+        if not isinstance(cfg["infer_file"], str) or not cfg["infer_file"].strip():
+            raise ValueError("infer_file must be null or a nonempty path")
+        value = Path(cfg["infer_file"]).expanduser()
+        cfg["infer_file"] = str((path.parent / value).resolve())
     if cfg["initial_reference_checkpoint"] is not None:
         value = Path(cfg["initial_reference_checkpoint"]).expanduser()
         cfg["initial_reference_checkpoint"] = str((path.parent / value).resolve())
@@ -327,7 +350,7 @@ def run_command(command: list[str]) -> None:
 
 
 def generation_command(cfg: dict, checkpoint: str, queries: Path, documents: Path,
-                       output: Path, fingerprint: str, round_id: int, evaluate=False) -> list[str]:
+                       output: Path, fingerprint: str, round_id: int, evaluate=False, infer=False) -> list[str]:
     command = [sys.executable, str(MINING / "mine_model_confusion_negatives.py")]
     mining_gpus = cfg.get("mining_num_gpus") or cfg["num_gpus"]
     if mining_gpus > 1:
@@ -350,8 +373,10 @@ def generation_command(cfg: dict, checkpoint: str, queries: Path, documents: Pat
     command.append("--strict-corpus")
     if cfg["precision"] != "fp32":
         command.append(f"--{cfg['precision']}")
-    if evaluate:
+    if evaluate or infer:
         command.append("--evaluation-only")
+    if infer:
+        command.append("--no-beam-early-stopping")
     return command
 
 
@@ -425,11 +450,13 @@ def audit_pairs(path: Path, queries: list[dict], documents: Path, target_type: s
 
 def run_pipeline(cfg: dict, resume=False, prepare_only=False, runner=run_command, start_round=0,
                  extend_rounds=None, eval_every_rounds=None, eval_at_end=None,
-                 mining_batch_size=None) -> dict:
+                 mining_batch_size=None, infer_file=None) -> dict:
     if type(start_round) is not int or start_round < 0:
         raise ValueError("start_round must be a nonnegative integer")
     if start_round and (not resume or prepare_only):
         raise ValueError("--start-round requires --resume and cannot be used with --prepare-only")
+    if infer_file is not None:
+        cfg = {**cfg, "infer_file": str(Path(infer_file).expanduser().resolve())}
     if mining_batch_size is not None:
         if type(mining_batch_size) is not int or mining_batch_size <= 0:
             raise ValueError("mining_batch_size must be a positive integer")
@@ -495,7 +522,10 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0, exte
             versions[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
             versions[package] = None
-    identity = {"config": cfg, "inputs": {str(p): file_hash(p) for p in sources},
+    # Final inference has its own identity. Adding it never changes a round's
+    # training identity or uses its labels for mining/checkpoint selection.
+    identity = {"config": {k: v for k, v in cfg.items() if k != "infer_file"},
+                "inputs": {str(p): file_hash(p) for p in sources},
                 "code": {str(p): file_hash(p) for p in code}, "versions": versions,
                 "initial_checkpoint": checkpoint_hash(cfg["checkpoint_path"])}
     if cfg.get("initial_reference_checkpoint"):
@@ -539,6 +569,25 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0, exte
     stage("prepare", [documents, training, validation, metadata / "split_manifest.json"], lambda: prepare(
         cfg["corpus_files"], cfg["query_file"], str(metadata), cfg["validation_fraction"], cfg["seed"],
         cfg["structure_id_sources"], cfg["id_mode"], cfg["input_format"], cfg["target_type"]))
+    inference_queries = metadata / "infer_queries.jsonl"
+    inference_audit = inference_queries.with_suffix(".audit.json")
+    if cfg.get("infer_file"):
+        from pretrain.prepare_inference_queries import prepare_inference_queries
+        inference_identity = {"query_file": cfg["infer_file"], "query_hash": file_hash(cfg["infer_file"]),
+                              "corpus_hash": file_hash(documents), "target_type": cfg["target_type"],
+                              "input_format": cfg["input_format"], "beam_early_stopping": False,
+                              "preparation_code": file_hash(SRC / "pretrain/prepare_inference_queries.py")}
+        if (state.get("inference_identity") not in (None, inference_identity)
+                and "prepare-infer" in state["stages"]):
+            raise ValueError("Inference file, corpus, or preparation code changed")
+        if state.get("inference_identity") != inference_identity:
+            state["inference_identity"] = inference_identity
+            state["complete"] = False
+            atomic_json(manifest_path, state)
+        stage("prepare-infer", [inference_queries, inference_audit], lambda: prepare_inference_queries(
+            cfg["infer_file"], documents, inference_queries, cfg["target_type"], cfg["input_format"]))
+    elif state.get("inference_identity"):
+        raise ValueError("This run has INFER_FILE configured; provide the same --infer-file on resume")
     queries = coverage_queries if coverage_queries is not None else list(iter_json_records(training))
     heldout = list(iter_json_records(validation))
     if ({normalize_query(r["prompt"]) for r in queries} & {normalize_query(r["prompt"]) for r in heldout}
@@ -759,6 +808,28 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0, exte
         atomic_json(manifest_path, state)
         atomic_json(output / "best_checkpoint.json", best)
         previous = pairs
+    if cfg.get("infer_file"):
+        assert_file_hashes({cfg["infer_file"]: state["inference_identity"]["query_hash"]})
+        directory = output / f"round-{total_rounds - 1:03d}"
+        predictions = directory / "infer_predictions.jsonl"
+        stats = predictions.with_suffix(".stats.json")
+        summary = directory / "infer_summary.json"
+
+        def final_inference():
+            runner(generation_command(cfg, checkpoint, inference_queries, documents, predictions,
+                                      fingerprint, total_rounds - 1, infer=True))
+            assert_file_hashes({cfg["infer_file"]: state["inference_identity"]["query_hash"]})
+            atomic_json(summary, {"round_id": total_rounds - 1, "checkpoint": checkpoint,
+                                  "checkpoint_fingerprint": fingerprint, "query_file": cfg["infer_file"],
+                                  "queries": read_json(inference_audit)["queries"],
+                                  "beam_early_stopping": False, "predictions": str(predictions),
+                                  "metrics": read_json(stats)["metrics"]})
+
+        stage(f"infer-{total_rounds - 1}", [predictions, stats,
+              predictions.with_suffix(".excluded_text_ids.json"), summary], final_inference)
+        state["final_inference"] = read_json(summary)
+        atomic_json(output / "final_inference.json", state["final_inference"])
+        print("Final inference:", json.dumps(state["final_inference"]), flush=True)
     state["complete"] = True
     atomic_json(manifest_path, state)
     print(f"Completed {len(results)} rounds. Latest: {checkpoint}. Best: {best['checkpoint']}", flush=True)
@@ -769,6 +840,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--infer-file", help="Optional labeled query file evaluated only on the final policy")
     parser.add_argument("--mining-batch-size", type=int,
                         help="Override generation batch per GPU, including on resume after mining OOM")
     parser.add_argument("--eval-every-rounds", type=int,
@@ -786,7 +858,7 @@ def main():
     run_pipeline(load_config(args.config.resolve()), args.resume, args.prepare_only,
                  start_round=args.start_round, extend_rounds=args.extend_rounds,
                  eval_every_rounds=args.eval_every_rounds, eval_at_end=args.eval_at_end,
-                 mining_batch_size=args.mining_batch_size)
+                 mining_batch_size=args.mining_batch_size, infer_file=args.infer_file)
 
 
 if __name__ == "__main__":

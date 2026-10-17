@@ -31,7 +31,7 @@ max_target_length tokenizer_collision_groups allowed_collision_groups
 excluded_collision_targets excluded_collision_text_ids excluded_overlength_targets
 truncated_targets excluded_overlength_text_ids model_mining_excluded_targets
 model_mining_excluded_text_ids checkpoint num_beams negatives_per_query seed
-round_id policy_fingerprint length_penalty
+round_id policy_fingerprint length_penalty beam_early_stopping
 """.split())
 OUTPUT_STATS = {"device", "output", "exclusions_output", "collision_exclusions_output"}
 

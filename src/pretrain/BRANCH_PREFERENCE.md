@@ -70,6 +70,59 @@ The launcher writes a resolved config beside the output directory, e.g.
 the controller starts the mining and training workers. Do not wrap the launcher
 in `torchrun`.
 
+## Evaluate a separate inference file on the final policy
+
+Set `INFER_FILE` alongside the training `QUERY_FILE`:
+
+```bash
+INFER_FILE=/path/to/Ruby_infer.jsonl \
+bash src/scripts/ddro/run_vault_branch_preference_full_sft_3_5.sh
+```
+
+The generic full-run script supports the same variable. With the Python
+launcher, use `--infer-file /path/to/Ruby_infer.jsonl`. A JSON controller config
+can contain `"infer_file": "/path/to/Ruby_infer.jsonl"`.
+
+Only the latest policy from the final round is evaluated on this file. Its
+queries/labels do not enter preference mining, training, the validation split,
+or best-checkpoint selection. Periodic validation keeps the existing schedule.
+Final inference is run even with `--no-eval-at-end` (that switch controls the
+training-validation pass). Its beam search explicitly uses
+`early_stopping=False`; ordinary mining and validation retain their existing
+early-stopping behavior. Generation still uses the configured length limit.
+
+For URL IDs, inference records can use either format:
+
+```json
+{"text": "find a function", "url_based_id": "repo/file.rb/function(arg)"}
+{"text": "find related functions", "positive_url_based_id": ["repo/a.rb/f()", "repo/b.rb/g()"]}
+```
+
+The single ID is the ground truth only when `positive_url_based_id` is absent.
+An explicit positive list is used verbatim and must be nonempty. For structure
+IDs, use `structure_id_v6` / `positive_structure_id_v6`. Every inference record
+is evaluated, including duplicates. Legacy inputs can use canonical
+`target_text_id` / `positive_text_ids` metadata.
+
+Inference uses the same corpus as mining. Supply all retrieval identities
+through `--corpus-file` when the training query file does not cover the full
+collection. Missing inference positives are reported during preparation before
+GPU work; the inference file does not silently expand the training corpus.
+
+Outputs are `round-NNN/infer_predictions.jsonl`, its `.stats.json`,
+`round-NNN/infer_summary.json`, and the top-level `final_inference.json` summary.
+They record retrieval metrics, final checkpoint identity, and disabled beam
+early stopping. Inference inputs and prepared artifacts are fingerprinted;
+interrupted final inference can resume without retraining completed rounds.
+
+To add inference to an existing run, use the updated controller with its saved
+config, `--resume`, and `--infer-file /path/to/Ruby_infer.jsonl`. The known
+preceding code version is supported without changing trained outputs. Repeat
+the file override on later controller resumes, or save `infer_file` in the
+existing config. Branch-launcher resumes retain a previously saved inference
+file automatically. Once inference metadata is committed, its file/corpus and
+preparation code must remain unchanged.
+
 The launcher uses the on-policy compatibility defaults for every arm:
 `--target-length-policy truncate --target-collision-policy allow
 --target-token-policy allow`. Mining, branch extraction, and training use the

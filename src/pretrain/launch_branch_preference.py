@@ -15,6 +15,7 @@ def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True, help="Initial policy/reference checkpoint, e.g. your completed normal-DPO model")
     parser.add_argument("--query-file", required=True, help="Multilabel query JSON/JSONL")
+    parser.add_argument("--infer-file", help="Optional final-only evaluation file; beam early stopping is disabled")
     parser.add_argument("--output-dir", required=True, help="Separate, initially empty directory for this arm")
     parser.add_argument("--target-type", default="url_based_id", help="ID column; requires positive_<column> labels")
     parser.add_argument("--corpus-file", action="append", default=[], help="Optional additional full-corpus metadata")
@@ -67,7 +68,7 @@ def experiment_config(args):
         training.update(preference_objective="branch-dpo",
                         branch_loss_weight=0.0 if args.arm == "zero" else args.branch_loss_weight,
                         branch_beta=args.branch_beta if args.branch_beta is not None else args.beta)
-    return {"checkpoint_path": str(Path(args.checkpoint).resolve()),
+    config = {"checkpoint_path": str(Path(args.checkpoint).resolve()),
             "initial_reference_checkpoint": str(Path(args.checkpoint).resolve()),
             "query_file": str(Path(args.query_file).resolve()),
             "output_dir": str(Path(args.output_dir).resolve()),
@@ -86,6 +87,9 @@ def experiment_config(args):
             "target_collision_policy": args.target_collision_policy, "target_token_policy": args.target_token_policy,
             "selection_metric": "mrr@10", "eval_every_rounds": args.eval_every_rounds,
             "eval_at_end": args.eval_at_end, "training": training}
+    if args.infer_file:
+        config["infer_file"] = str(Path(args.infer_file).resolve())
+    return config
 
 
 def main():
@@ -95,9 +99,16 @@ def main():
     config = experiment_config(args)
     output = Path(config["output_dir"])
     config_path = output.parent / (output.name + ".config.json")
-    if (config_path.exists() and read_json(config_path) != config
-            and (args.resume or (output / "run_manifest.json").exists())):
-        raise ValueError(f"Resolved config changed: {config_path}; use a separate output directory for another arm")
+    if config_path.exists():
+        previous = read_json(config_path)
+        if args.resume and not config.get("infer_file") and previous.get("infer_file"):
+            config["infer_file"] = previous["infer_file"]
+        if previous != config and (args.resume or (output / "run_manifest.json").exists()):
+            same_training = ({k: v for k, v in previous.items() if k != "infer_file"}
+                             == {k: v for k, v in config.items() if k != "infer_file"})
+            adding_inference = args.resume and not previous.get("infer_file") and config.get("infer_file")
+            if not (same_training and adding_inference):
+                raise ValueError(f"Resolved config changed: {config_path}; use a separate output directory for another arm")
     if args.resume and not (output / "run_manifest.json").is_file():
         raise ValueError("No existing run_manifest.json to resume")
     atomic_json(config_path, config)

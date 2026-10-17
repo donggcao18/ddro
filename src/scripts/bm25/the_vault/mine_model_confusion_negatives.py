@@ -538,7 +538,7 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                         num_beams=args.num_beams,
                         num_return_sequences=args.num_beams,
                         do_sample=False,
-                        early_stopping=True,
+                        early_stopping=not getattr(args, "no_beam_early_stopping", False),
                         prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
                         return_dict_in_generate=True,
                         output_scores=True,
@@ -731,6 +731,7 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
             "round_id": getattr(args, "round_id", None),
             "policy_fingerprint": getattr(args, "checkpoint_fingerprint", None),
             "length_penalty": getattr(args, "length_penalty", 1.0),
+            "beam_early_stopping": not getattr(args, "no_beam_early_stopping", False),
         }
     )
     if evaluation_only:
@@ -755,6 +756,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--length-penalty", type=float, default=1.0)
     parser.add_argument("--evaluation-only", action="store_true",
                         help="Write ranked predictions and retrieval metrics instead of preference pairs")
+    parser.add_argument("--no-beam-early-stopping", action="store_true",
+                        help="Pass early_stopping=False to beam search (used for final inference)")
     parser.add_argument("--strict-corpus", action="store_true",
                         help="Reject missing/ambiguous mappings, padding, and unknown target tokens")
     parser.add_argument("--target-token-policy", choices=["error", "allow"], default="error",

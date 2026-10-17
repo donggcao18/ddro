@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 SRC = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(SRC))
@@ -133,6 +134,25 @@ class BranchConfigTest(unittest.TestCase):
                 self.assertEqual(loaded["target_length_policy"], length)
                 self.assertEqual(loaded["target_collision_policy"], collision)
                 self.assertEqual(loaded["target_token_policy"], "error")
+
+    def test_inference_can_be_added_on_resume_and_remains_in_resolved_config(self):
+        from pretrain import launch_branch_preference as launcher
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            argv = ["--checkpoint", str(root / "dpo"), "--query-file", str(root / "train.jsonl"),
+                    "--output-dir", str(root / "run")]
+            original = experiment_config(build_parser().parse_args(argv))
+            atomic_json(root / "run.config.json", original)
+            atomic_json(root / "run/run_manifest.json", {})
+            with patch.object(sys, "argv", ["launcher", *argv, "--resume", "--infer-file", str(root / "infer.jsonl")]), \
+                 patch.object(launcher, "run_pipeline") as run:
+                launcher.main()
+                self.assertEqual(run.call_args.args[0]["infer_file"], str(root / "infer.jsonl"))
+                self.assertEqual(run.call_args.args[0]["training"]["learning_rate"], original["training"]["learning_rate"])
+            with patch.object(sys, "argv", ["launcher", *argv, "--resume"]), \
+                 patch.object(launcher, "run_pipeline") as run:
+                launcher.main()
+                self.assertEqual(run.call_args.args[0]["infer_file"], str(root / "infer.jsonl"))
 
 
 if __name__ == "__main__":

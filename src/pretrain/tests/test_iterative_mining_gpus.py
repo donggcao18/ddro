@@ -170,6 +170,27 @@ class MiningGPUTest(unittest.TestCase):
                 self.assertEqual(marker["identity"]["args"]["batch_size"], 1)
             run_sharded(smaller, 2, lambda *_: self.fail("Unexpected recomputation"), lambda *_: None)
 
+    def test_final_inference_disables_beam_early_stopping_in_every_shard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            argv = self.setup_mining(root) + ["--evaluation-only", "--no-beam-early-stopping"]
+
+            def launch(jobs, commit):
+                for job in jobs:
+                    self.assertIn("--no-beam-early-stopping", job["command"])
+                    self.assertIn("--evaluation-only", job["command"])
+                    rows = list(iter_json_records(job["command"][job["command"].index("--query-metadata") + 1]))
+                    atomic_jsonl(job["output"], rows)
+                    atomic_json(job["output"].with_suffix(".excluded_text_ids.json"), {})
+                    atomic_json(job["output"].with_suffix(".stats.json"), {
+                        "queries_seen": len(rows), "queries_processed": len(rows),
+                        "beam_early_stopping": False, "metrics": {"mrr@10": 0.5}})
+                    commit(job)
+
+            result = run_sharded(argv, 2, launch, lambda *_: None)
+            self.assertFalse(result["beam_early_stopping"])
+            self.assertEqual(result["queries_processed"], 7)
+
     def test_old_controller_resume_keeps_trained_round(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
