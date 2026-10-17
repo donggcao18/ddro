@@ -60,7 +60,7 @@ Defaults: 4 GPUs, FP16, enough rounds to cover the prepared training queries
 once, up to 10,000 selected queries per round, 1,000 optimizer updates per round,
 retrieval evaluation every 8 completed rounds plus the final round, 15 beams,
 4 negatives/query, mining batch 25/GPU,
-training batch 4/GPU with accumulation 4, LR 1e-6, beta 0.4, branch coefficient
+training batch 16/GPU with accumulation 1, LR 1e-6, beta 0.4, branch coefficient
 0.1, prompt limit 256, target limit 128. These are pilot settings, not verified
 V100 memory/throughput measurements. Lower `--mining-batch-size` or `--batch-size`
 and adjust accumulation if your checkpoint needs more memory.

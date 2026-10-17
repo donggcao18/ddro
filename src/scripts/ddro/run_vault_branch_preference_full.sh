@@ -28,8 +28,8 @@ exec "${PYTHON_BIN}" -u "${REPO_ROOT}/src/pretrain/launch_branch_preference.py" 
   --num-beams 15 \
   --mining-batch-size 25 \
   --negatives-per-query 4 \
-  --batch-size 4 \
-  --gradient-accumulation 4 \
+  --batch-size 16 \
+  --gradient-accumulation 1 \
   --learning-rate 1e-6 \
   --warmup-ratio 0.1 \
   --beta 0.4 \
