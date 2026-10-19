@@ -16,6 +16,9 @@ def build_parser():
     parser.add_argument("--checkpoint", required=True, help="Initial policy/reference checkpoint, e.g. your completed normal-DPO model")
     parser.add_argument("--query-file", required=True, help="Multilabel query JSON/JSONL")
     parser.add_argument("--infer-file", help="Optional final-only evaluation file; beam early stopping is disabled")
+    parser.add_argument("--bm25-file", help="Optional BM25 preference JSONL, matched by prompt and chosen_<target-type>")
+    parser.add_argument("--bm25-negatives-per-query", type=int, default=2,
+                        help="BM25 share of the total --negatives-per-query budget (default: 2 of 4)")
     parser.add_argument("--output-dir", required=True, help="Separate, initially empty directory for this arm")
     parser.add_argument("--target-type", default="url_based_id", help="ID column; requires positive_<column> labels")
     parser.add_argument("--corpus-file", action="append", default=[], help="Optional additional full-corpus metadata")
@@ -89,6 +92,9 @@ def experiment_config(args):
             "eval_at_end": args.eval_at_end, "training": training}
     if args.infer_file:
         config["infer_file"] = str(Path(args.infer_file).resolve())
+    if args.bm25_file:
+        config.update(bm25_file=str(Path(args.bm25_file).resolve()),
+                      bm25_negatives_per_query=args.bm25_negatives_per_query)
     return config
 
 

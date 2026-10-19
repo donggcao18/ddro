@@ -30,6 +30,7 @@ from pretrain.update_dpo_reference import reference_identity
 DEFAULTS = {
     "initial_reference_checkpoint": None,
     "infer_file": None,
+    "bm25_file": None, "bm25_negatives_per_query": 2,
     "rounds": None, "queries_per_round": None, "steps_per_round": 1000,
     "epochs_per_round": None, "seed": 42, "validation_fraction": 0.05,
     "target_type": "text_id", "id_mode": "auto", "structure_id_sources": [],
@@ -65,6 +66,9 @@ MINING_COMPATIBLE_CONTROLLERS = EVALUATION_COMPATIBLE_CONTROLLERS | {
 }
 RUNTIME_KEYS = EVALUATION_SCHEDULE_KEYS | {"mining_num_gpus", "mining_batch_size"}
 ROUND_RESUME_COMPATIBLE_CONTROLLERS = MINING_COMPATIBLE_CONTROLLERS | {
+    # Controller before optional BM25/policy mixing (LF / CRLF).
+    "b1aa99f9ecbc8e02ba907b1b42f908f1b95944177144b6897e7f617873963961",
+    "af1739854cba7437beac03939be01d603f391e7f85738b843538b5875268f3cb",
     # Controller before Hit@K reporting (LF / CRLF).
     "d4ee0bcfea5cb70c9f008643d113f1cbd7ea8393f34e44a9ff6818bc6816f143",
     "377bb3166bfd1fca9ae627ec232a9897d560154af84c29d8263cfc08375105ac",
@@ -102,7 +106,7 @@ INFERENCE_COMPATIBLE_CODE = {
 
 def skipped_round_stage(name: str, start_round: int) -> bool:
     prefix, _, suffix = name.rpartition("-")
-    return (prefix in {"select", "mine", "branches", "round-inputs", "train", "skip", "reference", "evaluate", "infer"}
+    return (prefix in {"select", "mine", "mix", "branches", "round-inputs", "train", "skip", "reference", "evaluate", "infer"}
             and suffix.isdigit() and int(suffix) < start_round)
 
 
@@ -206,6 +210,15 @@ def load_config(path: Path) -> dict:
     if unknown or required - raw.keys():
         raise ValueError(f"Invalid config keys: unknown={unknown}, missing={required - raw.keys()}")
     cfg = {**DEFAULTS, **raw}
+    if cfg["bm25_file"] is not None:
+        if not isinstance(cfg["bm25_file"], str) or not cfg["bm25_file"].strip():
+            raise ValueError("bm25_file must be null or a nonempty path")
+        if cfg["input_format"] != "multilabel":
+            raise ValueError("BM25 mixing requires input_format=multilabel with explicit selected document IDs")
+        quota = cfg["bm25_negatives_per_query"]
+        if (type(quota) is not int or type(cfg["negatives_per_query"]) is not int
+                or not 0 < quota < cfg["negatives_per_query"]):
+            raise ValueError("bm25_negatives_per_query must be positive and smaller than negatives_per_query")
     if cfg["target_length_policy"] not in {"error", "skip", "truncate"}:
         raise ValueError("target_length_policy must be error, skip, or truncate")
     if cfg["target_collision_policy"] not in {"error", "skip", "allow"}:
@@ -307,6 +320,8 @@ def load_config(path: Path) -> dict:
     for key in ("checkpoint_path", "query_file", "output_dir"):
         value = Path(cfg[key]).expanduser()
         cfg[key] = str((path.parent / value).resolve())
+    if cfg["bm25_file"] is not None:
+        cfg["bm25_file"] = str((path.parent / Path(cfg["bm25_file"]).expanduser()).resolve())
     if cfg["infer_file"] is not None:
         if not isinstance(cfg["infer_file"], str) or not cfg["infer_file"].strip():
             raise ValueError("infer_file must be null or a nonempty path")
@@ -417,7 +432,8 @@ def training_command(cfg: dict, manifest_path: Path, directory: Path,
 
 
 def audit_pairs(path: Path, queries: list[dict], documents: Path, target_type: str,
-                round_id: int, fingerprint: str, quota: int, previous: Path | None) -> dict:
+                round_id: int, fingerprint: str, quota: int, previous: Path | None,
+                allowed_sources=("model_confusion",)) -> dict:
     query_map = {r["query_key"]: r for r in queries}
     targets = {r["text_id"]: document_targets(r, target_type) for r in iter_json_records(documents)}
     previous_keys = set()
@@ -437,8 +453,8 @@ def audit_pairs(path: Path, queries: list[dict], documents: Path, target_type: s
             raise ValueError("Preference has an invalid/ambiguous decoder target")
         if row.get("round_id") != round_id or row.get("policy_fingerprint") != fingerprint:
             raise ValueError("Stale mining provenance")
-        if row.get("negative_source") != "model_confusion":
-            raise ValueError("Only model-confusion negatives are allowed")
+        if row.get("negative_source") not in allowed_sources:
+            raise ValueError(f"Negative source is not allowed: {row.get('negative_source')}")
         key = (row["query_key"], chosen, rejected)
         if key in seen or row["chosen"] == row["rejected"]:
             raise ValueError("Duplicate or indistinguishable preference")
@@ -513,12 +529,16 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0, exte
             if index >= len(coverage_partitions) or list(iter_json_records(selected)) != coverage_partitions[index]:
                 raise ValueError("Completed query selections are not a prefix of a full dataset pass")
     sources = [cfg["query_file"], *cfg["corpus_files"], *cfg["structure_id_sources"]]
+    if cfg.get("bm25_file"):
+        sources.append(cfg["bm25_file"])
     code = [Path(__file__), SRC / "pretrain/train_ddro_vault.py",
             SRC / "pretrain/update_dpo_reference.py",
             SRC / "pretrain/iterative_dpo_utils.py", SRC / "data/data_prep/prepare_vault_dpo_metadata.py",
             MINING / "mine_model_confusion_negatives.py", MINING / "prepare_bm25.py", MINING / "common.py",
             SRC / "utils/trie.py", SRC / "pretrain/mine_on_gpus.py"]
     branch_mode = cfg["training"].get("preference_objective", "dpo") == "branch-dpo"
+    if cfg.get("bm25_file"):
+        code.append(SRC / "pretrain/mix_bm25_preferences.py")
     if branch_mode:
         code.extend(SRC / "pretrain" / filename for filename in (
             "branch_preference_utils.py", "prepare_branch_preferences.py", "branch_preference_trainer.py"))
@@ -530,7 +550,8 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0, exte
             versions[package] = None
     # Final inference has its own identity. Adding it never changes a round's
     # training identity or uses its labels for mining/checkpoint selection.
-    identity = {"config": {k: v for k, v in cfg.items() if k != "infer_file"},
+    ignored_config = {"infer_file"} | ({"bm25_file", "bm25_negatives_per_query"} if not cfg.get("bm25_file") else set())
+    identity = {"config": {k: v for k, v in cfg.items() if k not in ignored_config},
                 "inputs": {str(p): file_hash(p) for p in sources},
                 "code": {str(p): file_hash(p) for p in code}, "versions": versions,
                 "initial_checkpoint": checkpoint_hash(cfg["checkpoint_path"])}
@@ -599,6 +620,13 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0, exte
     if ({normalize_query(r["prompt"]) for r in queries} & {normalize_query(r["prompt"]) for r in heldout}
             or {r["family_id"] for r in queries} & {r["family_id"] for r in heldout}):
         raise ValueError("Training and validation query families overlap")
+    bm25_pool = metadata / "bm25_pool.sqlite"
+    if cfg.get("bm25_file"):
+        from pretrain.mix_bm25_preferences import prepare_bm25_pool
+        stage("prepare-bm25", [bm25_pool, bm25_pool.with_suffix(".audit.json")], lambda: prepare_bm25_pool(
+            cfg["bm25_file"], training, documents, cfg["checkpoint_path"], bm25_pool,
+            cfg["target_type"], cfg["max_target_length"], cfg["target_length_policy"],
+            cfg["target_collision_policy"], cfg["target_token_policy"]))
     full_pass = cfg["rounds"] is None or bool(state.get("full_query_pass"))
     partitions = (coverage_partitions if coverage_partitions is not None else
                   partition_queries(queries, cfg["queries_per_round"], cfg["seed"]) if full_pass else None)
@@ -714,13 +742,38 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0, exte
             print("Round preferences:", json.dumps(report), flush=True)
         stage(f"mine-{round_id}", [pairs, mining_stats, audit, pairs.with_suffix(".excluded_text_ids.json")], mine_round)
         training_pairs = pairs
+        training_audit = audit
+        if cfg.get("bm25_file"):
+            from pretrain.mix_bm25_preferences import fuse_round_preferences
+            training_pairs = directory / "mixed_preferences.jsonl"
+            training_audit = directory / "mixed_pair_audit.json"
+
+            def mix_round():
+                fuse_round_preferences(bm25_pool, pairs, selected, training_pairs,
+                                       cfg["negatives_per_query"], cfg["bm25_negatives_per_query"],
+                                       round_id, fingerprint)
+                report = audit_pairs(training_pairs, selected_rows, documents, cfg["target_type"],
+                                     round_id, fingerprint, cfg["negatives_per_query"], None,
+                                     allowed_sources=("model_confusion", "bm25"))
+                if cfg["steps_per_round"]:
+                    presentations = (cfg["steps_per_round"] * cfg["num_gpus"] *
+                                     cfg["training"]["per_device_train_batch_size"] *
+                                     cfg["training"]["gradient_accumulation_steps"])
+                else:
+                    presentations = report["pairs"] * cfg["epochs_per_round"]
+                report["nominal_pair_presentations"] = presentations if report["pairs"] else 0
+                report["nominal_dataset_passes"] = presentations / report["pairs"] if report["pairs"] else 0
+                atomic_json(training_audit, report)
+
+            stage(f"mix-{round_id}", [training_pairs, training_pairs.with_suffix(".audit.json"), training_audit], mix_round)
+        sequence_pairs = training_pairs
         branch_audit_path = None
         if branch_mode:
             from pretrain.prepare_branch_preferences import prepare_branch_preferences
             training_pairs = directory / "branch_preferences.jsonl"
             branch_audit_path = directory / "branch_audit.json"
             stage(f"branches-{round_id}", [training_pairs, branch_audit_path], lambda: prepare_branch_preferences(
-                pairs, selected, documents, checkpoint, training_pairs, cfg["target_type"],
+                sequence_pairs, selected, documents, checkpoint, training_pairs, cfg["target_type"],
                 cfg["max_target_length"], cfg["target_token_policy"], branch_audit_path,
                 target_length_policy=cfg["target_length_policy"],
                 target_collision_policy=cfg["target_collision_policy"]))
@@ -732,8 +785,12 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0, exte
                    "training": training_options(cfg, round_id), "precision": cfg["precision"],
                    "num_gpus": cfg["num_gpus"]}
         if branch_mode:
-            payload["original_pairs_file"] = str(pairs)
+            payload["original_pairs_file"] = str(sequence_pairs)
             payload["inputs"].update({str(p): file_hash(p) for p in (training_pairs, branch_audit_path)})
+        if cfg.get("bm25_file"):
+            payload["model_pairs_file"] = str(pairs)
+            payload["inputs"].update({str(p): file_hash(p) for p in (
+                sequence_pairs, sequence_pairs.with_suffix(".audit.json"), training_audit)})
         stage(f"round-inputs-{round_id}", [round_manifest], lambda: atomic_json(round_manifest, payload))
         if read_json(round_manifest) != payload:
             raise ValueError("Round snapshot or data provenance changed")
@@ -750,7 +807,7 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0, exte
             resume_checkpoint = latest_resumable_checkpoint(
                 train_dir, round_identity, cfg["num_gpus"], cfg["precision"] == "fp16")
             runner(training_command(cfg, round_manifest, train_dir, resume_checkpoint))
-        report = read_json(audit)
+        report = read_json(training_audit)
         if report["pairs"] == 0:
             skipped = directory / "round_skipped.json"
             marker = {"identity": round_identity, "reason": "no_model_negatives",
