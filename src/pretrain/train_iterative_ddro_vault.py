@@ -31,6 +31,7 @@ DEFAULTS = {
     "initial_reference_checkpoint": None,
     "infer_file": None,
     "bm25_file": None, "bm25_negatives_per_query": 2,
+    "policy_mining_negatives_per_query": None,
     "rounds": None, "queries_per_round": None, "steps_per_round": 1000,
     "epochs_per_round": None, "seed": 42, "validation_fraction": 0.05,
     "target_type": "text_id", "id_mode": "auto", "structure_id_sources": [],
@@ -66,6 +67,9 @@ MINING_COMPATIBLE_CONTROLLERS = EVALUATION_COMPATIBLE_CONTROLLERS | {
 }
 RUNTIME_KEYS = EVALUATION_SCHEDULE_KEYS | {"mining_num_gpus", "mining_batch_size"}
 ROUND_RESUME_COMPATIBLE_CONTROLLERS = MINING_COMPATIBLE_CONTROLLERS | {
+    # Controller before separate mining/training negative budgets (LF / CRLF).
+    "5e7e23777e5895cf06ae2e61730a54f3659e4e6564d92542d3e338de2bd24569",
+    "d98d8faf48864683840e2e14ca1e1bcb114647c06977da5a9ded39ca20567b36",
     # Controller before optional BM25/policy mixing (LF / CRLF).
     "b1aa99f9ecbc8e02ba907b1b42f908f1b95944177144b6897e7f617873963961",
     "af1739854cba7437beac03939be01d603f391e7f85738b843538b5875268f3cb",
@@ -219,6 +223,14 @@ def load_config(path: Path) -> dict:
         if (type(quota) is not int or type(cfg["negatives_per_query"]) is not int
                 or not 0 < quota < cfg["negatives_per_query"]):
             raise ValueError("bm25_negatives_per_query must be positive and smaller than negatives_per_query")
+    policy_quota = cfg["policy_mining_negatives_per_query"]
+    if policy_quota is not None:
+        if type(policy_quota) is not int or policy_quota <= 0:
+            raise ValueError("policy_mining_negatives_per_query must be null or a positive integer")
+        if not cfg["bm25_file"] and policy_quota != cfg["negatives_per_query"]:
+            raise ValueError("Without BM25 mixing, policy_mining_negatives_per_query must equal the total training quota")
+        if policy_quota == cfg["negatives_per_query"]:
+            cfg["policy_mining_negatives_per_query"] = None  # Preserve old resume identities.
     if cfg["target_length_policy"] not in {"error", "skip", "truncate"}:
         raise ValueError("target_length_policy must be error, skip, or truncate")
     if cfg["target_collision_policy"] not in {"error", "skip", "allow"}:
@@ -381,7 +393,8 @@ def generation_command(cfg: dict, checkpoint: str, queries: Path, documents: Pat
         "checkpoint-path": checkpoint, "checkpoint-fingerprint": fingerprint,
         "query-metadata": queries, "document-metadata": documents, "output": output,
         "target-type": cfg["target_type"], "num-beams": cfg["num_beams"],
-        "negatives-per-query": cfg["negatives_per_query"], "batch-size": cfg["mining_batch_size"],
+        "negatives-per-query": cfg.get("policy_mining_negatives_per_query") or cfg["negatives_per_query"],
+        "batch-size": cfg["mining_batch_size"],
         "max-prompt-length": cfg["max_prompt_length"], "max-target-length": cfg["max_target_length"],
         "length-penalty": cfg["length_penalty"], "seed": cfg["seed"] + max(round_id, 0),
         "device": cfg["device"], "round-id": round_id,
@@ -551,6 +564,8 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0, exte
     # Final inference has its own identity. Adding it never changes a round's
     # training identity or uses its labels for mining/checkpoint selection.
     ignored_config = {"infer_file"} | ({"bm25_file", "bm25_negatives_per_query"} if not cfg.get("bm25_file") else set())
+    if cfg.get("policy_mining_negatives_per_query") is None:
+        ignored_config.add("policy_mining_negatives_per_query")
     identity = {"config": {k: v for k, v in cfg.items() if k not in ignored_config},
                 "inputs": {str(p): file_hash(p) for p in sources},
                 "code": {str(p): file_hash(p) for p in code}, "versions": versions,
@@ -651,6 +666,12 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0, exte
     state["planned_rounds"] = total_rounds
     atomic_json(manifest_path, state)
     print(f"Round plan: {total_rounds} rounds for {len(queries)} training queries ({plan['mode']}).", flush=True)
+    policy_mining_quota = cfg.get("policy_mining_negatives_per_query") or cfg["negatives_per_query"]
+    bm25_training_quota = cfg["bm25_negatives_per_query"] if cfg.get("bm25_file") else 0
+    print(f"Negative budgets per query: policy mining <= {policy_mining_quota}; "
+          f"training total <= {cfg['negatives_per_query']}; "
+          f"training targets: BM25 {bm25_training_quota} + "
+          f"policy {cfg['negatives_per_query'] - bm25_training_quota} (backfill when mixing).", flush=True)
     if prepare_only:
         return state
 
@@ -728,7 +749,7 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0, exte
         def mine_round():
             runner(generation_command(cfg, checkpoint, selected, documents, pairs, fingerprint, round_id))
             report = audit_pairs(pairs, selected_rows, documents, cfg["target_type"],
-                                 round_id, fingerprint, cfg["negatives_per_query"], previous)
+                                 round_id, fingerprint, policy_mining_quota, previous)
             if cfg["steps_per_round"]:
                 presentations = (cfg["steps_per_round"] * cfg["num_gpus"] *
                                  cfg["training"]["per_device_train_batch_size"] *

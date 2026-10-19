@@ -15,7 +15,7 @@ from common import iter_json_records
 from pretrain.iterative_dpo_utils import atomic_json, atomic_jsonl, file_hash, read_json
 from pretrain.launch_branch_preference import build_parser, experiment_config
 from pretrain.mix_bm25_preferences import prepare_bm25_pool, fuse_round_preferences
-from pretrain.train_iterative_ddro_vault import load_config, run_pipeline, skipped_round_stage
+from pretrain.train_iterative_ddro_vault import generation_command, load_config, run_pipeline, skipped_round_stage
 from test_iterative_dpo import fake_checkpoint, FixtureWorker
 
 
@@ -186,6 +186,34 @@ class MixedPreferencesTest(unittest.TestCase):
 
 
 class MixedPipelineTest(unittest.TestCase):
+    def test_clear_cli_names_and_legacy_aliases_resolve_identically(self):
+        common = ["--checkpoint", "model", "--query-file", "q", "--output-dir", "run", "--bm25-file", "bm.jsonl"]
+        old = experiment_config(build_parser().parse_args(common + [
+            "--negatives-per-query", "10", "--bm25-negatives-per-query", "6"]))
+        new = experiment_config(build_parser().parse_args(common + [
+            "--total-training-negatives-per-query", "10", "--bm25-training-negatives-per-query", "6"]))
+        self.assertEqual(old, new)
+        explicit = experiment_config(build_parser().parse_args(common + [
+            "--total-training-negatives-per-query", "10", "--bm25-training-negatives-per-query", "6",
+            "--policy-mining-negatives-per-query", "4"]))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cfg.json"
+            atomic_json(path, explicit)
+            cfg = load_config(path)
+            command = generation_command(cfg, "model", Path("q"), Path("docs"), Path("out"), "hash", 0)
+            self.assertEqual(command[command.index("--negatives-per-query") + 1], "4")
+            self.assertEqual(cfg["negatives_per_query"], 10)
+            self.assertEqual(cfg["bm25_negatives_per_query"], 6)
+            for quota in (0, -1, True, 1.5):
+                atomic_json(path, {**explicit, "policy_mining_negatives_per_query": quota})
+                with self.assertRaisesRegex(ValueError, "policy_mining_negatives_per_query"):
+                    load_config(path)
+            atomic_json(path, {**explicit, "policy_mining_negatives_per_query": 10})
+            self.assertIsNone(load_config(path)["policy_mining_negatives_per_query"])
+            atomic_json(path, {**explicit, "bm25_file": None})
+            with self.assertRaisesRegex(ValueError, "Without BM25 mixing"):
+                load_config(path)
+
     def test_launcher_config_quotas_and_separate_experiment_identity(self):
         args = build_parser().parse_args(["--checkpoint", "model", "--query-file", "q", "--output-dir", "run",
                                           "--bm25-file", "bm25.jsonl"])
@@ -230,6 +258,11 @@ class MixedPipelineTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "training interruption"):
                     run_pipeline(cfg, runner=worker)
             mixed_hash = file_hash(root / "run/round-000/mixed_preferences.jsonl")
+            manifest = root / "run/run_manifest.json"
+            state = read_json(manifest)
+            state["identity"]["code"][str(SRC / "pretrain/train_iterative_ddro_vault.py")] = (
+                "5e7e23777e5895cf06ae2e61730a54f3659e4e6564d92542d3e338de2bd24569")
+            atomic_json(manifest, state)
             worker.fail_training = False
             worker.calls.clear()
             result = run_pipeline(cfg, runner=worker, resume=True)
@@ -287,7 +320,7 @@ class RealMixedBranchTest(unittest.TestCase):
                                "query_file": "queries.jsonl", "bm25_file": "bm25.jsonl", "infer_file": "infer.jsonl",
                                "input_format": "multilabel", "target_type": "url_based_id", "output_dir": "run",
                                "queries_per_round": 4, "steps_per_round": 1, "num_beams": 8,
-                               "negatives_per_query": 4, "mining_batch_size": 2,
+                               "negatives_per_query": 6, "policy_mining_negatives_per_query": 4, "mining_batch_size": 2,
                                "max_prompt_length": 8, "max_target_length": 8, "precision": "fp32", "device": "cpu",
                                "selection_metric": "mrr@8", "reference_update": "ema", "reference_ema_decay": 1.0,
                                "eval_every_rounds": 8, "training": {"preference_objective": "branch-dpo",
@@ -312,6 +345,9 @@ class RealMixedBranchTest(unittest.TestCase):
                 directory = root / f"run/round-{i:03d}"
                 mixed = list(iter_json_records(directory / "mixed_preferences.jsonl"))
                 annotated = list(iter_json_records(directory / "branch_preferences.jsonl"))
+                mined = list(iter_json_records(directory / "preferences.jsonl"))
+                self.assertTrue(all(n <= 4 for n in Counter(r["query_key"] for r in mined).values()))
+                self.assertTrue(all(n <= 6 for n in Counter(r["query_key"] for r in mixed).values()))
                 self.assertEqual(len(mixed), len(annotated))
                 self.assertEqual({r["negative_source"] for r in annotated}, {"bm25", "model_confusion"})
                 self.assertTrue(any(r["branch_active"] for r in annotated))

@@ -17,8 +17,9 @@ def build_parser():
     parser.add_argument("--query-file", required=True, help="Multilabel query JSON/JSONL")
     parser.add_argument("--infer-file", help="Optional final-only evaluation file; beam early stopping is disabled")
     parser.add_argument("--bm25-file", help="Optional BM25 preference JSONL, matched by prompt and chosen_<target-type>")
-    parser.add_argument("--bm25-negatives-per-query", type=int, default=2,
-                        help="BM25 share of the total --negatives-per-query budget (default: 2 of 4)")
+    parser.add_argument("--bm25-training-negatives-per-query", "--bm25-negatives-per-query",
+                        dest="bm25_negatives_per_query", type=int, default=2,
+                        help="BM25 target share of the final training quota; other sources may backfill shortfalls (default: 2)")
     parser.add_argument("--output-dir", required=True, help="Separate, initially empty directory for this arm")
     parser.add_argument("--target-type", default="url_based_id", help="ID column; requires positive_<column> labels")
     parser.add_argument("--corpus-file", action="append", default=[], help="Optional additional full-corpus metadata")
@@ -38,7 +39,11 @@ def build_parser():
     parser.add_argument("--queries-per-round", type=int, default=10000)
     parser.add_argument("--steps-per-round", type=int, default=1000)
     parser.add_argument("--num-beams", type=int, default=15)
-    parser.add_argument("--negatives-per-query", type=int, default=4)
+    parser.add_argument("--total-training-negatives-per-query", "--negatives-per-query",
+                        dest="negatives_per_query", type=int, default=4,
+                        help="Maximum final training negatives per query, summed across sources (default: 4)")
+    parser.add_argument("--policy-mining-negatives-per-query", type=int,
+                        help="Maximum model-confusion candidates retained from beams before mixing; defaults to the total training quota")
     parser.add_argument("--mining-batch-size", type=int, default=25)
     parser.add_argument("--batch-size", type=int, default=16, help="Training pairs per GPU")
     parser.add_argument("--gradient-accumulation", type=int, default=1)
@@ -92,6 +97,8 @@ def experiment_config(args):
             "eval_at_end": args.eval_at_end, "training": training}
     if args.infer_file:
         config["infer_file"] = str(Path(args.infer_file).resolve())
+    if args.policy_mining_negatives_per_query is not None and args.policy_mining_negatives_per_query != args.negatives_per_query:
+        config["policy_mining_negatives_per_query"] = args.policy_mining_negatives_per_query
     if args.bm25_file:
         config.update(bm25_file=str(Path(args.bm25_file).resolve()),
                       bm25_negatives_per_query=args.bm25_negatives_per_query)

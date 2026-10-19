@@ -5,12 +5,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python}"
-CHECKPOINT_PATH="${CHECKPOINT_PATH:-/mnt/beegfs/scratch/congthanh_le/scratch/east/ddro/outputs/vault-url-branch-preference-full-fresh/round-019/training/checkpoint-1000}"
-QUERY_FILE="${QUERY_FILE:-/home/users/congthanh_le/scratch/veil/CodeGR/data/updated_url/Ruby_merged_multilabel_dpo.jsonl}"
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-/home/users/congthanh_le/scratch/veil/CodeGR/outputs/DSI_Ruby_url__qg_t5_url_max_lr/checkpoint-161800}"
+QUERY_FILE="${QUERY_FILE:-/home/users/congthanh_le/scratch/veil/CodeGR/data/updated_url/Ruby_merged_multilabel.jsonl}"
 BM25_FILE="${BM25_FILE:-/home/users/congthanh_le/scratch/east/ddro/data/vault_bm25/dpo_pairs_url.jsonl}"
-BM25_NEGATIVES_PER_QUERY="${BM25_NEGATIVES_PER_QUERY:-2}"
+# Retain the old BM25 environment name as an override alias.
+BM25_TRAINING_NEGATIVES_PER_QUERY="${BM25_TRAINING_NEGATIVES_PER_QUERY:-${BM25_NEGATIVES_PER_QUERY:-6}}"
+POLICY_MINING_NEGATIVES_PER_QUERY="${POLICY_MINING_NEGATIVES_PER_QUERY:-4}"
+TOTAL_TRAINING_NEGATIVES_PER_QUERY="${TOTAL_TRAINING_NEGATIVES_PER_QUERY:-10}"
 INFER_FILE="${INFER_FILE:-/home/users/congthanh_le/scratch/veil/CodeGR/data/updated_url/Ruby_test_r32.0_multilabel.json}"
-OUTPUT_DIR="${OUTPUT_DIR:-/mnt/beegfs/scratch/congthanh_le/scratch/east/ddro/outputs/vault-url-branch-preference-full-fresh-epoch2-bm25-mixed}"
+OUTPUT_DIR="${OUTPUT_DIR:-/mnt/beegfs/scratch/congthanh_le/scratch/east/ddro/outputs/vault-url-branch-preference-full-bm25-mixed}"
 INFER_ARGS=()
 if [[ -n "${INFER_FILE:-}" ]]; then
   INFER_ARGS=(--infer-file "${INFER_FILE}")
@@ -24,7 +27,8 @@ exec "${PYTHON_BIN}" -u "${REPO_ROOT}/src/pretrain/launch_branch_preference.py" 
   --checkpoint "${CHECKPOINT_PATH}" \
   --query-file "${QUERY_FILE}" \
   --bm25-file "${BM25_FILE}" \
-  --bm25-negatives-per-query "${BM25_NEGATIVES_PER_QUERY}" \
+  --bm25-training-negatives-per-query "${BM25_TRAINING_NEGATIVES_PER_QUERY}" \
+  --policy-mining-negatives-per-query "${POLICY_MINING_NEGATIVES_PER_QUERY}" \
   --output-dir "${OUTPUT_DIR}" \
   --target-type url_based_id \
   --arm branch \
@@ -36,10 +40,10 @@ exec "${PYTHON_BIN}" -u "${REPO_ROOT}/src/pretrain/launch_branch_preference.py" 
   --precision fp16 \
   --num-beams 15 \
   --mining-batch-size 16 \
-  --negatives-per-query 4 \
+  --total-training-negatives-per-query "${TOTAL_TRAINING_NEGATIVES_PER_QUERY}" \
   --batch-size 16 \
   --gradient-accumulation 1 \
-  --learning-rate 1e-5 \
+  --learning-rate 2e-5 \
   --warmup-ratio 0.1 \
   --beta 0.4 \
   --branch-beta 0.4 \

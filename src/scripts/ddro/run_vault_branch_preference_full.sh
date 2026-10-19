@@ -27,7 +27,7 @@ exec "${PYTHON_BIN}" -u "${REPO_ROOT}/src/pretrain/launch_branch_preference.py" 
   --precision fp16 \
   --num-beams 15 \
   --mining-batch-size 25 \
-  --negatives-per-query 4 \
+  --total-training-negatives-per-query 4 \
   --batch-size 16 \
   --gradient-accumulation 1 \
   --learning-rate 1e-6 \

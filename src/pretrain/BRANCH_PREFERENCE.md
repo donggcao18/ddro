@@ -87,28 +87,52 @@ query key and full positive list. A BM25 row for a different chosen target
 does not join just because its prompt matches. Validation queries are not
 imported into the training pool. No relevance labels are added from BM25.
 
-The default reserves two BM25 and two policy negatives per selected query:
+The launcher default reserves two BM25 and two policy negatives per selected
+query. The dedicated mixed run script currently requests six BM25 plus four
+policy negatives, with ten total training negatives per query:
 
 ```bash
 conda activate ddro_env
 BM25_FILE=/path/to/bm25_preferences.jsonl \
-bash src/scripts/ddro/run_vault_branch_preference_full_epoch2.sh
+bash src/scripts/ddro/run_vault_branch_preference_mixed.sh
 ```
 
-The existing epoch2 script now includes fusion by default and retains its checkpoint, learning rate, training batch
-16/GPU, accumulation 1, 15 beams, mining batch 16/GPU, evaluation interval,
-and final inference file. Its default BM25 file is
+The mixed script uses training batch 16/GPU, accumulation 1, 15 beams, mining
+batch 16/GPU, evaluation every eight rounds, and the configured final inference
+file. Its default BM25 file is
 `/home/users/congthanh_le/scratch/east/ddro/data/vault_bm25/dpo_pairs_url.jsonl`,
 matching the existing URL-DPO launch script. Override `BM25_FILE` for another
-file. It uses a separate `...-epoch2-bm25-mixed` output directory.
+file. It uses a separate `...-full-bm25-mixed` output directory.
 `OUTPUT_DIR`, `CHECKPOINT_PATH`, `QUERY_FILE`, and `INFER_FILE` remain
-environment overrides. `BM25_NEGATIVES_PER_QUERY` defaults to 2. Add `--arm dpo`
-for the ordinary DPO control, or `--resume` after an interruption. The
-`run_vault_branch_preference_full_epoch2_mixed.sh` name remains an alias.
+environment overrides. Add `--arm dpo` for the ordinary DPO control, or
+`--resume` after an interruption. The epoch2 and SFT scripts retain their
+policy-only configuration.
 
 The same options work directly with `launch_branch_preference.py`:
-`--bm25-file ... --bm25-negatives-per-query 2 --negatives-per-query 4`.
-`negatives_per_query` is the TOTAL quota. The source quota must be between
+`--bm25-file ... --bm25-training-negatives-per-query 2
+--total-training-negatives-per-query 4 --policy-mining-negatives-per-query 4`.
+
+Negative budgets are named separately:
+
+| Launcher option | Mixed-script environment variable | Current mixed default |
+| --- | --- | --- |
+| `--policy-mining-negatives-per-query` | `POLICY_MINING_NEGATIVES_PER_QUERY` | 4 candidates retained from the model's 15 beams |
+| `--bm25-training-negatives-per-query` | `BM25_TRAINING_NEGATIVES_PER_QUERY` | 6 BM25 negatives targeted in the final mix |
+| `--total-training-negatives-per-query` | `TOTAL_TRAINING_NEGATIVES_PER_QUERY` | 10 training negatives maximum across sources |
+
+The policy training target is total minus BM25 (currently 10 minus 6 = 4).
+Source shares are targets; existing backfilling may shift the actual mixture.
+Mining can retain a larger candidate pool than the policy training share.
+If unspecified, the mining limit defaults to the total training quota, preserving
+the old behavior. Without BM25, an explicit mining limit must equal the total
+training quota.
+
+`--negatives-per-query` and `--bm25-negatives-per-query` remain CLI aliases.
+`BM25_NEGATIVES_PER_QUERY` remains an environment alias in the mixed script.
+Saved JSON configs retain the legacy `negatives_per_query` (training total) and
+`bm25_negatives_per_query` (BM25 training share) keys; the optional
+`policy_mining_negatives_per_query` key separates mining when needed. Merely
+renaming the CLI flags does not change a run's identity. The source quota must be between
 one and total-minus-one. BM25 candidates are ordered by ascending BM25 rank
 (file order for ties/missing ranks); policy candidates retain beam order.
 The two sources' scores are never compared to each other.
@@ -119,10 +143,10 @@ token aliases are filtered. Unknown corpus IDs are skipped and reported with
 examples; add `--corpus-file` for a more complete retrieval collection. A file
 with no usable training matches fails before GPU work. Each round then:
 
-1. Mines up to the total quota of policy negatives into `preferences.jsonl`.
+1. Mines up to the policy-mining quota into `preferences.jsonl`.
 2. Runs `mix-N` to select the reserved source shares, deduplicate effective
    token sequences across sources, then fill empty slots from unused policy
-   candidates followed by BM25 candidates. Fewer than four valid distinct
+   candidates followed by BM25 candidates. Fewer than the requested total of valid distinct
    negatives is allowed; no pair is duplicated to satisfy the quota.
 3. Writes `mixed_preferences.jsonl`, `mixed_preferences.audit.json` (actual
    source counts and per-query mixture distribution), and `mixed_pair_audit.json`.
