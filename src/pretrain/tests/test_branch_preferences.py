@@ -14,7 +14,7 @@ from pretrain.branch_preference_utils import (
 )
 from pretrain.iterative_dpo_utils import atomic_json
 from pretrain.launch_branch_preference import build_parser, experiment_config
-from pretrain.train_iterative_ddro_vault import load_config, skipped_round_stage
+from pretrain.train_iterative_ddro_vault import load_config, skipped_round_stage, training_options
 
 
 class BranchExtractionTest(unittest.TestCase):
@@ -84,6 +84,25 @@ class BranchExtractionTest(unittest.TestCase):
 
 
 class BranchConfigTest(unittest.TestCase):
+    def test_epoch_round_budget_disables_step_cap(self):
+        argv = ["--checkpoint", "model", "--query-file", "q.jsonl", "--output-dir", "run",
+                "--queries-per-round", "2000", "--epochs-per-round", "1", "--reference-ema-decay", "0.98"]
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.json"
+            atomic_json(path, experiment_config(build_parser().parse_args(argv)))
+            cfg = load_config(path)
+            self.assertIsNone(cfg["steps_per_round"])
+            self.assertEqual(cfg["epochs_per_round"], 1.0)
+            options = training_options(cfg, 0)
+            self.assertEqual(options["max_steps"], -1)
+            self.assertEqual(options["num_train_epochs"], 1.0)
+            for value in (0, -1, float("nan"), float("inf")):
+                atomic_json(path, {**cfg, "epochs_per_round": value})
+                with self.assertRaisesRegex(ValueError, "epochs_per_round"):
+                    load_config(path)
+        with patch("sys.stderr"), self.assertRaises(SystemExit):
+            build_parser().parse_args(argv + ["--steps-per-round", "200"])
+
     def test_explicit_ema_decay_and_invalid_values(self):
         argv = ["--checkpoint", "model", "--query-file", "q.jsonl", "--output-dir", "run",
                 "--queries-per-round", "2000", "--steps-per-round", "200", "--eval-every-rounds", "40"]

@@ -319,7 +319,7 @@ class RealMixedBranchTest(unittest.TestCase):
             atomic_json(path, {"checkpoint_path": "model", "initial_reference_checkpoint": "model",
                                "query_file": "queries.jsonl", "bm25_file": "bm25.jsonl", "infer_file": "infer.jsonl",
                                "input_format": "multilabel", "target_type": "url_based_id", "output_dir": "run",
-                               "queries_per_round": 4, "steps_per_round": 1, "num_beams": 8,
+                               "queries_per_round": 4, "epochs_per_round": 1, "num_beams": 8,
                                "negatives_per_query": 6, "policy_mining_negatives_per_query": 4, "mining_batch_size": 2,
                                "max_prompt_length": 8, "max_target_length": 8, "precision": "fp32", "device": "cpu",
                                "selection_metric": "mrr@8", "reference_update": "ema", "reference_ema_decay": 1.0,
@@ -348,6 +348,8 @@ class RealMixedBranchTest(unittest.TestCase):
                 mined = list(iter_json_records(directory / "preferences.jsonl"))
                 self.assertTrue(all(n <= 4 for n in Counter(r["query_key"] for r in mined).values()))
                 self.assertTrue(all(n <= 6 for n in Counter(r["query_key"] for r in mixed).values()))
+                self.assertEqual(result["rounds"][i]["optimizer_steps"], (len(mixed) + 1) // 2)
+                self.assertEqual(result["rounds"][i]["completed_training_epochs"], i + 1)
                 self.assertEqual(len(mixed), len(annotated))
                 self.assertEqual({r["negative_source"] for r in annotated}, {"bm25", "model_confusion"})
                 self.assertTrue(any(r["branch_active"] for r in annotated))

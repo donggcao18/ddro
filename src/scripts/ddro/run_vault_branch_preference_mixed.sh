@@ -19,6 +19,11 @@ INFER_ARGS=()
 if [[ -n "${INFER_FILE:-}" ]]; then
   INFER_ARGS=(--infer-file "${INFER_FILE}")
 fi
+if [[ -n "${EPOCHS_PER_ROUND:-}" ]]; then
+  ROUND_BUDGET_ARGS=(--epochs-per-round "${EPOCHS_PER_ROUND}")
+else
+  ROUND_BUDGET_ARGS=(--steps-per-round "${STEPS_PER_ROUND:-1000}")
+fi
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export MKL_THREADING_LAYER=GNU
@@ -36,7 +41,7 @@ exec "${PYTHON_BIN}" -u "${REPO_ROOT}/src/pretrain/launch_branch_preference.py" 
   --rounds all \
   --keep-last-round-checkpoints "${KEEP_LAST_ROUND_CHECKPOINTS}" \
   --queries-per-round 10000 \
-  --steps-per-round 1000 \
+  "${ROUND_BUDGET_ARGS[@]}" \
   --num-gpus 4 \
   --mining-num-gpus 4 \
   --precision fp16 \

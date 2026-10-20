@@ -39,7 +39,11 @@ def build_parser():
                         help="Evaluate retrieval every N completed rounds")
     parser.add_argument("--eval-at-end", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--queries-per-round", type=int, default=10000)
-    parser.add_argument("--steps-per-round", type=int, default=1000)
+    budget = parser.add_mutually_exclusive_group()
+    budget.add_argument("--steps-per-round", type=int, default=1000,
+                        help="Fixed optimizer steps per round (default: 1000 when no epoch budget is given)")
+    budget.add_argument("--epochs-per-round", type=float,
+                        help="Passes over each round's complete usable preference dataset; disables the fixed step limit")
     parser.add_argument("--num-beams", type=int, default=15)
     parser.add_argument("--total-training-negatives-per-query", "--negatives-per-query",
                         dest="negatives_per_query", type=int, default=4,
@@ -99,6 +103,8 @@ def experiment_config(args):
             "target_collision_policy": args.target_collision_policy, "target_token_policy": args.target_token_policy,
             "selection_metric": "mrr@10", "eval_every_rounds": args.eval_every_rounds,
             "eval_at_end": args.eval_at_end, "training": training}
+    if args.epochs_per_round is not None:
+        config.update(steps_per_round=None, epochs_per_round=args.epochs_per_round)
     if args.infer_file:
         config["infer_file"] = str(Path(args.infer_file).resolve())
     config["keep_last_round_checkpoints"] = args.keep_last_round_checkpoints

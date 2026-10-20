@@ -360,9 +360,10 @@ conda activate ddro_env
 bash src/scripts/ddro/run_vault_branch_preference_mixed_small_rounds.sh
 ```
 
-This starts a new full-query run in `.../vault-url-branch-preference-mixed-q2000-ema098`:
+This starts a new full-query run in `.../vault-url-branch-preference-mixed-q2000-ema098-epoch1`:
 
-- 2,000 queries and 200 optimizer steps per round.
+- 2,000 queries and one complete epoch over the usable mixed preference pairs
+  per round. There is no fixed optimizer-step cap.
 - Reference EMA decay 0.98: 98% old reference plus 2% latest policy per round.
 - Validation every 40 completed rounds (approximately 80,000 queries), plus the
   final round. The separate inference file is evaluated only after training,
@@ -371,19 +372,26 @@ This starts a new full-query run in `.../vault-url-branch-preference-mixed-q2000
   batch 16/GPU, accumulation 1, 15 beams, mining batch 16/GPU, six BM25 plus four
   policy training targets, and latest-three-round checkpoint retention.
 
-The smaller final query partition keeps the same 200-step round budget.
-The 200 versus 1,000 steps scales the nominal full-query training budget by the
-same factor as 2,000 versus 10,000 queries. Five EMA updates give
+The smaller final query partition also receives one epoch; its step count
+shrinks with its actual pair count. At 2,000 queries, ten negatives each, batch
+16/GPU on four GPUs, and accumulation one, a full epoch is approximately 313
+optimizer steps. Filtering can reduce that number. Five EMA updates give
 `0.98^5 ~= 0.904` retention of the old reference, close to one decay-0.9 update
 per 10,000 queries. These are experimental starting values, not measured optima.
 The ordinary launcher's default remains decay 1.0 (frozen reference).
 
-Override `QUERIES_PER_ROUND`, `STEPS_PER_ROUND`, `REFERENCE_EMA_DECAY`, and
-`EVAL_EVERY_ROUNDS` through environment variables. For example, the 1,000-query
-alternative uses 100 steps, decay 0.99, and validation every 80 rounds; give it
-a separate `OUTPUT_DIR`. The launcher also accepts `--reference-ema-decay`
-directly. Start a new output directory when changing the round size, step
-budget, or EMA decay. To resume the same small-round experiment, repeat its
+Override `QUERIES_PER_ROUND`, `EPOCHS_PER_ROUND`, `REFERENCE_EMA_DECAY`, and
+`EVAL_EVERY_ROUNDS` through environment variables. A 1,000-query alternative
+can retain one epoch, decay 0.99, and validation every 80 rounds; give it a
+separate `OUTPUT_DIR`. The launcher accepts mutually exclusive
+`--epochs-per-round` and `--steps-per-round` options, plus
+`--reference-ema-decay`. The base mixed script uses `EPOCHS_PER_ROUND` when
+set, otherwise `STEPS_PER_ROUND` (default 1,000). The small-round script always
+sets an epoch budget and ignores `STEPS_PER_ROUND`.
+
+Start a new output directory when changing the round size, training budget, or
+EMA decay. The new `-epoch1` directory separates this run from the earlier
+200-step experiment. To resume the same epoch-based experiment, repeat its
 script with `--resume` and the same environment overrides.
 
 ## Keep only the latest three checkpoint rounds
