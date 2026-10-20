@@ -20,6 +20,7 @@ exec "${PYTHON_BIN}" -u "${REPO_ROOT}/src/pretrain/launch_branch_preference.py" 
   --target-type url_based_id \
   --arm branch \
   --rounds all \
+  --keep-last-round-checkpoints 3 \
   --queries-per-round 10000 \
   --steps-per-round 1000 \
   --num-gpus 4 \

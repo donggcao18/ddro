@@ -25,6 +25,7 @@ from pretrain.iterative_dpo_utils import (
     latest_resumable_checkpoint, partition_queries, read_json, round_queries,
 )
 from pretrain.update_dpo_reference import reference_identity
+from pretrain.checkpoint_retention import checkpoint_pruned, prune_round_checkpoints, resume_after_pruning
 
 
 DEFAULTS = {
@@ -32,6 +33,7 @@ DEFAULTS = {
     "infer_file": None,
     "bm25_file": None, "bm25_negatives_per_query": 2,
     "policy_mining_negatives_per_query": None,
+    "keep_last_round_checkpoints": None,
     "rounds": None, "queries_per_round": None, "steps_per_round": 1000,
     "epochs_per_round": None, "seed": 42, "validation_fraction": 0.05,
     "target_type": "text_id", "id_mode": "auto", "structure_id_sources": [],
@@ -65,8 +67,11 @@ MINING_COMPATIBLE_CONTROLLERS = EVALUATION_COMPATIBLE_CONTROLLERS | {
     "13c07e6d53f273b021498b572469322782b6af52333bbe6173a7466f50d88e1c",
     "d02f074f416ad1979679458933d8e940e378a32b2771f13b6a34bbab167f8b3c",
 }
-RUNTIME_KEYS = EVALUATION_SCHEDULE_KEYS | {"mining_num_gpus", "mining_batch_size"}
+RUNTIME_KEYS = EVALUATION_SCHEDULE_KEYS | {"mining_num_gpus", "mining_batch_size", "keep_last_round_checkpoints"}
 ROUND_RESUME_COMPATIBLE_CONTROLLERS = MINING_COMPATIBLE_CONTROLLERS | {
+    # Controller before optional checkpoint retention (LF / CRLF).
+    "f0eeeb3fd73ab76a4f8c8327c3d3397e13767c960da86a3f78317f0281f550ca",
+    "dcfc8d84703221614b46f77c136df42eaea0d4515aab1cf7d69efad92c527f94",
     # Controller before separate mining/training negative budgets (LF / CRLF).
     "5e7e23777e5895cf06ae2e61730a54f3659e4e6564d92542d3e338de2bd24569",
     "d98d8faf48864683840e2e14ca1e1bcb114647c06977da5a9ded39ca20567b36",
@@ -151,6 +156,9 @@ def accept_evaluation_resume_update(state: dict, identity: dict, start_round=0,
     valid_controller = (previous_code.get(controller) == current_code.get(controller)
                         or previous_code.get(controller) in ROUND_RESUME_COMPATIBLE_CONTROLLERS)
     allowed_code = {controller}
+    retention_code = str(SRC / "pretrain/checkpoint_retention.py")
+    if previous_code.get(controller) in ROUND_RESUME_COMPATIBLE_CONTROLLERS and retention_code not in previous_code:
+        allowed_code.add(retention_code)
     # Known upgrades add an optional generation flag or evaluation statistics;
     # existing mining and validation keep early_stopping=True.
     allowed_code.update(path for path, versions in INFERENCE_COMPATIBLE_CODE.items()
@@ -187,6 +195,7 @@ def accept_evaluation_resume_update(state: dict, identity: dict, start_round=0,
         "new_schedule": {key: identity["config"][key] for key in sorted(EVALUATION_SCHEDULE_KEYS)},
         "mining_num_gpus": identity["config"].get("mining_num_gpus"),
         "mining_batch_size": identity["config"]["mining_batch_size"],
+        "keep_last_round_checkpoints": identity["config"].get("keep_last_round_checkpoints"),
         "new_controller_fingerprint": current_code[controller],
     })
     state["identity"] = identity
@@ -214,6 +223,9 @@ def load_config(path: Path) -> dict:
     if unknown or required - raw.keys():
         raise ValueError(f"Invalid config keys: unknown={unknown}, missing={required - raw.keys()}")
     cfg = {**DEFAULTS, **raw}
+    if (cfg["keep_last_round_checkpoints"] is not None
+            and (type(cfg["keep_last_round_checkpoints"]) is not int or cfg["keep_last_round_checkpoints"] < 0)):
+        raise ValueError("keep_last_round_checkpoints must be null or a nonnegative integer (0 keeps all)")
     if cfg["bm25_file"] is not None:
         if not isinstance(cfg["bm25_file"], str) or not cfg["bm25_file"].strip():
             raise ValueError("bm25_file must be null or a nonempty path")
@@ -485,13 +497,17 @@ def audit_pairs(path: Path, queries: list[dict], documents: Path, target_type: s
 
 def run_pipeline(cfg: dict, resume=False, prepare_only=False, runner=run_command, start_round=0,
                  extend_rounds=None, eval_every_rounds=None, eval_at_end=None,
-                 mining_batch_size=None, infer_file=None) -> dict:
+                 mining_batch_size=None, infer_file=None, keep_last_round_checkpoints=None) -> dict:
     if type(start_round) is not int or start_round < 0:
         raise ValueError("start_round must be a nonnegative integer")
     if start_round and (not resume or prepare_only):
         raise ValueError("--start-round requires --resume and cannot be used with --prepare-only")
     if infer_file is not None:
         cfg = {**cfg, "infer_file": str(Path(infer_file).expanduser().resolve())}
+    if keep_last_round_checkpoints is not None:
+        if type(keep_last_round_checkpoints) is not int or keep_last_round_checkpoints < 0:
+            raise ValueError("keep_last_round_checkpoints must be a nonnegative integer (0 keeps all)")
+        cfg = {**cfg, "keep_last_round_checkpoints": keep_last_round_checkpoints}
     if mining_batch_size is not None:
         if type(mining_batch_size) is not int or mining_batch_size <= 0:
             raise ValueError("mining_batch_size must be a positive integer")
@@ -549,6 +565,7 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0, exte
             SRC / "pretrain/iterative_dpo_utils.py", SRC / "data/data_prep/prepare_vault_dpo_metadata.py",
             MINING / "mine_model_confusion_negatives.py", MINING / "prepare_bm25.py", MINING / "common.py",
             SRC / "utils/trie.py", SRC / "pretrain/mine_on_gpus.py"]
+    code.append(SRC / "pretrain/checkpoint_retention.py")
     branch_mode = cfg["training"].get("preference_objective", "dpo") == "branch-dpo"
     if cfg.get("bm25_file"):
         code.append(SRC / "pretrain/mix_bm25_preferences.py")
@@ -566,6 +583,8 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0, exte
     ignored_config = {"infer_file"} | ({"bm25_file", "bm25_negatives_per_query"} if not cfg.get("bm25_file") else set())
     if cfg.get("policy_mining_negatives_per_query") is None:
         ignored_config.add("policy_mining_negatives_per_query")
+    if cfg.get("keep_last_round_checkpoints") is None:
+        ignored_config.add("keep_last_round_checkpoints")
     identity = {"config": {k: v for k, v in cfg.items() if k not in ignored_config},
                 "inputs": {str(p): file_hash(p) for p in sources},
                 "code": {str(p): file_hash(p) for p in code}, "versions": versions,
@@ -594,6 +613,11 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0, exte
             raise ValueError("New run requires an empty output directory")
         state = {"identity": identity, "stages": {}, "rounds": [], "complete": False}
         atomic_json(manifest_path, state)
+
+    start_round, auto_resume_pruned = resume_after_pruning(state, start_round)
+    if auto_resume_pruned:
+        for artifacts in state["stages"].values():
+            assert_file_hashes(artifacts)
 
     def stage(name, artifacts, action):
         if name in state["stages"]:
@@ -646,7 +670,7 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0, exte
     partitions = (coverage_partitions if coverage_partitions is not None else
                   partition_queries(queries, cfg["queries_per_round"], cfg["seed"]) if full_pass else None)
     total_rounds = len(partitions) if cfg["rounds"] is None else cfg["rounds"]
-    if start_round >= total_rounds:
+    if start_round > total_rounds or (start_round == total_rounds and not auto_resume_pruned):
         raise ValueError(f"--start-round must be less than {total_rounds} (round IDs are zero-based)")
     plan = {"mode": "partition_all" if partitions is not None else "fixed_rounds",
             "total_rounds": total_rounds, "training_queries": len(queries), "validation_queries": len(heldout),
@@ -674,6 +698,9 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0, exte
           f"policy {cfg['negatives_per_query'] - bm25_training_quota} (backfill when mixing).", flush=True)
     if prepare_only:
         return state
+    protected_checkpoints = [cfg["checkpoint_path"], cfg.get("initial_reference_checkpoint")]
+    if state.get("checkpoint_pruning"):
+        prune_round_checkpoints(state, output, cfg.get("keep_last_round_checkpoints"), protected_checkpoints)
 
     def evaluate(name, checkpoint, fingerprint, round_id, directory):
         predictions = directory / "validation_predictions.jsonl"
@@ -724,10 +751,13 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0, exte
         for result in results:
             metrics = result.get("metrics")
             if (metrics is not None and metrics[cfg["selection_metric"]] > best["metrics"][cfg["selection_metric"]]
-                    and Path(result["checkpoint"]).is_dir()):
-                if checkpoint_hash(result["checkpoint"]) != result["checkpoint_fingerprint"]:
+                    and (Path(result["checkpoint"]).is_dir() or checkpoint_pruned(state, result["checkpoint"]))):
+                pruned = checkpoint_pruned(state, result["checkpoint"])
+                if not pruned and checkpoint_hash(result["checkpoint"]) != result["checkpoint_fingerprint"]:
                     raise ValueError("Retained best checkpoint changed")
                 best = {key: result[key] for key in ("round_id", "checkpoint", "checkpoint_fingerprint", "metrics")}
+                if pruned:
+                    best["checkpoint_available"] = False
         # Old preference files are optional here; they affect only overlap diagnostics.
         prior_pairs = output / f"round-{start_round - 1:03d}" / "preferences.jsonl"
         recorded = state["stages"].get(f"mine-{start_round - 1}", {})
@@ -891,6 +921,7 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0, exte
                       "latest_reference": reference_checkpoint})
         atomic_json(manifest_path, state)
         atomic_json(output / "best_checkpoint.json", best)
+        prune_round_checkpoints(state, output, cfg.get("keep_last_round_checkpoints"), protected_checkpoints)
         previous = pairs
     if cfg.get("infer_file"):
         assert_file_hashes({cfg["infer_file"]: state["inference_identity"]["query_hash"]})
@@ -916,7 +947,8 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0, exte
         print("Final inference:", json.dumps(state["final_inference"]), flush=True)
     state["complete"] = True
     atomic_json(manifest_path, state)
-    print(f"Completed {len(results)} rounds. Latest: {checkpoint}. Best: {best['checkpoint']}", flush=True)
+    best_display = best["checkpoint"] + (" (weights pruned)" if best.get("checkpoint_available") is False else "")
+    print(f"Completed {len(results)} rounds. Latest: {checkpoint}. Best: {best_display}", flush=True)
     return state
 
 
@@ -925,6 +957,8 @@ def main():
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--infer-file", help="Optional labeled query file evaluated only on the final policy")
+    parser.add_argument("--keep-last-round-checkpoints", type=int,
+                        help="Keep only N latest checkpoint-bearing rounds; 0 disables pruning (resume-compatible)")
     parser.add_argument("--mining-batch-size", type=int,
                         help="Override generation batch per GPU, including on resume after mining OOM")
     parser.add_argument("--eval-every-rounds", type=int,
@@ -942,7 +976,8 @@ def main():
     run_pipeline(load_config(args.config.resolve()), args.resume, args.prepare_only,
                  start_round=args.start_round, extend_rounds=args.extend_rounds,
                  eval_every_rounds=args.eval_every_rounds, eval_at_end=args.eval_at_end,
-                 mining_batch_size=args.mining_batch_size, infer_file=args.infer_file)
+                 mining_batch_size=args.mining_batch_size, infer_file=args.infer_file,
+                 keep_last_round_checkpoints=args.keep_last_round_checkpoints)
 
 
 if __name__ == "__main__":

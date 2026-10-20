@@ -12,6 +12,7 @@ BM25_FILE="${BM25_FILE:-/home/users/congthanh_le/scratch/east/ddro/data/vault_bm
 BM25_TRAINING_NEGATIVES_PER_QUERY="${BM25_TRAINING_NEGATIVES_PER_QUERY:-${BM25_NEGATIVES_PER_QUERY:-6}}"
 POLICY_MINING_NEGATIVES_PER_QUERY="${POLICY_MINING_NEGATIVES_PER_QUERY:-4}"
 TOTAL_TRAINING_NEGATIVES_PER_QUERY="${TOTAL_TRAINING_NEGATIVES_PER_QUERY:-10}"
+KEEP_LAST_ROUND_CHECKPOINTS="${KEEP_LAST_ROUND_CHECKPOINTS:-3}"
 INFER_FILE="${INFER_FILE:-/home/users/congthanh_le/scratch/veil/CodeGR/data/updated_url/Ruby_test_r32.0_multilabel.json}"
 OUTPUT_DIR="${OUTPUT_DIR:-/mnt/beegfs/scratch/congthanh_le/scratch/east/ddro/outputs/vault-url-branch-preference-full-bm25-mixed}"
 INFER_ARGS=()
@@ -33,6 +34,7 @@ exec "${PYTHON_BIN}" -u "${REPO_ROOT}/src/pretrain/launch_branch_preference.py" 
   --target-type url_based_id \
   --arm branch \
   --rounds all \
+  --keep-last-round-checkpoints "${KEEP_LAST_ROUND_CHECKPOINTS}" \
   --queries-per-round 10000 \
   --steps-per-round 1000 \
   --num-gpus 4 \

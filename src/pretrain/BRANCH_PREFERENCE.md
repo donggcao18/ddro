@@ -351,6 +351,86 @@ Existing pre-update manifests do not silently
 migrate into branch experiments. `--prepare-only` prepares the split; continue
 that run with `--resume` after removing `--prepare-only`.
 
+## Smaller rounds with an updating EMA reference
+
+For the 2,000-query experiment, reuse the existing mixed script through:
+
+```bash
+conda activate ddro_env
+bash src/scripts/ddro/run_vault_branch_preference_mixed_small_rounds.sh
+```
+
+This starts a new full-query run in `.../vault-url-branch-preference-mixed-q2000-ema098`:
+
+- 2,000 queries and 200 optimizer steps per round.
+- Reference EMA decay 0.98: 98% old reference plus 2% latest policy per round.
+- Validation every 40 completed rounds (approximately 80,000 queries), plus the
+  final round. The separate inference file is evaluated only after training,
+  with beam early stopping disabled.
+- The existing mixed checkpoint and query/BM25/infer paths, LR 2e-5, training
+  batch 16/GPU, accumulation 1, 15 beams, mining batch 16/GPU, six BM25 plus four
+  policy training targets, and latest-three-round checkpoint retention.
+
+The smaller final query partition keeps the same 200-step round budget.
+The 200 versus 1,000 steps scales the nominal full-query training budget by the
+same factor as 2,000 versus 10,000 queries. Five EMA updates give
+`0.98^5 ~= 0.904` retention of the old reference, close to one decay-0.9 update
+per 10,000 queries. These are experimental starting values, not measured optima.
+The ordinary launcher's default remains decay 1.0 (frozen reference).
+
+Override `QUERIES_PER_ROUND`, `STEPS_PER_ROUND`, `REFERENCE_EMA_DECAY`, and
+`EVAL_EVERY_ROUNDS` through environment variables. For example, the 1,000-query
+alternative uses 100 steps, decay 0.99, and validation every 80 rounds; give it
+a separate `OUTPUT_DIR`. The launcher also accepts `--reference-ema-decay`
+directly. Start a new output directory when changing the round size, step
+budget, or EMA decay. To resume the same small-round experiment, repeat its
+script with `--resume` and the same environment overrides.
+
+## Keep only the latest three checkpoint rounds
+
+Branch-preference launchers default to `--keep-last-round-checkpoints 3`.
+After a round's training, reference update, and scheduled validation have
+completed and its result is committed, older checkpoint payloads are pruned.
+For example, after `round-005`, checkpoint weights for `round-003`,
+`round-004`, and `round-005` remain. Skipped rounds do not count toward this
+window because they have no new weights.
+
+Only recognized model-weight, optimizer, scheduler, scaler, RNG and training-args
+binary files in the old rounds' `training/latest`, `training/final`,
+`training/checkpoint-N`, training root, and EMA `reference` directories are
+removed. JSON/JSONL data, mined and mixed pairs, branch annotations, audits,
+metrics, predictions, logs, completion markers, and tokenizer/config metadata
+remain. No round or data directory is recursively removed. Initial policy and
+reference inputs and the currently required policy/reference are protected.
+
+Cleanup is journaled in `run_manifest.json` before deletion. An interrupted
+cleanup resumes from that journal. Ordinary `--resume` automatically skips the
+completed historical rounds after pruning; it does not try to reload their
+deleted weights. Retained artifacts are still checked for changes. An explicit
+`--start-round` requires the preceding policy/reference weights to still exist.
+
+This is a strict recent-round policy: an older best checkpoint can be pruned
+too. Its historical metrics and path remain in `best_checkpoint.json`, with
+`checkpoint_available: false`. No extra best-model copy is kept. Final inference
+continues to use the latest retained policy.
+
+The mixed script exposes `KEEP_LAST_ROUND_CHECKPOINTS=3`. Set the CLI option to
+`0` to disable future pruning; this does not restore previously removed weights.
+Existing JSON configurations may add `keep_last_round_checkpoints: 3`, or use
+the controller's resume-compatible override:
+
+```bash
+python -u src/pretrain/train_iterative_ddro_vault.py \
+  --config /path/to/existing.config.json \
+  --resume --keep-last-round-checkpoints 3
+```
+
+Updated branch launch scripts also enable retention when resumed with an older
+saved config, provided the training settings remain the same. A controller that
+is already running must be restarted with `--resume` to use the new retention
+code. Generic controller configurations without the retention option retain
+their old keep-all behavior.
+
 ## Outputs
 
 Each round preserves `preferences.jsonl` and adds:

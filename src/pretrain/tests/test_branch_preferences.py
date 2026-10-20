@@ -84,6 +84,25 @@ class BranchExtractionTest(unittest.TestCase):
 
 
 class BranchConfigTest(unittest.TestCase):
+    def test_explicit_ema_decay_and_invalid_values(self):
+        argv = ["--checkpoint", "model", "--query-file", "q.jsonl", "--output-dir", "run",
+                "--queries-per-round", "2000", "--steps-per-round", "200", "--eval-every-rounds", "40"]
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.json"
+            for decay in (0.98, 0.99, 0.9, 0.0, 1.0):
+                args = build_parser().parse_args(argv + ["--reference-ema-decay", str(decay)])
+                atomic_json(path, experiment_config(args))
+                cfg = load_config(path)
+                self.assertEqual(cfg["reference_update"], "ema")
+                self.assertEqual(cfg["reference_ema_decay"], decay)
+                self.assertEqual(cfg["queries_per_round"], 2000)
+                self.assertEqual(cfg["steps_per_round"], 200)
+                self.assertEqual(cfg["eval_every_rounds"], 40)
+            for value in ("-0.1", "1.1", "nan", "inf"):
+                atomic_json(path, experiment_config(build_parser().parse_args(argv + ["--reference-ema-decay", value])))
+                with self.assertRaisesRegex(ValueError, "reference_ema_decay"):
+                    load_config(path)
+
     def config(self, arm):
         args = build_parser().parse_args(["--checkpoint", "dpo", "--query-file", "q.jsonl",
                                           "--output-dir", "run", "--arm", arm])

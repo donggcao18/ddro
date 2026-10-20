@@ -27,6 +27,8 @@ def build_parser():
     parser.add_argument("--branch-loss-weight", type=float, default=0.1)
     parser.add_argument("--beta", type=float, default=0.4)
     parser.add_argument("--branch-beta", type=float)
+    parser.add_argument("--reference-ema-decay", type=float, default=1.0,
+                        help="Old-reference weight in EMA: ref <- decay*ref + (1-decay)*policy; 1 freezes the reference")
     parser.add_argument("--num-gpus", type=int, default=4)
     parser.add_argument("--mining-num-gpus", type=int)
     parser.add_argument("--precision", choices=["fp16", "bf16", "fp32"], default="fp16")
@@ -61,6 +63,8 @@ def build_parser():
     parser.add_argument("--logging-steps", type=int, default=10)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--start-round", type=int, default=0)
+    parser.add_argument("--keep-last-round-checkpoints", type=int, default=3,
+                        help="Keep checkpoint payloads for the N latest completed training rounds; 0 keeps all (default: 3)")
     parser.add_argument("--prepare-only", action="store_true")
     return parser
 
@@ -84,7 +88,7 @@ def experiment_config(args):
             "input_format": "multilabel", "target_type": args.target_type,
             "rounds": args.rounds, "queries_per_round": args.queries_per_round,
             "steps_per_round": args.steps_per_round, "reference_update": "ema",
-            "reference_ema_decay": 1.0, "seed": args.seed,
+            "reference_ema_decay": args.reference_ema_decay, "seed": args.seed,
             "validation_fraction": args.validation_fraction, "num_gpus": args.num_gpus,
             "mining_num_gpus": args.mining_num_gpus or args.num_gpus,
             "precision": args.precision, "device": args.device,
@@ -97,6 +101,7 @@ def experiment_config(args):
             "eval_at_end": args.eval_at_end, "training": training}
     if args.infer_file:
         config["infer_file"] = str(Path(args.infer_file).resolve())
+    config["keep_last_round_checkpoints"] = args.keep_last_round_checkpoints
     if args.policy_mining_negatives_per_query is not None and args.policy_mining_negatives_per_query != args.negatives_per_query:
         config["policy_mining_negatives_per_query"] = args.policy_mining_negatives_per_query
     if args.bm25_file:
@@ -117,10 +122,12 @@ def main():
         if args.resume and not config.get("infer_file") and previous.get("infer_file"):
             config["infer_file"] = previous["infer_file"]
         if previous != config and (args.resume or (output / "run_manifest.json").exists()):
-            same_training = ({k: v for k, v in previous.items() if k != "infer_file"}
-                             == {k: v for k, v in config.items() if k != "infer_file"})
+            runtime_keys = {"infer_file", "keep_last_round_checkpoints"}
+            same_training = ({k: v for k, v in previous.items() if k not in runtime_keys}
+                             == {k: v for k, v in config.items() if k not in runtime_keys})
             adding_inference = args.resume and not previous.get("infer_file") and config.get("infer_file")
-            if not (same_training and adding_inference):
+            same_inference = previous.get("infer_file") == config.get("infer_file")
+            if not (args.resume and same_training and (same_inference or adding_inference)):
                 raise ValueError(f"Resolved config changed: {config_path}; use a separate output directory for another arm")
     if args.resume and not (output / "run_manifest.json").is_file():
         raise ValueError("No existing run_manifest.json to resume")
