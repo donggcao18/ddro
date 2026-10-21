@@ -13,6 +13,10 @@ BM25_TRAINING_NEGATIVES_PER_QUERY="${BM25_TRAINING_NEGATIVES_PER_QUERY:-${BM25_N
 POLICY_MINING_NEGATIVES_PER_QUERY="${POLICY_MINING_NEGATIVES_PER_QUERY:-4}"
 TOTAL_TRAINING_NEGATIVES_PER_QUERY="${TOTAL_TRAINING_NEGATIVES_PER_QUERY:-10}"
 KEEP_LAST_ROUND_CHECKPOINTS="${KEEP_LAST_ROUND_CHECKPOINTS:-3}"
+LEARNING_RATE="${LEARNING_RATE:-2e-5}"
+QUERIES_PER_ROUND="${QUERIES_PER_ROUND:-10000}"
+REFERENCE_EMA_DECAY="${REFERENCE_EMA_DECAY:-1.0}"
+EVAL_EVERY_ROUNDS="${EVAL_EVERY_ROUNDS:-8}"
 INFER_FILE="${INFER_FILE:-/home/users/congthanh_le/scratch/veil/CodeGR/data/updated_url/Ruby_test_r32.0_multilabel.json}"
 OUTPUT_DIR="${OUTPUT_DIR:-/mnt/beegfs/scratch/congthanh_le/scratch/east/ddro/outputs/vault-url-branch-preference-full-bm25-mixed}"
 INFER_ARGS=()
@@ -40,7 +44,8 @@ exec "${PYTHON_BIN}" -u "${REPO_ROOT}/src/pretrain/launch_branch_preference.py" 
   --arm branch \
   --rounds all \
   --keep-last-round-checkpoints "${KEEP_LAST_ROUND_CHECKPOINTS}" \
-  --queries-per-round 10000 \
+  --queries-per-round "${QUERIES_PER_ROUND}" \
+  --reference-ema-decay "${REFERENCE_EMA_DECAY}" \
   "${ROUND_BUDGET_ARGS[@]}" \
   --num-gpus 4 \
   --mining-num-gpus 4 \
@@ -50,7 +55,7 @@ exec "${PYTHON_BIN}" -u "${REPO_ROOT}/src/pretrain/launch_branch_preference.py" 
   --total-training-negatives-per-query "${TOTAL_TRAINING_NEGATIVES_PER_QUERY}" \
   --batch-size 16 \
   --gradient-accumulation 1 \
-  --learning-rate 2e-5 \
+  --learning-rate "${LEARNING_RATE}" \
   --warmup-ratio 0.1 \
   --beta 0.4 \
   --branch-beta 0.4 \
@@ -60,7 +65,7 @@ exec "${PYTHON_BIN}" -u "${REPO_ROOT}/src/pretrain/launch_branch_preference.py" 
   --target-length-policy truncate \
   --target-collision-policy allow \
   --target-token-policy allow \
-  --eval-every-rounds 8 \
+  --eval-every-rounds "${EVAL_EVERY_ROUNDS}" \
   --eval-at-end \
   --save-steps 100 \
   --logging-steps 10 \

@@ -353,6 +353,26 @@ that run with `--resume` after removing `--prepare-only`.
 
 ## Smaller rounds with an updating EMA reference
 
+The named standalone experiment below contains its complete launch command,
+with no dependency on another shell script:
+
+```bash
+conda activate ddro_env
+bash src/scripts/ddro/run_vault_branch_preference_mixed_q1000_lr1e-5_ema099_epoch1.sh
+```
+
+It fixes LR `1e-5`, 1,000 queries/round, one epoch/round, reference EMA decay
+`0.99`, validation every 80 rounds plus the final round, training batch 16/GPU
+with accumulation 1, 15 mining beams, mining batch 16/GPU, six BM25 plus four
+policy negatives, and retention of the latest three checkpoint rounds.
+It evaluates the inference file after training with beam early stopping off.
+The default output is
+`.../vault-url-branch-preference-mixed-q1000-lr1e-5-ema0.99-epoch1`.
+Paths and `PYTHON_BIN` can be overridden through environment variables;
+hyperparameters are written explicitly in this file. Append `--resume` to
+continue the same run. To preserve a different experiment, copy the file,
+give it a descriptive name, and change its hyperparameters and output directory.
+
 For the 2,000-query experiment, reuse the existing mixed script through:
 
 ```bash
