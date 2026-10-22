@@ -13,7 +13,7 @@ CHECKPOINT_PATH="${CHECKPOINT_PATH:-/home/users/congthanh_le/scratch/veil/CodeGR
 QUERY_FILE="${QUERY_FILE:-/home/users/congthanh_le/scratch/veil/CodeGR/data/updated_url/Ruby_merged_multilabel.jsonl}"
 BM25_FILE="${BM25_FILE:-/home/users/congthanh_le/scratch/east/ddro/data/vault_bm25/dpo_pairs_url.jsonl}"
 INFER_FILE="${INFER_FILE:-/home/users/congthanh_le/scratch/veil/CodeGR/data/updated_url/Ruby_test_r32.0_multilabel.json}"
-OUTPUT_DIR="${OUTPUT_DIR:-/mnt/beegfs/scratch/congthanh_le/scratch/east/ddro/outputs/vault-url-branch-preference-mixed-q1000-lr1e-5-ema0.99-epoch1}"
+OUTPUT_DIR="${OUTPUT_DIR:-/mnt/beegfs/scratch/congthanh_le/scratch/east/ddro/outputs/vault-url-branch-preference-mixed-2000-lr5e-5-ema0.98-epoch1}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export MKL_THREADING_LAYER=GNU
@@ -31,8 +31,8 @@ exec "${PYTHON_BIN}" -u "${REPO_ROOT}/src/pretrain/launch_branch_preference.py" 
   --rounds all \
   --queries-per-round 2000 \
   --epochs-per-round 1 \
-  --reference-ema-decay 0.9 \
-  --learning-rate 1e-5 \
+  --reference-ema-decay 0.98 \
+  --learning-rate 5e-5 \
   --warmup-ratio 0.1 \
   --beta 0.4 \
   --branch-beta 0.4 \
