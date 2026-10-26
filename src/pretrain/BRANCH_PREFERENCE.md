@@ -351,6 +351,59 @@ Existing pre-update manifests do not silently
 migrate into branch experiments. `--prepare-only` prepares the split; continue
 that run with `--resume` after removing `--prepare-only`.
 
+## Three-round tuning runs
+
+To run the branch-beta comparison sequentially with one command:
+
+```bash
+bash src/scripts/ddro/sweep_vault_branch_beta_02_04_08_3rounds.sh
+```
+
+This script explicitly runs three trials with branch beta `0.2`, `0.4`, and
+`0.8`, fixing LR `2e-5`, 10,000 queries/round, EMA `0.9`, one epoch/round,
+sequence beta `0.4`, branch weight `0.1`, and seed 42. Each trial starts from
+the same initial checkpoint and performs inference after its third round.
+Results live under `SWEEP_OUTPUT_ROOT/branch-beta-<value>/final_inference.json`;
+`SWEEP_OUTPUT_ROOT` can override the dedicated default sweep directory.
+If a trial fails, the sweep stops before starting the next trial.
+
+The standalone tuning script trains rounds `000`, `001`, and `002`, performs
+validation after the third round, then evaluates `INFER_FILE` on the latest
+policy with beam early stopping disabled:
+
+```bash
+conda activate ddro_env
+bash src/scripts/ddro/run_vault_branch_preference_tune_3rounds.sh
+```
+
+Defaults are LR `2e-5`, 10,000 queries/round, EMA decay `0.9`, one epoch over
+all usable mixed pairs per round, sequence beta `0.4`, branch beta `0.4`,
+branch loss weight `0.1`, training batch 16/GPU and accumulation 1. It includes
+the full command and does not depend on another experiment shell script.
+Each trial starts from `CHECKPOINT_PATH`; rounds within a trial continue from
+the previous policy. Fixed-round selection uses the controller's seeded
+rotating query windows; with at least 30,000 training queries the default
+trial covers the first three 10,000-query windows without wrapping.
+
+Change the exposed parameters through environment variables, for example:
+
+```bash
+BRANCH_BETA=0.2 bash src/scripts/ddro/run_vault_branch_preference_tune_3rounds.sh
+LEARNING_RATE=1e-5 bash src/scripts/ddro/run_vault_branch_preference_tune_3rounds.sh
+```
+
+The generated output name includes round count, query count, LR, EMA, epochs,
+both betas, branch weight and seed. Repeat the same settings with `--resume`
+to continue an interrupted trial. Set a separate `EXPERIMENT_NAME` or
+`OUTPUT_DIR` when changing input files or additional CLI training settings;
+copy and rename the script to archive a particular experiment. Varying query
+count with three fixed rounds also changes total training exposure.
+
+Results are written to `OUTPUT_DIR/final_inference.json`, with predictions
+and statistics under `OUTPUT_DIR/round-002/infer_predictions*`.
+For hyperparameter selection, use a labeled validation file as `INFER_FILE`
+and reserve the test file for final reporting.
+
 ## Smaller rounds with an updating EMA reference
 
 The named standalone experiment below contains its complete launch command,
