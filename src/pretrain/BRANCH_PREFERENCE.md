@@ -1,5 +1,81 @@
 # Branch-preference continuation after DPO
 
+## Switch between DPO + SFT and DPO + branch preference
+
+The mixed launcher defaults to DPO + SFT. Switch objectives without editing code:
+
+```bash
+# Whole-ID DPO + chosen-token NLL (TRL RPO).
+ARM=sft SFT_LOSS_WEIGHT=1.0 bash src/scripts/ddro/run_vault_branch_preference_mixed.sh
+
+# Original whole-ID DPO + branch preference, without SFT.
+ARM=branch bash src/scripts/ddro/run_vault_branch_preference_mixed.sh
+```
+
+Equivalent launcher flags are `--arm sft --sft-loss-weight 1.0` and `--arm branch`.
+The SFT coefficient is passed as `rpo_alpha` to the existing TRL 0.11.4 trainer;
+the SFT arm preserves masked labels to fix that version's T5 NLL padding bug.
+NLL is averaged over all non-padding chosen tokens in the batch, including EOS.
+This is the built-in TRL reduction, not a separate per-query or per-sequence
+average. No extra model or forward pass is added for the SFT term. The direct
+training entry point also accepts `--rpo_alpha`.
+
+Policy mining now retains only negatives **ahead of the designated chosen ID**
+(smaller numeric rank). Other known positives and positive token aliases are
+still excluded. Chosen at rank 1 means no policy negatives. If chosen is absent
+from the returned beams, it is treated as below that list; this is a beam-based
+ordering assumption, not an exact full-corpus rank. Each policy pair records
+`model_rank` and `model_positive_rank` (null when chosen is outside the beams).
+BM25 selection and source-quota backfilling remain unchanged, so a query with
+no policy negatives may still train on BM25 pairs. Local branch eligibility
+remains a separate check after mining.
+
+Default output folders include the objective and `outranking` to separate these
+runs from older experiments. Use a fresh output folder when changing objectives,
+SFT coefficients, or mining code; existing identity checks reject incompatible
+training resumes. The remaining sections describe the original branch arm.
+
+## Run a limited experiment with repeatable round data
+
+The mixed script accepts `ROUNDS` (a positive integer or `all`), `SEED`, and
+`INFER_MAX_SAMPLES`. For example, train three rounds of 2,000 queries each and
+evaluate the first 1,000 records from the inference file:
+
+```bash
+ARM=sft ROUNDS=3 QUERIES_PER_ROUND=2000 EPOCHS_PER_ROUND=1 \
+SEED=42 INFER_MAX_SAMPLES=1000 \
+bash src/scripts/ddro/run_vault_branch_preference_mixed.sh
+```
+
+Change `ARM=branch` for a comparison run. Training stops after the requested
+round count; final inference uses that run's latest policy. `EPOCHS_PER_ROUND=1`
+means one pass over each selected round's preference pairs, not the entire
+query collection. Without it, the existing `STEPS_PER_ROUND` budget applies.
+Defaults remain `ROUNDS=all`, `SEED=42`, and inference on the whole file.
+Default output names now also include round count and seed; set `OUTPUT_DIR`
+explicitly when varying other settings.
+
+With the same query inputs, target type, validation fraction, seed, and
+queries-per-round, numeric-round experiments select identical ordered queries
+in every shared round, independent of objective, output folder, or total round
+budget. Selection sorts query keys, shuffles once with the saved seed, and
+takes fixed windows. Numeric budgets retain the existing rotating schedule
+(windows wrap if the budget exceeds the available queries). `ROUNDS=all`
+instead retains a smaller final partition without wrapping. The exact selected
+queries and their order are saved in each `round-NNN/queries.jsonl`.
+Policy-mined negatives and the resulting mixed pairs can differ as policies
+diverge; the reproducibility guarantee concerns the queries and their order.
+
+`INFER_MAX_SAMPLES=N` evaluates the first `min(N, file length)` records in file
+order, including duplicates. This uses the same subset across round budgets,
+objectives, and seeds. The Python launcher and controller accept
+`--infer-max-samples N`; JSON configs accept `infer_max_samples: N`.
+`metadata/infer_queries.audit.json` records the limit and actual query count;
+`final_inference.json` reports the number evaluated. The file and limit are
+fixed once inference metadata is committed, and launcher resumes retain the
+saved limit if the flag is omitted. Use a separate output folder for another
+inference subset.
+
 The `branch-preference` branch implements whole-ID sigmoid DPO plus a local
 preference at the first divergent target token. Both actions are scored under
 the same chosen-prefix history. Existing constrained on-policy mining,
@@ -191,8 +267,9 @@ For URL IDs, inference records can use either format:
 
 The single ID is the ground truth only when `positive_url_based_id` is absent.
 An explicit positive list is used verbatim and must be nonempty. For structure
-IDs, use `structure_id_v6` / `positive_structure_id_v6`. Every inference record
-is evaluated, including duplicates. Legacy inputs can use canonical
+IDs, use `structure_id_v6` / `positive_structure_id_v6`. Every selected inference
+record is evaluated, including duplicates (all records unless capped with
+`--infer-max-samples`). Legacy inputs can use canonical
 `target_text_id` / `positive_text_ids` metadata.
 
 Inference uses the same corpus as mining. Supply all retrieval identities
@@ -217,7 +294,7 @@ config, `--resume`, and `--infer-file /path/to/Ruby_infer.jsonl`. The known
 preceding code version is supported without changing trained outputs. Repeat
 the file override on later controller resumes, or save `infer_file` in the
 existing config. Branch-launcher resumes retain a previously saved inference
-file automatically. Once inference metadata is committed, its file/corpus and
+file and sample limit automatically. Once inference metadata is committed, its file/corpus, limit, and
 preparation code must remain unchanged.
 
 The launcher uses the on-policy compatibility defaults for every arm:

@@ -229,6 +229,33 @@ class MixedPipelineTest(unittest.TestCase):
                     load_config(path)
         self.assertTrue(skipped_round_stage("mix-3", 4))
 
+    def test_sft_arm_forwards_coefficient_and_keeps_branch_arm_separate(self):
+        argv = ["--checkpoint", "model", "--query-file", "q", "--output-dir", "run"]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            for arm in ("sft", "branch", "dpo"):
+                args = build_parser().parse_args(argv + ["--arm", arm, "--sft-loss-weight", "0.3"])
+                config = experiment_config(args)
+                atomic_json(path, config)
+                cfg = load_config(path)
+                if arm == "sft":
+                    self.assertEqual(cfg["training"]["rpo_alpha"], 0.3)
+                    self.assertNotIn("branch_loss_weight", cfg["training"])
+                    from pretrain.train_iterative_ddro_vault import training_command
+                    atomic_json(Path(tmp) / "round.json", {
+                        "training": cfg["training"], "policy_checkpoint": "model",
+                        "reference_checkpoint": "model", "pairs_file": "pairs.jsonl"})
+                    command = training_command(cfg, Path(tmp) / "round.json", Path(tmp) / "train", None)
+                    self.assertEqual(command[command.index("--rpo_alpha") + 1], "0.3")
+                else:
+                    self.assertNotIn("rpo_alpha", cfg["training"])
+            for value in (-1, float("nan"), float("inf"), True):
+                config = experiment_config(build_parser().parse_args(argv + ["--arm", "sft"]))
+                config["training"]["rpo_alpha"] = value
+                atomic_json(path, config)
+                with self.assertRaisesRegex(ValueError, "rpo_alpha"):
+                    load_config(path)
+
     def test_each_round_uses_only_selected_queries_and_resumes_committed_mix(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -295,7 +322,14 @@ class MixedPipelineTest(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("RUN_DPO_INTEGRATION") == "1", "Set RUN_DPO_INTEGRATION=1")
 class RealMixedBranchTest(unittest.TestCase):
-    def test_actual_mixed_branch_training_and_final_inference(self):
+    def test_limited_runs_share_round_data_across_objectives_and_budgets(self):
+        branch_rounds, branch_infer = self.run_actual_mixed_training("branch", 2)
+        sft_rounds, sft_infer = self.run_actual_mixed_training("sft", 3)
+        # Byte equality checks both query membership and within-round ordering.
+        self.assertEqual(branch_rounds, sft_rounds[:2])
+        self.assertEqual(branch_infer, sft_infer)
+
+    def run_actual_mixed_training(self, arm, rounds):
         import torch
         import mine_model_confusion_negatives as miner
         from pretrain import train_ddro_vault as training
@@ -314,17 +348,21 @@ class RealMixedBranchTest(unittest.TestCase):
                  "query_key": f"vault-{i}", "chosen_text_id": f"old-{i}", "positive_text_ids": [f"old-{i}"],
                  "bm25_rank": rank, "bm25_score": None}
                 for i, target in enumerate(ids) for rank, negative in enumerate(ids, 1) if negative != target])
-            atomic_jsonl(root / "infer.jsonl", [{"text": "find C0", "url_based_id": ids[0]}])
+            atomic_jsonl(root / "infer.jsonl", [
+                {"text": f"find C{i}", "url_based_id": ids[i]} for i in range(3)])
             path = root / "config.json"
             atomic_json(path, {"checkpoint_path": "model", "initial_reference_checkpoint": "model",
                                "query_file": "queries.jsonl", "bm25_file": "bm25.jsonl", "infer_file": "infer.jsonl",
+                               "infer_max_samples": 2, "rounds": rounds,
                                "input_format": "multilabel", "target_type": "url_based_id", "output_dir": "run",
                                "queries_per_round": 4, "epochs_per_round": 1, "num_beams": 8,
                                "negatives_per_query": 6, "policy_mining_negatives_per_query": 4, "mining_batch_size": 2,
                                "max_prompt_length": 8, "max_target_length": 8, "precision": "fp32", "device": "cpu",
                                "selection_metric": "mrr@8", "reference_update": "ema", "reference_ema_decay": 1.0,
-                               "eval_every_rounds": 8, "training": {"preference_objective": "branch-dpo",
-                                   "branch_loss_weight": 0.1, "per_device_train_batch_size": 2,
+                               "eval_every_rounds": 8, "training": {
+                                   **({"preference_objective": "branch-dpo", "branch_loss_weight": 0.1}
+                                      if arm == "branch" else {"rpo_alpha": 0.3}),
+                                   "per_device_train_batch_size": 2,
                                    "gradient_accumulation_steps": 1, "save_steps": 1, "logging_steps": 1}})
             calls = []
 
@@ -341,25 +379,42 @@ class RealMixedBranchTest(unittest.TestCase):
             cfg = load_config(path)
             result = run_pipeline(cfg, runner=runner)
             self.assertTrue(result["complete"])
+            self.assertEqual(result["planned_rounds"], rounds)
+            self.assertEqual(len(result["rounds"]), rounds)
+            self.assertEqual(result["final_inference"]["checkpoint"], result["latest"])
+            self.assertEqual(result["final_inference"]["queries"], 2)
             for i in range(result["planned_rounds"]):
                 directory = root / f"run/round-{i:03d}"
                 mixed = list(iter_json_records(directory / "mixed_preferences.jsonl"))
-                annotated = list(iter_json_records(directory / "branch_preferences.jsonl"))
                 mined = list(iter_json_records(directory / "preferences.jsonl"))
                 self.assertTrue(all(n <= 4 for n in Counter(r["query_key"] for r in mined).values()))
+                self.assertTrue(all(r["model_positive_rank"] is None or
+                                    r["model_rank"] < r["model_positive_rank"] for r in mined))
                 self.assertTrue(all(n <= 6 for n in Counter(r["query_key"] for r in mixed).values()))
                 self.assertEqual(result["rounds"][i]["optimizer_steps"], (len(mixed) + 1) // 2)
                 self.assertEqual(result["rounds"][i]["completed_training_epochs"], i + 1)
-                self.assertEqual(len(mixed), len(annotated))
-                self.assertEqual({r["negative_source"] for r in annotated}, {"bm25", "model_confusion"})
-                self.assertTrue(any(r["branch_active"] for r in annotated))
-                self.assertEqual(read_json(directory / "branch_audit.json")["sequence_rows"], len(mixed))
+                self.assertEqual({r["negative_source"] for r in mixed}, {"bm25", "model_confusion"})
+                if arm == "branch":
+                    annotated = list(iter_json_records(directory / "branch_preferences.jsonl"))
+                    self.assertEqual(len(mixed), len(annotated))
+                    self.assertTrue(any(r["branch_active"] for r in annotated))
+                    self.assertEqual(read_json(directory / "branch_audit.json")["sequence_rows"], len(mixed))
+                else:
+                    self.assertFalse((directory / "branch_preferences.jsonl").exists())
+                    nll_logs = [row["nll_loss"] for row in read_json(
+                        directory / "training/trainer_state.json")["log_history"] if "nll_loss" in row]
+                    self.assertTrue(nll_logs)
+                    self.assertTrue(all(value > 0 for value in nll_logs))
             final_stats = read_json(root / f"run/round-{result['planned_rounds'] - 1:03d}/infer_predictions.stats.json")
             self.assertFalse(final_stats["beam_early_stopping"])
+            predictions = root / f"run/round-{rounds - 1:03d}/infer_predictions.jsonl"
+            self.assertEqual(len(list(iter_json_records(predictions))), 2)
             self.assertIn("hit@5", result["final_inference"]["metrics"])
             calls.clear()
             run_pipeline(cfg, resume=True, runner=runner)
             self.assertFalse(calls)
+            return ([file_hash(root / f"run/round-{i:03d}/queries.jsonl") for i in range(rounds)],
+                    file_hash(root / "run/metadata/infer_queries.jsonl"))
 
 
 if __name__ == "__main__":

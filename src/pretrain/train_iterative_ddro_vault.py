@@ -31,6 +31,7 @@ from pretrain.checkpoint_retention import checkpoint_pruned, prune_round_checkpo
 DEFAULTS = {
     "initial_reference_checkpoint": None,
     "infer_file": None,
+    "infer_max_samples": None,
     "bm25_file": None, "bm25_negatives_per_query": 2,
     "policy_mining_negatives_per_query": None,
     "keep_last_round_checkpoints": None,
@@ -291,7 +292,7 @@ def load_config(path: Path) -> dict:
     if cfg["id_mode"] not in {"auto", "numeric", "text_id"}:
         raise ValueError("Invalid id_mode")
     training = cfg["training"]
-    branch_keys = {"preference_objective", "branch_loss_weight", "branch_beta"}
+    branch_keys = {"preference_objective", "branch_loss_weight", "branch_beta", "rpo_alpha"}
     if training.keys() - TRAIN_DEFAULTS.keys() - branch_keys:
         raise ValueError(f"Unsupported training options: {training.keys() - TRAIN_DEFAULTS.keys() - branch_keys}")
     cfg["training"] = {**TRAIN_DEFAULTS, **training}
@@ -309,6 +310,10 @@ def load_config(path: Path) -> dict:
         value = cfg["training"]["branch_beta"]
         if type(value) not in {int, float} or not math.isfinite(value) or value <= 0:
             raise ValueError("branch_beta must be finite and positive")
+    if "rpo_alpha" in cfg["training"]:
+        value = cfg["training"]["rpo_alpha"]
+        if type(value) not in {int, float} or not math.isfinite(value) or value < 0:
+            raise ValueError("rpo_alpha must be finite and nonnegative")
     for key in ("rounds", "num_gpus", "num_beams", "negatives_per_query", "mining_batch_size",
                 "max_prompt_length", "max_target_length", "queries_per_round", "steps_per_round"):
         value = cfg[key]
@@ -351,6 +356,11 @@ def load_config(path: Path) -> dict:
             raise ValueError("infer_file must be null or a nonempty path")
         value = Path(cfg["infer_file"]).expanduser()
         cfg["infer_file"] = str((path.parent / value).resolve())
+    if cfg["infer_max_samples"] is not None:
+        if type(cfg["infer_max_samples"]) is not int or cfg["infer_max_samples"] <= 0:
+            raise ValueError("infer_max_samples must be null or a positive integer")
+        if not cfg["infer_file"]:
+            raise ValueError("infer_max_samples requires infer_file")
     if cfg["initial_reference_checkpoint"] is not None:
         value = Path(cfg["initial_reference_checkpoint"]).expanduser()
         cfg["initial_reference_checkpoint"] = str((path.parent / value).resolve())
@@ -497,13 +507,22 @@ def audit_pairs(path: Path, queries: list[dict], documents: Path, target_type: s
 
 def run_pipeline(cfg: dict, resume=False, prepare_only=False, runner=run_command, start_round=0,
                  extend_rounds=None, eval_every_rounds=None, eval_at_end=None,
-                 mining_batch_size=None, infer_file=None, keep_last_round_checkpoints=None) -> dict:
+                 mining_batch_size=None, infer_file=None, keep_last_round_checkpoints=None,
+                 infer_max_samples=None) -> dict:
     if type(start_round) is not int or start_round < 0:
         raise ValueError("start_round must be a nonnegative integer")
     if start_round and (not resume or prepare_only):
         raise ValueError("--start-round requires --resume and cannot be used with --prepare-only")
     if infer_file is not None:
         cfg = {**cfg, "infer_file": str(Path(infer_file).expanduser().resolve())}
+    if infer_max_samples is not None:
+        cfg = {**cfg, "infer_max_samples": infer_max_samples}
+    limit = cfg.get("infer_max_samples")
+    if limit is not None:
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("infer_max_samples must be null or a positive integer")
+        if not cfg.get("infer_file"):
+            raise ValueError("infer_max_samples requires infer_file")
     if keep_last_round_checkpoints is not None:
         if type(keep_last_round_checkpoints) is not int or keep_last_round_checkpoints < 0:
             raise ValueError("keep_last_round_checkpoints must be a nonnegative integer (0 keeps all)")
@@ -580,7 +599,7 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0, exte
             versions[package] = None
     # Final inference has its own identity. Adding it never changes a round's
     # training identity or uses its labels for mining/checkpoint selection.
-    ignored_config = {"infer_file"} | ({"bm25_file", "bm25_negatives_per_query"} if not cfg.get("bm25_file") else set())
+    ignored_config = {"infer_file", "infer_max_samples"} | ({"bm25_file", "bm25_negatives_per_query"} if not cfg.get("bm25_file") else set())
     if cfg.get("policy_mining_negatives_per_query") is None:
         ignored_config.add("policy_mining_negatives_per_query")
     if cfg.get("keep_last_round_checkpoints") is None:
@@ -643,15 +662,18 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0, exte
                               "corpus_hash": file_hash(documents), "target_type": cfg["target_type"],
                               "input_format": cfg["input_format"], "beam_early_stopping": False,
                               "preparation_code": file_hash(SRC / "pretrain/prepare_inference_queries.py")}
+        if cfg.get("infer_max_samples") is not None:
+            inference_identity["max_samples"] = cfg["infer_max_samples"]
         if (state.get("inference_identity") not in (None, inference_identity)
                 and "prepare-infer" in state["stages"]):
-            raise ValueError("Inference file, corpus, or preparation code changed")
+            raise ValueError("Inference file, sample limit, corpus, or preparation code changed")
         if state.get("inference_identity") != inference_identity:
             state["inference_identity"] = inference_identity
             state["complete"] = False
             atomic_json(manifest_path, state)
         stage("prepare-infer", [inference_queries, inference_audit], lambda: prepare_inference_queries(
-            cfg["infer_file"], documents, inference_queries, cfg["target_type"], cfg["input_format"]))
+            cfg["infer_file"], documents, inference_queries, cfg["target_type"], cfg["input_format"],
+            max_samples=cfg.get("infer_max_samples")))
     elif state.get("inference_identity"):
         raise ValueError("This run has INFER_FILE configured; provide the same --infer-file on resume")
     queries = coverage_queries if coverage_queries is not None else list(iter_json_records(training))
@@ -957,6 +979,7 @@ def main():
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--infer-file", help="Optional labeled query file evaluated only on the final policy")
+    parser.add_argument("--infer-max-samples", type=int, help="Evaluate only the first N inference records")
     parser.add_argument("--keep-last-round-checkpoints", type=int,
                         help="Keep only N latest checkpoint-bearing rounds; 0 disables pruning (resume-compatible)")
     parser.add_argument("--mining-batch-size", type=int,
@@ -977,6 +1000,7 @@ def main():
                  start_round=args.start_round, extend_rounds=args.extend_rounds,
                  eval_every_rounds=args.eval_every_rounds, eval_at_end=args.eval_at_end,
                  mining_batch_size=args.mining_batch_size, infer_file=args.infer_file,
+                 infer_max_samples=args.infer_max_samples,
                  keep_last_round_checkpoints=args.keep_last_round_checkpoints)
 
 

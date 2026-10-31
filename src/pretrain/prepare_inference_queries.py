@@ -1,6 +1,7 @@
 """Prepare final-only retrieval queries without changing training data or corpus."""
 
 import hashlib
+from itertools import islice
 import json
 from pathlib import Path
 import sys
@@ -13,7 +14,9 @@ from mine_model_confusion_negatives import build_document_targets
 from pretrain.iterative_dpo_utils import atomic_json, atomic_jsonl, file_hash
 
 
-def prepare_inference_queries(infer_file, document_metadata, output, target_type, input_format):
+def prepare_inference_queries(infer_file, document_metadata, output, target_type, input_format, max_samples=None):
+    if max_samples is not None and (type(max_samples) is not int or max_samples <= 0):
+        raise ValueError("infer_max_samples must be null or a positive integer")
     sources = {str(p): file_hash(p) for p in (infer_file, document_metadata)}
     documents = {row["text_id"]: row for row in iter_json_records(document_metadata)}
     _, target_to_id, invalid = build_document_targets(documents, target_type)
@@ -27,7 +30,7 @@ def prepare_inference_queries(infer_file, document_metadata, output, target_type
         return value
 
     rows, fallback_rows = [], 0
-    for index, raw in enumerate(iter_json_records(infer_file), 1):
+    for index, raw in enumerate(islice(iter_json_records(infer_file), max_samples), 1):
         prompt = raw.get("prompt", raw.get("text", raw.get("query", "")))
         if not isinstance(prompt, str) or not clean_prompt(prompt):
             raise ValueError(f"Empty or invalid inference query at record {index}")
@@ -63,6 +66,8 @@ def prepare_inference_queries(infer_file, document_metadata, output, target_type
         raise ValueError("Inference inputs changed while preparing queries")
     report = {"queries": len(rows), "single_label_fallback_rows": fallback_rows,
               "target_type": target_type, "input_format": input_format, "sources": sources}
+    if max_samples is not None:
+        report.update(max_samples=max_samples, selection="first_records")
     atomic_jsonl(output, rows)
     atomic_json(Path(output).with_suffix(".audit.json"), report)
     return report

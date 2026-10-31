@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Full-query branch DPO with BM25 + current-policy negatives.
+# DPO + SFT (ARM=sft) or DPO + branch preference (ARM=branch), with mixed negatives.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python}"
+ARM="${ARM:-sft}"
+SFT_LOSS_WEIGHT="${SFT_LOSS_WEIGHT:-1.0}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-/home/users/congthanh_le/scratch/veil/CodeGR/outputs/DSI_Ruby_url__qg_t5_url_max_lr/checkpoint-161800}"
 QUERY_FILE="${QUERY_FILE:-/home/users/congthanh_le/scratch/veil/CodeGR/data/updated_url/Ruby_merged_multilabel.jsonl}"
 BM25_FILE="${BM25_FILE:-/home/users/congthanh_le/scratch/east/ddro/data/vault_bm25/dpo_pairs_url.jsonl}"
@@ -15,13 +17,19 @@ TOTAL_TRAINING_NEGATIVES_PER_QUERY="${TOTAL_TRAINING_NEGATIVES_PER_QUERY:-10}"
 KEEP_LAST_ROUND_CHECKPOINTS="${KEEP_LAST_ROUND_CHECKPOINTS:-3}"
 LEARNING_RATE="${LEARNING_RATE:-2e-5}"
 QUERIES_PER_ROUND="${QUERIES_PER_ROUND:-10000}"
+ROUNDS="${ROUNDS:-all}"
+SEED="${SEED:-42}"
 REFERENCE_EMA_DECAY="${REFERENCE_EMA_DECAY:-1.0}"
 EVAL_EVERY_ROUNDS="${EVAL_EVERY_ROUNDS:-8}"
 INFER_FILE="${INFER_FILE:-/home/users/congthanh_le/scratch/veil/CodeGR/data/updated_url/Ruby_test_r32.0_multilabel.json}"
-OUTPUT_DIR="${OUTPUT_DIR:-/mnt/beegfs/scratch/congthanh_le/scratch/east/ddro/outputs/vault-url-branch-preference-full-bm25-mixed}"
+INFER_MAX_SAMPLES="${INFER_MAX_SAMPLES:-}"
+OUTPUT_DIR="${OUTPUT_DIR:-/mnt/beegfs/scratch/congthanh_le/scratch/east/ddro/outputs/vault-url-${ARM}-preference-mixed-outranking-r${ROUNDS}-seed${SEED}}"
 INFER_ARGS=()
 if [[ -n "${INFER_FILE:-}" ]]; then
   INFER_ARGS=(--infer-file "${INFER_FILE}")
+fi
+if [[ -n "${INFER_MAX_SAMPLES}" ]]; then
+  INFER_ARGS+=(--infer-max-samples "${INFER_MAX_SAMPLES}")
 fi
 if [[ -n "${EPOCHS_PER_ROUND:-}" ]]; then
   ROUND_BUDGET_ARGS=(--epochs-per-round "${EPOCHS_PER_ROUND}")
@@ -41,8 +49,9 @@ exec "${PYTHON_BIN}" -u "${REPO_ROOT}/src/pretrain/launch_branch_preference.py" 
   --policy-mining-negatives-per-query "${POLICY_MINING_NEGATIVES_PER_QUERY}" \
   --output-dir "${OUTPUT_DIR}" \
   --target-type url_based_id \
-  --arm branch \
-  --rounds all \
+  --arm "${ARM}" \
+  --sft-loss-weight "${SFT_LOSS_WEIGHT}" \
+  --rounds "${ROUNDS}" \
   --keep-last-round-checkpoints "${KEEP_LAST_ROUND_CHECKPOINTS}" \
   --queries-per-round "${QUERIES_PER_ROUND}" \
   --reference-ema-decay "${REFERENCE_EMA_DECAY}" \
@@ -69,5 +78,5 @@ exec "${PYTHON_BIN}" -u "${REPO_ROOT}/src/pretrain/launch_branch_preference.py" 
   --eval-at-end \
   --save-steps 100 \
   --logging-steps 10 \
-  --seed 42 \
+  --seed "${SEED}" \
   "${INFER_ARGS[@]}" "$@"

@@ -16,6 +16,8 @@ def build_parser():
     parser.add_argument("--checkpoint", required=True, help="Initial policy/reference checkpoint, e.g. your completed normal-DPO model")
     parser.add_argument("--query-file", required=True, help="Multilabel query JSON/JSONL")
     parser.add_argument("--infer-file", help="Optional final-only evaluation file; beam early stopping is disabled")
+    parser.add_argument("--infer-max-samples", type=int,
+                        help="Evaluate only the first N inference records (default: all; repeatable across runs)")
     parser.add_argument("--bm25-file", help="Optional BM25 preference JSONL, matched by prompt and chosen_<target-type>")
     parser.add_argument("--bm25-training-negatives-per-query", "--bm25-negatives-per-query",
                         dest="bm25_negatives_per_query", type=int, default=2,
@@ -23,7 +25,10 @@ def build_parser():
     parser.add_argument("--output-dir", required=True, help="Separate, initially empty directory for this arm")
     parser.add_argument("--target-type", default="url_based_id", help="ID column; requires positive_<column> labels")
     parser.add_argument("--corpus-file", action="append", default=[], help="Optional additional full-corpus metadata")
-    parser.add_argument("--arm", choices=["dpo", "zero", "branch"], default="branch")
+    parser.add_argument("--arm", choices=["dpo", "sft", "zero", "branch"], default="branch",
+                        help="sft: sequence DPO + chosen-token NLL; branch: sequence DPO + local preference")
+    parser.add_argument("--sft-loss-weight", type=float, default=1.0,
+                        help="Chosen-token NLL coefficient for --arm sft (TRL rpo_alpha)")
     parser.add_argument("--branch-loss-weight", type=float, default=0.1)
     parser.add_argument("--beta", type=float, default=0.4)
     parser.add_argument("--branch-beta", type=float)
@@ -80,7 +85,9 @@ def experiment_config(args):
                 "warmup_ratio": args.warmup_ratio, "save_steps": args.save_steps,
                 "logging_steps": args.logging_steps, "dataset_num_proc": 1,
                 "dataloader_num_workers": 0}
-    if args.arm != "dpo":
+    if args.arm == "sft":
+        training["rpo_alpha"] = args.sft_loss_weight
+    elif args.arm != "dpo":
         training.update(preference_objective="branch-dpo",
                         branch_loss_weight=0.0 if args.arm == "zero" else args.branch_loss_weight,
                         branch_beta=args.branch_beta if args.branch_beta is not None else args.beta)
@@ -107,6 +114,8 @@ def experiment_config(args):
         config.update(steps_per_round=None, epochs_per_round=args.epochs_per_round)
     if args.infer_file:
         config["infer_file"] = str(Path(args.infer_file).resolve())
+    if args.infer_max_samples is not None:
+        config["infer_max_samples"] = args.infer_max_samples
     config["keep_last_round_checkpoints"] = args.keep_last_round_checkpoints
     if args.policy_mining_negatives_per_query is not None and args.policy_mining_negatives_per_query != args.negatives_per_query:
         config["policy_mining_negatives_per_query"] = args.policy_mining_negatives_per_query
@@ -127,12 +136,15 @@ def main():
         previous = read_json(config_path)
         if args.resume and not config.get("infer_file") and previous.get("infer_file"):
             config["infer_file"] = previous["infer_file"]
+        if args.resume and args.infer_max_samples is None and previous.get("infer_max_samples") is not None:
+            config["infer_max_samples"] = previous["infer_max_samples"]
         if previous != config and (args.resume or (output / "run_manifest.json").exists()):
-            runtime_keys = {"infer_file", "keep_last_round_checkpoints"}
+            runtime_keys = {"infer_file", "infer_max_samples", "keep_last_round_checkpoints"}
             same_training = ({k: v for k, v in previous.items() if k not in runtime_keys}
                              == {k: v for k, v in config.items() if k not in runtime_keys})
             adding_inference = args.resume and not previous.get("infer_file") and config.get("infer_file")
-            same_inference = previous.get("infer_file") == config.get("infer_file")
+            same_inference = (previous.get("infer_file") == config.get("infer_file")
+                              and previous.get("infer_max_samples") == config.get("infer_max_samples"))
             if not (args.resume and same_training and (same_inference or adding_inference)):
                 raise ValueError(f"Resolved config changed: {config_path}; use a separate output directory for another arm")
     if args.resume and not (output / "run_manifest.json").is_file():

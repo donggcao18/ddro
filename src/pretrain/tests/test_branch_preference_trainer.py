@@ -6,6 +6,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 SRC = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(SRC))
@@ -170,6 +171,45 @@ class BranchLossTest(unittest.TestCase):
 
 
 class ActualTrainerTest(unittest.TestCase):
+    def test_sft_entry_point_matches_dpo_plus_chosen_nll_loss_and_gradients(self):
+        from pretrain.train_ddro_vault import ChosenSFTDPOTrainer, parse_args, build_training_args
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            model, tokenizer = tiny_checkpoint(root / "model")
+            reference = deepcopy(model)
+            disable_t5_attention_dropout(model)
+            disable_t5_attention_dropout(reference)
+            with patch.object(sys, "argv", ["train", "--checkpoint_path", str(root / "model"),
+                    "--train_file", "pairs.jsonl", "--output_dir", str(root / "train"),
+                    "--rpo_alpha", "0.3", "--dataset_num_proc", "1", "--dataloader_num_workers", "0",
+                    "--max_prompt_length", "8", "--max_target_length", "8"]):
+                args = build_training_args(parse_args(), False)
+            args.use_cpu = True
+            rows = [{key: row[key] for key in ("prompt", "chosen", "rejected")}
+                    for row in annotated_rows(tokenizer, model)]
+            trainer = ChosenSFTDPOTrainer(model=model, ref_model=reference, args=args, tokenizer=tokenizer,
+                                 train_dataset=Dataset.from_list(rows), is_encoder_decoder=True)
+            batch = trainer._prepare_inputs(trainer.data_collator(list(trainer.train_dataset)))
+            actual, metrics = trainer.get_batch_loss_metrics(trainer.model, batch)
+            policy = trainer.concatenated_forward(trainer.model, batch)
+            with torch.no_grad():
+                ref = trainer.concatenated_forward(trainer.ref_model, batch)
+            dpo = trainer.dpo_loss(policy[0], policy[1], ref[0], ref[1])[0].mean()
+            nll = F.cross_entropy(policy[2].reshape(-1, policy[2].shape[-1]),
+                                  batch["chosen_labels"].reshape(-1), ignore_index=-100)
+            expected = dpo + 0.3 * nll
+            torch.testing.assert_close(actual, expected)
+            torch.testing.assert_close(metrics["nll_loss"], nll.detach())
+            parameters = [p for p in trainer.model.parameters() if p.requires_grad]
+            actual_grad = torch.autograd.grad(actual, parameters, allow_unused=True)
+            expected_grad = torch.autograd.grad(expected, parameters, allow_unused=True)
+            for left, right in zip(actual_grad, expected_grad):
+                if left is None:
+                    self.assertIsNone(right)
+                else:
+                    torch.testing.assert_close(left, right)
+            self.assertTrue(all(p.grad is None for p in trainer.ref_model.parameters()))
+
     def make_trainer(self, root, weight):
         model, tokenizer = tiny_checkpoint(root / "model")
         reference = deepcopy(model)

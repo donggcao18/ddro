@@ -59,6 +59,35 @@ class FakeTokenizer:
 
 
 class ModelConfusionHelperTest(unittest.TestCase):
+    def test_keeps_only_negatives_before_designated_positive(self):
+        mapping = {(i, 1): name for i, name in enumerate(
+            ("negative-a", "other-positive", "negative-b", "chosen", "negative-c"), 10)}
+        sequences = [[0, i, 1] for i in range(10, 15)]
+        selected, stats = select_model_candidates(
+            sequences, [-float(i) for i in range(5)], mapping,
+            {"chosen", "other-positive"}, 4, 0, 0, 1, chosen_target="chosen")
+        self.assertEqual([r["target"] for r in selected], ["negative-a", "negative-b"])
+        self.assertEqual([r["rank"] for r in selected], [1, 3])
+        self.assertTrue(all(r["positive_rank"] == 4 for r in selected))
+        self.assertEqual(stats["non_outranking_beams_filtered"], 1)
+
+    def test_top_one_designated_positive_has_no_policy_negatives(self):
+        selected, stats = select_model_candidates(
+            [[0, 10, 1], [0, 11, 1]], [0.0, -1.0],
+            {(10, 1): "chosen", (11, 1): "negative"}, {"chosen"},
+            4, 0, 0, 1, chosen_target="chosen")
+        self.assertEqual(selected, [])
+        self.assertEqual(stats["queries_with_top1_positive"], 1)
+
+    def test_missing_designated_positive_is_below_returned_beams(self):
+        selected, stats = select_model_candidates(
+            [[0, 10, 1], [0, 11, 1], [0, 12, 1]], [0.0, -1.0, -2.0],
+            {(10, 1): "other-positive", (11, 1): "negative-a", (12, 1): "negative-b"},
+            {"chosen", "other-positive"}, 1, 0, 0, 1, chosen_target="chosen")
+        self.assertEqual([r["target"] for r in selected], ["negative-a"])
+        self.assertIsNone(selected[0]["positive_rank"])
+        self.assertEqual(stats["queries_with_chosen_outside_beams"], 1)
+
     def test_allow_collisions_keeps_shared_sequence_and_padding_lookup(self):
         tokenizer = FakeTokenizer({"a": [10, 0, 2, 1], "b": [10, 0, 2, 1], "c": [11, 1]})
         encoded, mapping, excluded, groups, _ = build_target_index(

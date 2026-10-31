@@ -18,6 +18,27 @@ from test_iterative_dpo import FixtureWorker, fixture
 
 
 class InferenceMetadataTest(unittest.TestCase):
+    def test_inference_limit_keeps_first_records_and_handles_short_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            atomic_jsonl(root / "docs.jsonl", [{"text_id": "a", "doc_id_type": "url_based_id"}])
+            atomic_jsonl(root / "infer.jsonl", [
+                {"text": f"query {i}", "url_based_id": "a"} for i in range(5)])
+            outputs = []
+            for limit in (2, 10, None):
+                report = prepare_inference_queries(root / "infer.jsonl", root / "docs.jsonl",
+                    root / "prepared.jsonl", "url_based_id", "multilabel", max_samples=limit)
+                rows = list(iter_json_records(root / "prepared.jsonl"))
+                self.assertEqual(report["queries"], min(limit or 5, 5))
+                self.assertEqual([row["infer_record"] for row in rows], list(range(1, len(rows) + 1)))
+                outputs.append(rows)
+            self.assertEqual(outputs[0], outputs[2][:2])
+            self.assertEqual(outputs[1], outputs[2])
+            for invalid in (0, -1, True, 1.5):
+                with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "positive integer"):
+                    prepare_inference_queries(root / "infer.jsonl", root / "docs.jsonl",
+                        root / "prepared.jsonl", "url_based_id", "multilabel", max_samples=invalid)
+
     def test_single_label_multilabel_and_duplicates_for_both_id_designs(self):
         for target_type in ("url_based_id", "structure_id_v6"):
             with tempfile.TemporaryDirectory() as tmp, self.subTest(target_type=target_type):
@@ -53,6 +74,31 @@ class InferenceMetadataTest(unittest.TestCase):
 
 
 class FinalInferenceControllerTest(unittest.TestCase):
+    def test_limited_inference_is_fixed_on_resume_and_preserves_training(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path, cfg, worker = self.setup_run(root)
+            raw = read_json(path)
+            for invalid in (0, -1, True, 1.5):
+                atomic_json(path, {**raw, "infer_max_samples": invalid})
+                with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "infer_max_samples"):
+                    load_config(path)
+            atomic_json(path, {**raw, "infer_file": None, "infer_max_samples": 1})
+            with self.assertRaisesRegex(ValueError, "requires infer_file"):
+                load_config(path)
+            result = run_pipeline(cfg, runner=worker, infer_max_samples=1)
+            self.assertEqual(result["final_inference"]["queries"], 1)
+            self.assertNotIn("infer_max_samples", result["identity"]["config"])
+            self.assertEqual(result["inference_identity"]["max_samples"], 1)
+            saved = {p: file_hash(p) for p in (root / "run").rglob("*") if p.is_file()}
+            worker.calls.clear()
+            run_pipeline(cfg, runner=worker, resume=True, infer_max_samples=1)
+            self.assertFalse(worker.calls)
+            self.assertEqual({p: file_hash(p) for p in saved}, saved)
+            with self.assertRaisesRegex(ValueError, "sample limit.*changed"):
+                run_pipeline(cfg, runner=worker, resume=True, infer_max_samples=2)
+            self.assertFalse(worker.calls)
+
     def setup_run(self, root, infer=True):
         path = fixture(root)
         atomic_jsonl(root / "infer.jsonl", [

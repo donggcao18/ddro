@@ -4,8 +4,9 @@
 This is intentionally independent from the existing BM25 miner.  It loads the
 same Hugging Face checkpoint format as ``train_ddro_vault.py``, constrains beam
 search to tokenizer encodings of known Vault decoder targets, filters every
-known positive, and writes zero to ``--negatives-per-query`` model-confusion
-pairs for each query. A later combiner can fill any shortfall with BM25 pairs.
+known positive, and keeps only non-positives ranked ahead of the chosen target.
+If the chosen target is outside the returned beams, the returned candidates
+are treated as ahead of it. A later combiner can fill shortfalls with BM25 pairs.
 """
 
 from __future__ import annotations
@@ -231,23 +232,28 @@ def select_model_candidates(
     pad_token_id: int | None,
     eos_token_id: int | None,
     allow_pad_in_target: bool = False,
+    chosen_target: str | None = None,
 ) -> tuple[list[dict[str, Any]], Counter[str]]:
-    """Map beams to unique valid non-positive targets in model rank order."""
+    """Keep unique non-positives before chosen_target; absent chosen is below the beam list.
+
+    Omitting chosen_target preserves the legacy helper's unrestricted selection.
+    The training miner always supplies the chosen target for each emitted pair.
+    """
     selected: list[dict[str, Any]] = []
     seen: set[str] = set()
     counters: Counter[str] = Counter()
+    ranked_targets = [sequence_to_target.get(canonical_generated_tokens(
+        sequence, decoder_start_token_id, pad_token_id, eos_token_id, allow_pad_in_target,
+    )) for sequence in sequences]
+    positive_rank = next((rank for rank, target in enumerate(ranked_targets, 1)
+                          if target == chosen_target), None) if chosen_target is not None else None
+    if chosen_target is not None:
+        counters["queries_with_chosen_outside_beams" if positive_rank is None
+                 else "queries_with_chosen_in_beams"] += 1
 
-    for rank, (sequence, score) in enumerate(
-        zip(sequences, sequence_scores), start=1
+    for rank, (target, score) in enumerate(
+        zip(ranked_targets, sequence_scores), start=1
     ):
-        canonical = canonical_generated_tokens(
-            sequence,
-            decoder_start_token_id,
-            pad_token_id,
-            eos_token_id,
-            allow_pad_in_target,
-        )
-        target = sequence_to_target.get(canonical)
         if target is None:
             counters["unmapped_generation_sequences"] += 1
             continue
@@ -260,6 +266,9 @@ def select_model_candidates(
         if target in positive_targets:
             counters["positive_beams_filtered"] += 1
             continue
+        if positive_rank is not None and rank >= positive_rank:
+            counters["non_outranking_beams_filtered"] += 1
+            continue
         if target in seen:
             counters["duplicate_beams_filtered"] += 1
             continue
@@ -271,6 +280,8 @@ def select_model_candidates(
                 "score": None if score is None else float(score),
             }
         )
+        if chosen_target is not None:
+            selected[-1]["positive_rank"] = positive_rank
         if len(selected) == limit:
             break
 
@@ -611,6 +622,7 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                     # Any sequence shared with a positive is ineligible as a
                     # negative, even if its representative has another full ID.
                     positive_targets = {target_representatives.get(t, t) for t in positive_targets}
+                    primary_target = text_id_to_target[target_text_id]
                     candidates, selection_stats = select_model_candidates(
                         all_sequences[start:end],
                         all_scores[start:end],
@@ -621,6 +633,8 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                         tokenizer.pad_token_id,
                         tokenizer.eos_token_id,
                         allow_target_tokens,
+                        chosen_target=(None if args.pair_all_positives else
+                                       target_representatives.get(primary_target, primary_target)),
                     )
                     stats.update(selection_stats)
                     candidate_count_distribution[len(candidates)] += 1
@@ -649,7 +663,15 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                                 f"Chosen text_id={chosen_id!r} has no usable "
                                 f"{args.target_type} decoder target"
                             )
-                        for candidate in candidates:
+                        chosen_candidates = candidates
+                        if args.pair_all_positives:
+                            chosen_candidates, _ = select_model_candidates(
+                                all_sequences[start:end], all_scores[start:end], sequence_to_target,
+                                positive_targets, args.negatives_per_query, int(config.decoder_start_token_id),
+                                tokenizer.pad_token_id, tokenizer.eos_token_id, allow_target_tokens,
+                                chosen_target=target_representatives.get(chosen_target, chosen_target),
+                            )
+                        for candidate in chosen_candidates:
                             rejected_target = candidate["target"]
                             rejected_id = target_to_text_id[rejected_target]
                             rejected_metadata = document_rows[rejected_id]
@@ -665,6 +687,7 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
                                 "negative_source": "model_confusion",
                                 "target_type": args.target_type,
                                 "model_rank": candidate["rank"],
+                                "model_positive_rank": candidate["positive_rank"],
                                 "model_score": candidate["score"],
                                 "rejected_url_based_ids": rejected_metadata.get(
                                     "url_based_ids", []
@@ -727,6 +750,7 @@ def mine(args: argparse.Namespace) -> dict[str, Any]:
             "device": str(device),
             "num_beams": args.num_beams,
             "negatives_per_query": args.negatives_per_query,
+            "negative_selection": "before_chosen_or_beam_tail",
             "output": str(output_path),
             "seed": getattr(args, "seed", 42),
             "round_id": getattr(args, "round_id", None),

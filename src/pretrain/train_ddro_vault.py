@@ -45,6 +45,15 @@ except ImportError:  # Direct script entry point.
 PREFERENCE_COLUMNS = ("prompt", "chosen", "rejected")
 
 
+class ChosenSFTDPOTrainer(DPOTrainer):
+    @staticmethod
+    def get_batch_logps(logits, labels, label_pad_token_id=-100, is_encoder_decoder=False):
+        # TRL 0.11.4 replaces encoder-decoder label padding in place, then
+        # reuses those labels for RPO's NLL. Preserve its ignore_index mask.
+        return DPOTrainer.get_batch_logps(
+            logits, labels.clone(), label_pad_token_id, is_encoder_decoder)
+
+
 def positive_float(value: str) -> float:
     parsed = float(value)
     if parsed <= 0:
@@ -110,6 +119,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--warmup_ratio", type=unit_interval, default=0.1)
     parser.add_argument("--beta", type=positive_float, default=0.4)
+    parser.add_argument("--rpo_alpha", type=nonnegative_float, default=None,
+                        help="Add this weight times chosen-token mean NLL to DPO (TRL RPO)")
     parser.add_argument("--preference_objective", choices=["dpo", "branch-dpo"], default="dpo")
     parser.add_argument("--branch_loss_weight", type=nonnegative_float, default=0.1)
     parser.add_argument("--branch_beta", type=positive_float, default=None)
@@ -411,6 +422,7 @@ def build_training_args(args: argparse.Namespace, has_eval: bool) -> DPOConfig:
         max_grad_norm=args.max_grad_norm,
         lr_scheduler_type="cosine",
         beta=args.beta,
+        rpo_alpha=getattr(args, "rpo_alpha", None),
         loss_type="sigmoid",
         max_length=args.max_prompt_length + args.max_target_length,
         max_prompt_length=args.max_prompt_length,
@@ -628,7 +640,7 @@ def train_round(args: argparse.Namespace) -> None:
             )
         )
 
-    trainer_class = DPOTrainer
+    trainer_class = ChosenSFTDPOTrainer if args.rpo_alpha is not None else DPOTrainer
     if args.preference_objective == "branch-dpo":
         try:
             from .branch_preference_trainer import BranchDPOTrainer

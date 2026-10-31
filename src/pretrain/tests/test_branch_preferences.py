@@ -182,15 +182,18 @@ class BranchConfigTest(unittest.TestCase):
             original = experiment_config(build_parser().parse_args(argv))
             atomic_json(root / "run.config.json", original)
             atomic_json(root / "run/run_manifest.json", {})
-            with patch.object(sys, "argv", ["launcher", *argv, "--resume", "--infer-file", str(root / "infer.jsonl")]), \
+            with patch.object(sys, "argv", ["launcher", *argv, "--resume", "--infer-file", str(root / "infer.jsonl"),
+                                           "--infer-max-samples", "100"]), \
                  patch.object(launcher, "run_pipeline") as run:
                 launcher.main()
                 self.assertEqual(run.call_args.args[0]["infer_file"], str(root / "infer.jsonl"))
+                self.assertEqual(run.call_args.args[0]["infer_max_samples"], 100)
                 self.assertEqual(run.call_args.args[0]["training"]["learning_rate"], original["training"]["learning_rate"])
             with patch.object(sys, "argv", ["launcher", *argv, "--resume"]), \
                  patch.object(launcher, "run_pipeline") as run:
                 launcher.main()
                 self.assertEqual(run.call_args.args[0]["infer_file"], str(root / "infer.jsonl"))
+                self.assertEqual(run.call_args.args[0]["infer_max_samples"], 100)
 
 
 if __name__ == "__main__":
