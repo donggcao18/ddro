@@ -173,6 +173,14 @@ bash scripts/ddro/slurm_submit_ddro_training.sh
 
 DDRO is implemented using a custom version of HuggingFace's [DPOTrainer](https://github.com/huggingface/trl).
 
+### Alternative — rule-based GRPO
+
+For Vault T5/CodeT5 retrieval, GRPO can train directly from query-level positive
+sets: sample valid document IDs and reward any known positive with 1, otherwise
+0. No reward model or mined negative pairs are required. See the
+[GRPO training guide](src/scripts/grpo/README.md) for data preparation, single-GPU
+training, the four-V100 launcher, and checkpoint resumption.
+
 ---
 
 ## Evaluation
