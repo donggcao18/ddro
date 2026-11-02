@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -20,6 +21,7 @@ from transformers import PreTrainedTokenizerFast, T5Config, T5ForConditionalGene
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from pretrain.train_grpo_vault import build_trainer, main, parse_args
+from pretrain.calibrate_grpo_batch_size import largest_fitting_batch, probe_once
 from scripts.bm25.the_vault.common import write_jsonl
 from utils.grpo_data import consolidate_queries, prepare_metadata, split_queries, validate_query_sets
 from utils.grpo_trainer import (
@@ -96,6 +98,21 @@ class DataTests(unittest.TestCase):
 
 
 class ObjectiveTests(unittest.TestCase):
+    def test_memory_calibration_finds_largest_integer_batch(self):
+        for capacity in range(1, 34):
+            trials = []
+
+            def probe(batch_size):
+                trials.append(batch_size)
+                return batch_size <= capacity
+
+            self.assertEqual(largest_fitting_batch(16, 32, probe), min(capacity, 32))
+            self.assertTrue(all(1 <= value <= 32 for value in trials))
+        with self.assertRaisesRegex(RuntimeError, "one query"):
+            largest_fitting_batch(16, 32, lambda batch_size: False)
+        with self.assertRaises(ValueError):
+            largest_fitting_batch(32, 16, lambda batch_size: True)
+
     def test_advantages_and_eos_mask(self):
         rewards = torch.tensor([1., 0., 1., 0., 0., 0., 0., 0., 1., 1., 1., 1.])
         advantages = group_advantages(rewards, 4)
@@ -184,6 +201,28 @@ class TinyT5Tests(unittest.TestCase):
             TargetIndex(self.tokenizer, self.config, ["absent"], 3)
         with self.assertRaisesRegex(ValueError, "at least 2"):
             GRPOSettings(num_generations=1)
+
+    def test_capacity_probe_steps_and_oom_cleanup_on_cpu(self):
+        # Exercise actual generation, backward and AdamW. Only GPU accounting is
+        # replaced; this does not claim to validate CUDA capacity or FP16.
+        args = SimpleNamespace(
+            checkpoint_path=str(self.root / "sft"), beta=0.0, reserve_gib=0,
+            num_gpus=1, fp16=False, max_prompt_length=8, num_generations=4,
+            temperature=.7,
+        )
+        original = T5ForConditionalGeneration.from_pretrained(self.root / "sft").shared.weight.detach().clone()
+        with patch("torch.cuda.reset_peak_memory_stats"), patch("torch.cuda.synchronize"), \
+                patch("torch.cuda.max_memory_allocated", return_value=123):
+            for beta in (0.0, .1):
+                args.beta = beta
+                fits, peak = probe_once(args, self.index, torch.device("cpu"), 2)
+                self.assertTrue(fits)
+                self.assertEqual(peak, 123)
+            with patch("pretrain.calibrate_grpo_batch_size.AutoModelForSeq2SeqLM.from_pretrained",
+                       side_effect=torch.cuda.OutOfMemoryError("synthetic OOM")):
+                self.assertEqual(probe_once(args, self.index, torch.device("cpu"), 2), (False, 123))
+        restored = T5ForConditionalGeneration.from_pretrained(self.root / "sft")
+        torch.testing.assert_close(restored.shared.weight, original)
 
     def test_sampling_and_teacher_forcing_probabilities_match(self):
         trainer = self.trainer()

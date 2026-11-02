@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from scripts.bm25.the_vault.common import (
+    CODE_PREFIX_RE,
     clean_prompt,
     document_targets,
     iter_json_records,
@@ -16,6 +17,47 @@ from scripts.bm25.the_vault.common import (
 
 
 TARGET_TYPES = ("text_id", "url", "structure_id_v3", "structure_id_v6")
+
+
+def _url_values(value: Any, field: str, row_number: int) -> list[str]:
+    """Keep URL labels as strings; never convert nested metadata into an ID."""
+    values = value if isinstance(value, list) else [value]
+    if any(item is not None and not isinstance(item, str) for item in values):
+        raise ValueError(f"Row {row_number}: {field} must contain a string or list of strings")
+    return sorted({item.strip() for item in values if isinstance(item, str) and item.strip()})
+
+
+def prepare_url_file(
+    path: str | Path, include_positive_targets_in_corpus: bool = True
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Read native Vault rows directly, without numeric/semantic-ID joins.
+
+    Training catalog: union of row URLs and annotated positive URLs. Evaluation
+    can disable label-derived catalog entries and use test row URLs only, keeping
+    test positive labels separate from candidate construction.
+    """
+    queries: list[dict[str, Any]] = []
+    corpus: set[str] = set()
+    for number, row in enumerate(iter_json_records(path), 1):
+        corpus.update(_url_values(row.get("url_based_id"), "url_based_id", number))
+        raw_text = row.get("text")
+        if not isinstance(raw_text, str):
+            raise ValueError(f"Row {number}: text must be a query string")
+        # Original indexed files can include Code: rows; they add corpus IDs,
+        # but must not become code-to-ID training/evaluation queries.
+        if CODE_PREFIX_RE.match(raw_text):
+            continue
+        positives = _url_values(row.get("positive_url_based_id"), "positive_url_based_id", number)
+        if not positives:
+            raise ValueError(f"Row {number}: positive_url_based_id must contain at least one URL")
+        prompt = clean_prompt(raw_text)
+        if not prompt:
+            raise ValueError(f"Row {number}: empty query text")
+        queries.append({"prompt": prompt, "positive_targets": positives})
+        if include_positive_targets_in_corpus:
+            corpus.update(positives)
+    queries = consolidate_queries(queries)
+    return queries, sorted(corpus)
 
 
 def consolidate_queries(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
