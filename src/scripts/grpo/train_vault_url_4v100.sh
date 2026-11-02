@@ -10,7 +10,7 @@ WORK_DIR="${WORK_DIR:-/home/users/congthanh_le/scratch/veil/CodeGR/data/updated_
 TRAIN_INPUT_FILE="${TRAIN_INPUT_FILE:-${WORK_DIR}/Ruby_merged_multilabel_dpo.jsonl}"
 TEST_INPUT_FILE="${TEST_INPUT_FILE:-${WORK_DIR}/Ruby_test_r32.0_multilabel.json}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-/home/users/congthanh_le/scratch/veil/CodeGR/outputs/DSI_Ruby_url__qg_t5_url_max_lr_sft_3_5/checkpoint-96600}"
-OUTPUT_DIR="${OUTPUT_DIR:-/mnt/beegfs/scratch/congthanh_le/scratch/east/ddro/outputs/vault-ruby-grpo-url}"
+OUTPUT_DIR="${OUTPUT_DIR:-/mnt/beegfs/scratch/congthanh_le/scratch/east/ddro/outputs/vault-ruby-grpo-url-1e-5}"
 GRPO_DATA_DIR="${GRPO_DATA_DIR:-${OUTPUT_DIR}/grpo_data}"
 GRPO_PYTHON_BIN="${GRPO_PYTHON_BIN:-${PYTHON_BIN:-python}}"
 NUM_GPUS="${NUM_GPUS:-4}"
@@ -43,7 +43,7 @@ DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-2}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-2}"
 VALIDATION_SPLIT="${VALIDATION_SPLIT:-0.01}"
 # Conservative starting point for policy updates; tune after a pilot.
-LEARNING_RATE="${LEARNING_RATE:-1e-6}"
+LEARNING_RATE="${LEARNING_RATE:-1e-5}"
 # Regularize toward the frozen SFT checkpoint; GRPO_BETA=0 disables the reference.
 GRPO_BETA="${GRPO_BETA:-0.04}"
 EVAL_STEPS="${EVAL_STEPS:-2000}"
