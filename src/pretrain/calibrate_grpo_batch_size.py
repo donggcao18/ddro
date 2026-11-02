@@ -22,10 +22,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 from accelerate.utils import convert_to_fp32
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, GenerationConfig
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 from utils.grpo_data import load_corpus
-from utils.grpo_trainer import TargetIndex, completion_mask, constrained_logps, grpo_loss
+from utils.grpo_trainer import GRPOSettings, TargetIndex, completion_mask, constrained_logps, grpo_loss
 
 
 def largest_fitting_batch(start: int, maximum: int, probe: Callable[[int], bool]) -> int:
@@ -99,11 +99,11 @@ def probe_once(args: argparse.Namespace, index: TargetIndex, device: torch.devic
         inputs = torch.full((batch_size, args.max_prompt_length), content_id, dtype=torch.long, device=device)
         inputs[:, -1] = index.eos_id
         attention = torch.ones_like(inputs)
-        generation = GenerationConfig(
-            decoder_start_token_id=index.start_id, pad_token_id=index.pad_id, eos_token_id=index.eos_id,
-            do_sample=True, num_beams=1, num_return_sequences=args.num_generations,
-            top_k=0, temperature=args.temperature, max_new_tokens=len(longest), use_cache=True,
+        settings = GRPOSettings(
+            num_generations=args.num_generations, do_sample=args.do_sample == "true",
+            temperature=args.temperature, max_target_length=len(longest), beta=args.beta,
         )
+        generation = settings.rollout_generation_config(index)
 
         def force_longest(batch_id: int, prefix: torch.Tensor) -> list[int]:
             position = prefix.shape[0] - 1
@@ -117,6 +117,12 @@ def probe_once(args: argparse.Namespace, index: TargetIndex, device: torch.devic
                     input_ids=inputs, attention_mask=attention, generation_config=generation,
                     prefix_allowed_tokens_fn=force_longest,
                 )
+            if not settings.do_sample:
+                # A forced single path can leave -inf placeholder beam outputs.
+                # Generation above exercises the configured beam cache; use the
+                # full longest valid path for every backward row to probe memory.
+                sequences = torch.tensor([index.start_id, *longest], device=device).repeat(
+                    batch_size * args.num_generations, 1)
             mask = completion_mask(sequences[:, 1:], index.eos_id, index.pad_id)
             layout = index.score_layout(sequences)
             repeated = {
@@ -131,12 +137,12 @@ def probe_once(args: argparse.Namespace, index: TargetIndex, device: torch.devic
                 # Accelerator's native-AMP wrapper converts ModelOutput tensors
                 # back to FP32. Include that allocation in the capacity estimate.
                 outputs = convert_to_fp32(model(**repeated))
-                logps = constrained_logps(outputs.logits, layout, args.temperature)
+                logps = constrained_logps(outputs.logits, layout, settings.scoring_temperature)
                 ref_logps = None
                 if reference is not None:
                     with torch.no_grad():
                         ref_outputs = convert_to_fp32(reference(**repeated))
-                        ref_logps = constrained_logps(ref_outputs.logits, layout, args.temperature)
+                        ref_logps = constrained_logps(ref_outputs.logits, layout, settings.scoring_temperature)
                 # Artificial nonzero advantages exercise backward allocations;
                 # this is a capacity probe, not a source of training supervision.
                 loss, kl = grpo_loss(logps, logps.detach(), torch.ones(len(sequences), device=device),
@@ -170,6 +176,7 @@ def main() -> None:
     parser.add_argument("--output_file", required=True)
     parser.add_argument("--num_gpus", type=int, default=4)
     parser.add_argument("--num_generations", type=int, default=8)
+    parser.add_argument("--do_sample", type=str.lower, choices=("true", "false"), default="true")
     parser.add_argument("--max_prompt_length", type=int, default=256)
     parser.add_argument("--max_target_length", type=int, default=128)
     parser.add_argument("--invalid_target_policy", choices=("error", "skip"),
@@ -217,7 +224,7 @@ def main() -> None:
 
     chosen = largest_fitting_batch(args.start_batch_size, args.max_batch_size, probe)
     result = {
-        "batch_size": chosen, "num_generations": args.num_generations,
+        "batch_size": chosen, "num_generations": args.num_generations, "do_sample": args.do_sample == "true",
         "gpu": ordinal, "gpu_name": torch.cuda.get_device_name(device),
         "reserve_gib": args.reserve_gib, "max_batch_size": args.max_batch_size,
         "prompt_tokens": args.max_prompt_length,

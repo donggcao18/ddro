@@ -208,16 +208,19 @@ class TinyT5Tests(unittest.TestCase):
         args = SimpleNamespace(
             checkpoint_path=str(self.root / "sft"), beta=0.0, reserve_gib=0,
             num_gpus=1, fp16=False, max_prompt_length=8, num_generations=4,
-            temperature=.7,
+            temperature=.7, do_sample="true",
         )
         original = T5ForConditionalGeneration.from_pretrained(self.root / "sft").shared.weight.detach().clone()
         with patch("torch.cuda.reset_peak_memory_stats"), patch("torch.cuda.synchronize"), \
                 patch("torch.cuda.max_memory_allocated", return_value=123):
-            for beta in (0.0, .1):
-                args.beta = beta
-                fits, peak = probe_once(args, self.index, torch.device("cpu"), 2)
-                self.assertTrue(fits)
-                self.assertEqual(peak, 123)
+            for mode in ("true", "false"):
+                args.do_sample = mode
+                args.num_generations = 4 if mode == "true" else 3
+                for beta in (0.0, .1):
+                    args.beta = beta
+                    fits, peak = probe_once(args, self.index, torch.device("cpu"), 2)
+                    self.assertTrue(fits)
+                    self.assertEqual(peak, 123)
             with patch("pretrain.calibrate_grpo_batch_size.AutoModelForSeq2SeqLM.from_pretrained",
                        side_effect=torch.cuda.OutOfMemoryError("synthetic OOM")):
                 self.assertEqual(probe_once(args, self.index, torch.device("cpu"), 2), (False, 123))
@@ -260,6 +263,54 @@ class TinyT5Tests(unittest.TestCase):
         first = model(input_ids=inputs["input_ids"], decoder_input_ids=torch.tensor([[0, 4]])).logits
         second = model(input_ids=inputs["input_ids"], decoder_input_ids=torch.tensor([[0, 4]])).logits
         torch.testing.assert_close(first, second, atol=0, rtol=0)
+
+    def test_deterministic_beam_rollouts_and_group_alignment(self):
+        trainer = self.trainer(extra=["--do_sample", "False", "--num_generations", "3"])
+        # Shared prefixes and variable lengths must produce valid, distinct IDs.
+        index = TargetIndex(self.tokenizer, self.config, ["alpha", "alpha beta", "gamma"], 3)
+        trainer.target_index = index
+        inputs = trainer._prepare_inputs(trainer.data_collator([
+            {"prompt": "find first", "positive_targets": ["alpha", "alpha beta"]},
+            {"prompt": "find second", "positive_targets": ["gamma"]},
+        ]))
+        config = trainer.generation_config(True)
+        self.assertFalse(config.do_sample)
+        self.assertEqual((config.num_beams, config.num_return_sequences), (3, 3))
+        self.assertEqual(trainer.grpo.scoring_temperature, 1.0)
+        torch.manual_seed(5)
+        first = trainer.generate_sequences(trainer.model, inputs, training=True)
+        torch.manual_seed(77)
+        second = trainer.generate_sequences(trainer.model, inputs, training=True)
+        torch.testing.assert_close(first, second, atol=0, rtol=0)
+        self.assertEqual(len(first), 6)
+        for group in first.reshape(2, 3, -1):
+            targets = [index.sequence_to_target[index.canonical(row)] for row in group.tolist()]
+            self.assertEqual(set(targets), {"alpha", "alpha beta", "gamma"})
+        rewards = index.rewards(first, inputs["positive_targets"], 3).reshape(2, 3)
+        self.assertEqual(rewards.sum(1).tolist(), [2., 1.])
+        loss = trainer.compute_loss(trainer.model, inputs)
+        loss.backward()
+        gradients = [p.grad for p in trainer.model.parameters() if p.grad is not None]
+        self.assertTrue(all(torch.isfinite(grad).all() for grad in gradients))
+        self.assertTrue(any(grad.abs().sum() > 0 for grad in gradients))
+        manifest = json.loads((self.root / "run/grpo_run.json").read_text())
+        self.assertEqual(manifest["rollout_mode"], "beam_selected_variant")
+        self.assertFalse(manifest["grpo"]["do_sample"])
+        self.assertEqual(manifest["scoring_temperature"], 1.)
+        with self.assertRaisesRegex(ValueError, "usable corpus targets"):
+            self.trainer("too-many-beams", ["--do_sample", "false"])
+
+    def test_beam_training_evaluation_checkpoint_and_resume(self):
+        options = ["--do_sample", "false", "--num_generations", "3"]
+        trainer = self.trainer("beam", options)
+        original = trainer.model.shared.weight.detach().clone()
+        trainer.train()
+        self.assertFalse(torch.equal(original, trainer.model.shared.weight))
+        self.assertEqual(trainer.evaluate()["eval_recall@k"], 1.)
+        self.assertTrue((self.root / "beam/checkpoint-2/optimizer.pt").is_file())
+        resumed = self.trainer("beam-resumed", options + ["--max_steps", "3"])
+        resumed.train(resume_from_checkpoint=str(self.root / "beam/checkpoint-2"))
+        self.assertEqual(resumed.state.global_step, 3)
 
     def test_training_evaluation_save_and_resume(self):
         trainer = self.trainer()

@@ -33,6 +33,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--invalid_target_policy", choices=("error", "skip"),
                         default=os.environ.get("GRPO_INVALID_TARGET_POLICY", "error"))
     parser.add_argument("--num_generations", type=int, default=8)
+    parser.add_argument("--do_sample", type=str.lower, choices=("true", "false"), default="true",
+                        help="true: independent samples; false: deterministic num_generations-beam training variant.")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--epsilon", type=float, default=0.2)
     parser.add_argument("--beta", type=float, default=0.0, help="Optional frozen-SFT KL penalty; zero loads no reference model.")
@@ -58,7 +60,7 @@ def parse_args() -> argparse.Namespace:
     precision.add_argument("--fp16", action="store_true")
     precision.add_argument("--bf16", action="store_true")
     parser.add_argument("--resume_from_checkpoint", nargs="?", const=True, default=None)
-    parser.add_argument("--dry_run", action="store_true", help="Validate data/model and sample one query batch; do not optimize.")
+    parser.add_argument("--dry_run", action="store_true", help="Validate data/model and generate one query batch; do not optimize.")
     return parser.parse_args()
 
 
@@ -68,7 +70,7 @@ def build_trainer(args: argparse.Namespace) -> Seq2SeqGRPOTrainer:
     if min(args.logging_steps, args.save_steps, args.eval_steps) < 1:
         raise ValueError("Logging, save, and evaluation steps must be positive")
     settings = GRPOSettings(
-        num_generations=args.num_generations, temperature=args.temperature,
+        num_generations=args.num_generations, do_sample=args.do_sample == "true", temperature=args.temperature,
         max_target_length=args.max_target_length, epsilon=args.epsilon,
         beta=args.beta, eval_num_beams=args.eval_num_beams,
     )
@@ -162,6 +164,8 @@ def build_trainer(args: argparse.Namespace) -> Seq2SeqGRPOTrainer:
         destination.mkdir(parents=True, exist_ok=True)
         manifest = {
             "arguments": vars(args), "grpo": asdict(settings),
+            "rollout_mode": "sampled_grpo" if settings.do_sample else "beam_selected_variant",
+            "scoring_temperature": settings.scoring_temperature,
             "train_queries": len(train), "validation_queries": len(validation),
             "corpus_targets": len(allowed_targets),
             "target_filtering": index.filtering_summary, "query_filtering": query_filtering,
@@ -170,6 +174,9 @@ def build_trainer(args: argparse.Namespace) -> Seq2SeqGRPOTrainer:
         }
         (destination / "grpo_run.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(manifest, indent=2))
+        if not settings.do_sample:
+            print("Deterministic beam rollouts enabled: this selection-biased variant is not on-policy sampled GRPO. "
+                  "Temperature is ignored; signed group advantages are retained.")
     return trainer
 
 
@@ -179,7 +186,7 @@ def main() -> None:
     if args.dry_run:
         inputs = trainer._prepare_inputs(next(iter(trainer.get_train_dataloader())))
         with trainer.compute_loss_context_manager():
-            sequences = trainer.generate_sequences(trainer.model, inputs, sampling=True)
+            sequences = trainer.generate_sequences(trainer.model, inputs, training=True)
         rewards = trainer.target_index.rewards(sequences, inputs["positive_targets"], args.num_generations)
         if trainer.is_world_process_zero():
             print("Dry-run targets:", [trainer.target_index.sequence_to_target.get(trainer.target_index.canonical(row)) for row in sequences.cpu().tolist()])

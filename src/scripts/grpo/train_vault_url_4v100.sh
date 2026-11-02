@@ -26,6 +26,8 @@ if [[ "${GRPO_INVALID_TARGET_POLICY}" != skip && "${GRPO_INVALID_TARGET_POLICY}"
 fi
 export GRPO_INVALID_TARGET_POLICY
 NUM_GENERATIONS="${NUM_GENERATIONS:-8}"
+# Deterministic beam candidates by default; DO_SAMPLE=true restores sampled GRPO.
+DO_SAMPLE="${DO_SAMPLE:-false}"
 # Start at the DDRO query batch, then calibrate capacity on the allocated GPUs.
 # 16 queries * 8 rollouts = 128 trajectories per GPU, not 16 DPO pairs.
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
@@ -39,7 +41,7 @@ GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-2}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-2}"
 VALIDATION_SPLIT="${VALIDATION_SPLIT:-0.01}"
-# Conservative starting point for sampled policy gradients; tune after a pilot.
+# Conservative starting point for policy updates; tune after a pilot.
 LEARNING_RATE="${LEARNING_RATE:-1e-6}"
 # GRPO beta is a KL coefficient, not the DPO preference temperature.
 GRPO_BETA="${GRPO_BETA:-0.0}"

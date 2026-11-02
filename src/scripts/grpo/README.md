@@ -331,12 +331,40 @@ resume example with the batch recorded in that run's `grpo_run.json` or
 `batch_size_probe.json`. Reusing the same batch preserves the data-loader resume
 position; use calibration for a new run rather than changing the batch mid-run.
 
+## Deterministic training rollouts
+
+The URL launcher now defaults to `DO_SAMPLE=false`. It uses deterministic
+constrained beam search with `num_beams=NUM_GENERATIONS` and returns that many
+candidates per query, rather than repeating greedy decoding. For example:
+
+```bash
+DO_SAMPLE=false NUM_GENERATIONS=8 \
+bash src/scripts/grpo/train_vault_url_4v100.sh
+```
+
+`DO_SAMPLE=true` restores independent sampled GRPO. The shared and structure-v6
+launchers still default to sampling. Direct Python training and calibration
+accept `--do_sample false` (default: `true`). Dry runs and memory calibration
+use the selected training mode, and run manifests record it. Calibration should
+be rerun for a new beam experiment because generation memory differs. Use a new
+`OUTPUT_DIR` to compare it with an existing sampled run.
+
+Beam rollouts retain binary multi-positive rewards and **signed** group
+advantages. They are an experimental selection-biased variant, not standard
+on-policy sampled GRPO; the token-level ratio does not correct beam selection.
+Temperature is ignored for beam decoding and scoring uses temperature 1.
+Beam scores use `length_penalty=0`. `NUM_GENERATIONS` must not exceed the usable
+corpus target count. The separate evaluation/inference beam settings are unchanged.
+Beam candidates can still all receive the same reward, producing zero relevance
+advantages, and the centered loss can still log zero with nonzero gradients.
+
 ## Objective and diagnostics
 
 The objective uses group-centered rewards divided by group population std plus
 `1e-4`, the clipped token-level policy surrogate, and trajectory-then-batch
-averaging. It uses one fresh on-policy rollout per training microbatch, equivalent
-to the **single-iteration GRPO regime**. Old-policy log probabilities are the
+averaging. In sampling mode it uses fresh on-policy rollouts per training
+microbatch, equivalent to the **single-iteration GRPO regime**. In beam mode the
+same surrogate is applied to deterministically selected candidates. Old-policy log probabilities are the
 detached current-policy scores because no update occurs between sampling and
 scoring; there is no stale rollout cache or multi-iteration replay. Consequently,
 ratios start at one and clipping does not activate in this initial version.

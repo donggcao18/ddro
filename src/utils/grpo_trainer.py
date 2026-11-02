@@ -1,7 +1,8 @@
 """Encoder-decoder GRPO using Transformers Trainer for optimization and DDP.
 
-Each microbatch uses fresh on-policy rollouts, with one loss evaluation per
-rollout (the num_iterations=1 GRPO regime). No reward or value model is used.
+Each microbatch uses fresh rollouts, with one loss evaluation per rollout.
+Sampling is the on-policy GRPO regime; deterministic beam rollouts are an
+experimental selection-biased variant. No reward or value model is used.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from utils.trie import Trie
 @dataclass
 class GRPOSettings:
     num_generations: int = 8
+    do_sample: bool = True
     temperature: float = 1.0
     max_target_length: int = 128
     epsilon: float = 0.2
@@ -39,6 +41,27 @@ class GRPOSettings:
             raise ValueError("temperature and max_target_length must be positive")
         if not 0 < self.epsilon < 1 or self.beta < 0 or self.eval_num_beams < 1:
             raise ValueError("Require 0 < epsilon < 1, beta >= 0, and eval_num_beams >= 1")
+
+    @property
+    def scoring_temperature(self) -> float:
+        # Transformers does not apply temperature during deterministic decoding.
+        return self.temperature if self.do_sample else 1.0
+
+    def rollout_generation_config(self, index: TargetIndex) -> GenerationConfig:
+        if not self.do_sample and self.num_generations > len(index.sequence_to_target):
+            raise ValueError("Deterministic rollouts require num_generations <= usable corpus targets; "
+                             "reduce num_generations or use do_sample=true")
+        return GenerationConfig(
+            decoder_start_token_id=index.start_id,
+            pad_token_id=index.pad_id, eos_token_id=index.eos_id,
+            max_new_tokens=self.max_target_length,
+            do_sample=self.do_sample,
+            num_beams=1 if self.do_sample else self.num_generations,
+            num_return_sequences=self.num_generations,
+            temperature=self.scoring_temperature,
+            top_k=0 if self.do_sample else 50, top_p=1.0,
+            length_penalty=1.0 if self.do_sample else 0.0, use_cache=True,
+        )
 
 
 def group_advantages(rewards: torch.Tensor, group_size: int) -> torch.Tensor:
@@ -272,6 +295,8 @@ class Seq2SeqGRPOTrainer(Trainer):
             raise ValueError("This trainer supports single-device and DDP training, not DeepSpeed/FSDP")
         self.target_index = target_index
         self.grpo = grpo
+        # Validate deterministic group capacity before the first rollout.
+        grpo.rollout_generation_config(target_index)
         self.reference_model = reference_model
         self._rollout_metrics: dict[str, list[float]] = defaultdict(list)
         self.model_accepts_loss_kwargs = False
@@ -291,21 +316,21 @@ class Seq2SeqGRPOTrainer(Trainer):
             self.reference_model = self.accelerator.prepare_model(reference_model, evaluation_mode=True)
         self.compute_metrics = retrieval_metrics
 
-    def generation_config(self, sampling: bool) -> GenerationConfig:
+    def generation_config(self, training: bool) -> GenerationConfig:
         # A fresh config prevents inherited beam/forced-token/repetition settings
         # from silently changing the rollout distribution.
+        if training:
+            return self.grpo.rollout_generation_config(self.target_index)
+        beams = min(self.grpo.eval_num_beams, len(self.target_index.sequence_to_target))
         return GenerationConfig(
             decoder_start_token_id=self.target_index.start_id,
             pad_token_id=self.target_index.pad_id, eos_token_id=self.target_index.eos_id,
             max_new_tokens=self.grpo.max_target_length,
-            do_sample=sampling, num_beams=1 if sampling else min(self.grpo.eval_num_beams, len(self.target_index.sequence_to_target)),
-            num_return_sequences=self.grpo.num_generations if sampling else min(self.grpo.eval_num_beams, len(self.target_index.sequence_to_target)),
-            temperature=self.grpo.temperature if sampling else 1.0,
-            top_k=0 if sampling else 50, top_p=1.0,
-            length_penalty=1.0 if sampling else 0.0, use_cache=True,
+            do_sample=False, num_beams=beams, num_return_sequences=beams,
+            length_penalty=0.0, use_cache=True,
         )
 
-    def generate_sequences(self, model: nn.Module, inputs: dict[str, Any], sampling: bool) -> torch.Tensor:
+    def generate_sequences(self, model: nn.Module, inputs: dict[str, Any], training: bool) -> torch.Tensor:
         unwrapped = self.accelerator.unwrap_model(model)
         was_training = unwrapped.training
         unwrapped.eval()
@@ -313,7 +338,7 @@ class Seq2SeqGRPOTrainer(Trainer):
             with torch.no_grad():
                 return unwrapped.generate(
                     input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"],
-                    generation_config=self.generation_config(sampling),
+                    generation_config=self.generation_config(training),
                     prefix_allowed_tokens_fn=self.target_index.allowed,
                     synced_gpus=False,
                 )
@@ -322,7 +347,7 @@ class Seq2SeqGRPOTrainer(Trainer):
 
     def compute_loss(self, model: nn.Module, inputs: dict[str, Any], return_outputs: bool = False,
                      num_items_in_batch: Any = None) -> Any:
-        sequences = self.generate_sequences(model, inputs, sampling=True)
+        sequences = self.generate_sequences(model, inputs, training=True)
         group_size = self.grpo.num_generations
         repeated = {
             name: inputs[name].repeat_interleave(group_size, dim=0)
@@ -337,8 +362,9 @@ class Seq2SeqGRPOTrainer(Trainer):
         decoder_mask = torch.cat((torch.ones_like(mask[:, :1]), mask[:, :-1]), dim=1)
         outputs = model(**repeated, decoder_input_ids=decoder_inputs,
                         decoder_attention_mask=decoder_mask, use_cache=False)
-        logps = constrained_logps(outputs.logits, layout, self.grpo.temperature)
-        # One fresh rollout per microbatch: sampling and scoring share weights.
+        logps = constrained_logps(outputs.logits, layout, self.grpo.scoring_temperature)
+        # One fresh rollout per microbatch: generation and scoring share weights.
+        # Beam selection is biased; the ratio does not correct that selection.
         # detach retains the old-policy denominator, not its gradient.
         old_logps = logps.detach()
         reference_logps = None
@@ -348,7 +374,7 @@ class Seq2SeqGRPOTrainer(Trainer):
                     **repeated, decoder_input_ids=decoder_inputs,
                     decoder_attention_mask=decoder_mask, use_cache=False,
                 )
-                reference_logps = constrained_logps(ref_outputs.logits, layout, self.grpo.temperature)
+                reference_logps = constrained_logps(ref_outputs.logits, layout, self.grpo.scoring_temperature)
         loss, kl = grpo_loss(logps, old_logps, advantages, mask, self.grpo.epsilon,
                              self.grpo.beta, reference_logps)
         grouped = rewards.reshape(-1, group_size)
@@ -387,7 +413,7 @@ class Seq2SeqGRPOTrainer(Trainer):
                         ignore_keys: Any = None) -> tuple[Any, Any, Any]:
         inputs = self._prepare_inputs(inputs)
         with torch.no_grad(), self.compute_loss_context_manager():
-            sequences = self.generate_sequences(model, inputs, sampling=False)
+            sequences = self.generate_sequences(model, inputs, training=False)
         beams = self.generation_config(False).num_return_sequences
         scores = []
         canonical = [self.target_index.canonical(row) for row in sequences.cpu().tolist()]

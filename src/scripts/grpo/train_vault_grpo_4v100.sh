@@ -23,6 +23,12 @@ NUM_GPUS="${NUM_GPUS:-4}"
 PRECISION="${PRECISION:-fp16}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-256}"
 NUM_GENERATIONS="${NUM_GENERATIONS:-8}"
+DO_SAMPLE="${DO_SAMPLE:-true}"
+DO_SAMPLE="${DO_SAMPLE,,}"
+if [[ "${DO_SAMPLE}" != true && "${DO_SAMPLE}" != false ]]; then
+  echo "DO_SAMPLE must be true or false." >&2
+  exit 2
+fi
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1}"
 AUTO_TUNE_BATCH_SIZE="${AUTO_TUNE_BATCH_SIZE:-0}"
 MAX_TRAIN_BATCH_SIZE="${MAX_TRAIN_BATCH_SIZE:-32}"
@@ -126,6 +132,7 @@ if [[ "${RUN_DRY_RUN}" == 1 || "${RUN_TRAINING}" == 1 ]]; then
       --checkpoint_path "${CHECKPOINT_PATH}" --corpus_file "${CORPUS_FILE}"
       --output_file "${BATCH_SIZE_REPORT}" --num_gpus "${NUM_GPUS}"
       --num_generations "${NUM_GENERATIONS}"
+      --do_sample "${DO_SAMPLE}"
       --max_prompt_length "${MAX_PROMPT_LENGTH}" --max_target_length "${MAX_TARGET_LENGTH}"
       --start_batch_size "${TRAIN_BATCH_SIZE}" --max_batch_size "${MAX_TRAIN_BATCH_SIZE}"
       --reserve_gib "${BATCH_SIZE_RESERVE_GIB}" --temperature "${TEMPERATURE}" --beta "${GRPO_BETA}"
@@ -146,6 +153,7 @@ if [[ "${RUN_DRY_RUN}" == 1 || "${RUN_TRAINING}" == 1 ]]; then
     --output_dir "${OUTPUT_DIR}" --validation_split 0
     --max_prompt_length "${MAX_PROMPT_LENGTH}" --max_target_length "${MAX_TARGET_LENGTH}"
     --num_generations "${NUM_GENERATIONS}" --temperature "${TEMPERATURE}"
+    --do_sample "${DO_SAMPLE}"
     --epsilon "${GRPO_EPSILON}" --beta "${GRPO_BETA}" --eval_num_beams "${EVAL_NUM_BEAMS}"
     --per_device_train_batch_size "${TRAIN_BATCH_SIZE}"
     --per_device_eval_batch_size "${EVAL_BATCH_SIZE}"
@@ -172,6 +180,7 @@ if [[ "${RUN_DRY_RUN}" == 1 || "${RUN_TRAINING}" == 1 ]]; then
   echo "Train queries: ${TRAIN_FILE}; corpus: ${CORPUS_FILE}"
   echo "GPUs: ${NUM_GPUS}; precision: ${PRECISION}; prompt/target lengths: ${MAX_PROMPT_LENGTH}/${MAX_TARGET_LENGTH}"
   echo "Queries/GPU: ${TRAIN_BATCH_SIZE}; rollouts/query: ${NUM_GENERATIONS}; trajectories/GPU: $(( TRAIN_BATCH_SIZE * NUM_GENERATIONS ))"
+  echo "Training do_sample: ${DO_SAMPLE} (false uses ${NUM_GENERATIONS} beams; temperature is ignored)"
   echo "Accumulation: ${GRADIENT_ACCUMULATION_STEPS}; effective batch: ${QUERIES_PER_STEP} queries / ${ROLLOUTS_PER_STEP} rollouts per optimizer step"
   echo "Learning rate: ${LEARNING_RATE}; GRPO KL beta: ${GRPO_BETA}; epochs: ${NUM_TRAIN_EPOCHS}"
   echo "Evaluation/save interval: ${EVAL_STEPS}/${SAVE_STEPS}; output: ${OUTPUT_DIR}"
