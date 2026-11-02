@@ -358,6 +358,15 @@ corpus target count. The separate evaluation/inference beam settings are unchang
 Beam candidates can still all receive the same reward, producing zero relevance
 advantages, and the centered loss can still log zero with nonzero gradients.
 
+Generation explicitly enters Accelerate's autocast context, including standalone
+dry runs before the training model is prepared. With `PRECISION=fp16` this keeps
+dry-run beam generation in mixed precision, consistent with calibration. Older
+versions could run this stage in FP32 and exhaust memory at a calibrated batch.
+If memory remains insufficient, reduce the per-device query batch (for example,
+`AUTO_TUNE_BATCH_SIZE=0 TRAIN_BATCH_SIZE=4 GRADIENT_ACCUMULATION_STEPS=4` preserves
+the effective query batch of batch 16 with accumulation 1). For a new run you can
+instead rerun calibration with `BATCH_SIZE_RESERVE_GIB=4` for more headroom.
+
 ## Objective and diagnostics
 
 The objective uses group-centered rewards divided by group population std plus

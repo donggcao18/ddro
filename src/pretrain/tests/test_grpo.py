@@ -300,6 +300,37 @@ class TinyT5Tests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "usable corpus targets"):
             self.trainer("too-many-beams", ["--do_sample", "false"])
 
+    def test_unprepared_dry_run_generation_enters_autocast(self):
+        trainer = self.trainer(extra=["--do_sample", "false", "--num_generations", "3"])
+        # No train()/prepare_model() call: reproduce the standalone dry-run path.
+        trainer.model.train()
+        inputs = trainer._prepare_inputs(trainer.data_collator([trainer.train_dataset[0]]))
+        dtypes = []
+        handle = trainer.model.register_forward_hook(
+            lambda model, arguments, output: dtypes.append(output.logits.dtype))
+        try:
+            trainer.generate_sequences(trainer.model, inputs, training=True)
+            self.assertTrue(dtypes)
+            self.assertEqual(set(dtypes), {torch.float32})
+            dtypes.clear()
+            # CPU BF16 exercises real lower-precision generation without CUDA.
+            # On a V100 the configured Accelerator context instead uses FP16.
+            with patch.object(trainer.accelerator, "autocast",
+                              side_effect=lambda: torch.autocast("cpu", dtype=torch.bfloat16)) as autocast:
+                sequences = trainer.generate_sequences(trainer.model, inputs, training=True)
+            autocast.assert_called_once_with()
+            self.assertTrue(dtypes)
+            self.assertEqual(set(dtypes), {torch.bfloat16})
+            self.assertEqual(len(sequences), 3)
+            self.assertTrue(trainer.model.training)
+            self.assertFalse(sequences.requires_grad)
+            with patch.object(trainer.model, "generate", side_effect=RuntimeError("generation failure")):
+                with self.assertRaisesRegex(RuntimeError, "generation failure"):
+                    trainer.generate_sequences(trainer.model, inputs, training=True)
+            self.assertTrue(trainer.model.training)
+        finally:
+            handle.remove()
+
     def test_beam_training_evaluation_checkpoint_and_resume(self):
         options = ["--do_sample", "false", "--num_generations", "3"]
         trainer = self.trainer("beam", options)

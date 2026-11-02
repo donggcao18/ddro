@@ -335,7 +335,10 @@ class Seq2SeqGRPOTrainer(Trainer):
         was_training = unwrapped.training
         unwrapped.eval()
         try:
-            with torch.no_grad():
+            # The dry run generates before Trainer.train()/Accelerate.prepare
+            # installs the mixed-precision forward wrapper. Enter autocast here
+            # explicitly so its beam caches match calibration/training precision.
+            with torch.no_grad(), self.accelerator.autocast():
                 return unwrapped.generate(
                     input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"],
                     generation_config=self.generation_config(training),
