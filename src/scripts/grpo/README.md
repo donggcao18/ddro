@@ -386,7 +386,22 @@ beam rollouts: changing candidate generation does not change that cancellation.
 `loss=0` alone does not diagnose a broken gradient or successful learning.
 Track reward, mixed groups, gradient norm, and held-out retrieval metrics.
 
-Two additional diagnostics are logged without changing the optimized loss:
+Loss components are logged at full precision. Trainer's built-in four-decimal
+rounding is replaced for `loss` using the raw mean of per-device microbatch
+losses, averaged over ranks and the logging window, like the other GRPO metrics.
+This is the unscaled objective, not divided by gradient accumulation steps.
+`grpo/total_loss` exposes that same value, `grpo/policy_loss` exposes the clipped
+policy term, and `grpo/kl_loss` exposes its weighted regularization term.
+`grpo/kl` now uses the same trajectory-then-batch averaging as the optimized
+objective, so `total_loss = policy_loss + beta * kl` (up to floating-point error).
+Older versions logged token-weighted KL, which can differ for unequal lengths.
+The policy term can still be approximately zero, while a small nonzero KL term
+is now visible rather than rounded away. At the initial SFT policy, KL is zero.
+KL uses `expm1(delta) - delta` for better precision near zero; policy and KL are
+averaged separately before addition to avoid losing a tiny regularizer in the
+cancellation of positive and negative advantages.
+
+Other diagnostics are logged without changing the optimized loss:
 
 - `grpo/pg_loss`: `-mean(advantage * mean_valid_token_logp)` on the current
   candidates. Its derivative matches the policy term in this single-iteration

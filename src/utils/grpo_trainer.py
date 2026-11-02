@@ -94,11 +94,15 @@ def grpo_loss(
         if reference_logps is None:
             raise ValueError("A frozen reference is required for beta > 0")
         delta = reference_logps - logps
-        kl = delta.exp() - delta - 1
+        # exp(delta) - 1 loses precision near zero. Keep the small KL term
+        # separate from the O(1), signed advantages until after averaging.
+        kl = torch.expm1(delta) - delta
     # Original GRPO: average tokens within each trajectory, then trajectories.
     # Even constant-reward groups retain a connected zero loss for DDP backward.
-    loss = ((-surrogate + beta * kl) * mask).sum(1) / mask.sum(1).clamp_min(1)
-    return loss.mean(), (kl * mask).sum() / mask.sum().clamp_min(1)
+    lengths = mask.sum(1).clamp_min(1)
+    policy_loss = -((surrogate * mask).sum(1) / lengths).mean()
+    mean_kl = ((kl * mask).sum(1) / lengths).mean()
+    return policy_loss + beta * mean_kl, mean_kl
 
 
 class TargetIndex:
@@ -390,6 +394,9 @@ class Seq2SeqGRPOTrainer(Trainer):
         grouped = rewards.reshape(-1, group_size)
         means = grouped.mean(1)
         stats = {
+            "total_loss": loss.detach(),
+            "policy_loss": loss.detach() - self.grpo.beta * kl.detach(),
+            "kl_loss": self.grpo.beta * kl.detach(),
             "pg_loss": pg_loss, "advantage_abs_mean": advantages.abs().mean(),
             "reward": rewards.mean(), "mixed_reward_groups": ((means > 0) & (means < 1)).float().mean(),
             "all_zero_groups": means.eq(0).float().mean(), "all_one_groups": means.eq(1).float().mean(),
@@ -417,6 +424,11 @@ class Seq2SeqGRPOTrainer(Trainer):
             for name, values in self._rollout_metrics.items():
                 if values:
                     logs[f"grpo/{name}"] = sum(values) / len(values)
+            # Trainer rounds its built-in loss to four decimal places before
+            # calling log(). Preserve the raw microbatch mean so small KL
+            # penalties appear in scientific notation instead of always 0.0.
+            if "grpo/total_loss" in logs:
+                logs["loss"] = logs["grpo/total_loss"]
             self._rollout_metrics.clear()
         super().log(logs, *args, **kwargs)
 

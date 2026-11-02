@@ -164,6 +164,31 @@ class ObjectiveTests(unittest.TestCase):
         self.assertTrue(gradient[1, mask[1]].gt(0).all())
         self.assertTrue(gradient[~mask].eq(0).all())
 
+    def test_small_kl_survives_centered_policy_cancellation(self):
+        scores = torch.zeros(4, 3, requires_grad=True)
+        advantages = group_advantages(torch.tensor([1., 0., 1., 0.]), 4)
+        reference = torch.full_like(scores, 1e-4)
+        mask = torch.ones_like(scores)
+        loss, kl = grpo_loss(scores, scores.detach(), advantages, mask, .2, .04, reference)
+        expected = (torch.expm1(reference.double()) - reference.double()).mean()
+        self.assertGreater(loss.item(), 0.)
+        self.assertEqual(round(loss.item(), 4), 0.)
+        torch.testing.assert_close(kl.double(), expected, rtol=1e-3, atol=0)
+        torch.testing.assert_close(loss, .04 * kl)
+        loss.backward()
+        self.assertTrue(torch.isfinite(scores.grad).all())
+        self.assertGreater(scores.grad.abs().sum().item(), 0.)
+
+    def test_kl_metric_matches_loss_averaging_for_variable_lengths(self):
+        scores = torch.zeros(2, 3, requires_grad=True)
+        reference = torch.tensor([[.02, .02, .02], [-.1, -.1, -.1]])
+        mask = torch.tensor([[True, False, False], [True, True, True]])
+        loss, kl = grpo_loss(scores, scores.detach(), torch.zeros(2), mask, .2, .04, reference)
+        terms = torch.expm1(reference.double()) - reference.double()
+        expected = (terms[0, 0] + terms[1].mean()) / 2
+        torch.testing.assert_close(kl.double(), expected, rtol=1e-5, atol=0)
+        torch.testing.assert_close(loss, .04 * kl)
+
     def test_metric_definition(self):
         result = retrieval_metrics(type("Prediction", (), {"predictions": np.array([[1., .5], [.5, 1.]])})())
         self.assertEqual(result, {"mrr@10": .75, "recall@k": .75})
@@ -425,6 +450,36 @@ class TinyT5Tests(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss))
         loss.backward()
         self.assertTrue(all(torch.isfinite(p.grad).all() for p in trainer.model.parameters() if p.grad is not None))
+
+    def test_kl_loss_logging_preserves_small_values_and_frozen_reference(self):
+        trainer = self.trainer("small-kl", ["--beta", "0.04", "--do_sample", "false", "--num_generations", "3"])
+        inputs = trainer._prepare_inputs(trainer.data_collator([
+            {"prompt": "find first", "positive_targets": []},
+        ]))
+        sequences = torch.tensor([[0, 4, 1], [0, 5, 1], [0, 6, 1]], device=trainer.args.device)
+        reference_before = trainer.reference_model.shared.weight.detach().clone()
+        with torch.no_grad():
+            torch.manual_seed(19)
+            trainer.model.shared.weight.add_(torch.randn_like(trainer.model.shared.weight) * .001)
+        with patch.object(trainer, "generate_sequences", return_value=sequences):
+            loss = trainer.compute_loss(trainer.model, inputs)
+        self.assertGreater(loss.item(), 0.)
+        self.assertEqual(round(loss.item(), 4), 0.)
+        loss.backward()
+        self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in trainer.model.parameters()))
+        self.assertTrue(all(p.grad is None for p in trainer.reference_model.parameters()))
+        torch.testing.assert_close(reference_before, trainer.reference_model.shared.weight, atol=0, rtol=0)
+        trainer.log({"loss": 0.0})  # Reproduce Trainer's four-decimal rounding.
+        record = trainer.state.log_history[-1]
+        self.assertEqual(record["loss"], loss.item())
+        self.assertEqual(record["loss"], record["grpo/total_loss"])
+        self.assertAlmostEqual(record["grpo/policy_loss"], 0., places=10)
+        self.assertAlmostEqual(record["grpo/kl_loss"], record["grpo/kl"] * .04, places=12)
+        self.assertAlmostEqual(record["loss"], record["grpo/policy_loss"] + record["grpo/kl_loss"], places=12)
+        self.assertFalse(trainer._rollout_metrics["total_loss"])
+        # Evaluation-only calls must not replace an explicitly supplied loss.
+        trainer.log({"loss": 7.0})
+        self.assertEqual(trainer.state.log_history[-1]["loss"], 7.0)
 
     def test_resume_matches_uninterrupted_training(self):
         class StopAfterOneStep(TrainerCallback):
