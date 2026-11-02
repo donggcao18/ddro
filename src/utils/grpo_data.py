@@ -115,6 +115,27 @@ def validate_query_sets(
             )
 
 
+def filter_query_targets(
+    rows: list[dict[str, Any]], allowed_targets: set[str]
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Remove unusable positive labels and training queries with no labels left."""
+    filtered = []
+    removed_positives = 0
+    affected_queries = 0
+    for row in rows:
+        positives = [target for target in row["positive_targets"] if target in allowed_targets]
+        removed = len(row["positive_targets"]) - len(positives)
+        removed_positives += removed
+        affected_queries += int(removed > 0)
+        if positives:
+            filtered.append({**row, "positive_targets": positives})
+    return filtered, {
+        "input_queries": len(rows), "kept_queries": len(filtered),
+        "dropped_queries": len(rows) - len(filtered),
+        "affected_queries": affected_queries, "removed_positive_labels": removed_positives,
+    }
+
+
 def load_queries(path: str | Path) -> list[dict[str, Any]]:
     return consolidate_queries(iter_json_records(path))
 

@@ -6,10 +6,13 @@ rollout (the num_iterations=1 GRPO regime). No reward or value model is used.
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
+import json
 from math import isfinite
+from pathlib import Path
 from typing import Any, Sequence
+import unicodedata
 
 import torch
 from torch import nn
@@ -78,7 +81,10 @@ def grpo_loss(
 class TargetIndex:
     """An exact target lookup and trie, shared by sampling and probability scoring."""
 
-    def __init__(self, tokenizer: Any, config: Any, targets: Sequence[str], max_length: int):
+    def __init__(self, tokenizer: Any, config: Any, targets: Sequence[str], max_length: int,
+                 invalid_target_policy: str = "error"):
+        if invalid_target_policy not in {"error", "skip"}:
+            raise ValueError("invalid_target_policy must be error or skip")
         self.start_id = config.decoder_start_token_id
         self.pad_id = tokenizer.pad_token_id
         self.eos_id = tokenizer.eos_token_id
@@ -90,24 +96,71 @@ class TargetIndex:
             raise ValueError("Model config and tokenizer pad/EOS token IDs must agree")
         self.sequence_to_target: dict[tuple[int, ...], str] = {}
         self.target_to_sequence: dict[str, tuple[int, ...]] = {}
-        for target in sorted(set(targets)):
-            sequence = tuple(tokenizer(target, add_special_tokens=True, truncation=False)["input_ids"])
+        self.excluded_targets: dict[str, dict[str, Any]] = {}
+        candidates: dict[tuple[int, ...], list[str]] = {}
+        unique_targets = sorted(set(targets))
+
+        def exclude(target: str, reason: str, message: str, **details: Any) -> None:
+            if invalid_target_policy == "error":
+                raise ValueError(message)
+            self.excluded_targets[target] = {"reason": reason, **details}
+
+        for target in unique_targets:
+            if any(unicodedata.category(char) in {"Cc", "Cs"} or char == "\ufffd" for char in target):
+                exclude(target, "invalid_characters", f"Target contains a control, surrogate, or replacement character: {target!r}")
+                continue
+            try:
+                sequence = tuple(tokenizer(target, add_special_tokens=True, truncation=False)["input_ids"])
+            except (ValueError, UnicodeError) as error:
+                exclude(target, "tokenization_error", f"Cannot tokenize target {target!r}: {error}", error_type=type(error).__name__)
+                continue
             if not sequence or sequence[-1] != self.eos_id or self.eos_id in sequence[:-1]:
-                raise ValueError(f"Target must tokenize to exactly one terminal EOS: {target!r}")
+                exclude(target, "invalid_eos", f"Target must tokenize to exactly one terminal EOS: {target!r}")
+                continue
+            bos_id = getattr(tokenizer, "bos_token_id", None)
             if self.pad_id in sequence or (
                 tokenizer.unk_token_id is not None and tokenizer.unk_token_id in sequence
-            ):
-                raise ValueError(f"Target contains a padding or unknown token: {target!r}")
+            ) or (bos_id is not None and bos_id in sequence[1:]):
+                exclude(target, "reserved_or_unknown_token", f"Target contains a reserved, padding or unknown token: {target!r}")
+                continue
             if len(sequence) > max_length:
-                raise ValueError(f"Target {target!r} needs {len(sequence)} tokens; increase max_target_length={max_length}")
-            previous = self.sequence_to_target.get(sequence)
-            if previous is not None and previous != target:
-                raise ValueError(f"Tokenizer collision between targets {previous!r} and {target!r}")
+                exclude(target, "overlong", f"Target {target!r} needs {len(sequence)} tokens; increase max_target_length={max_length}",
+                        token_length=len(sequence), max_target_length=max_length)
+                continue
+            candidates.setdefault(sequence, []).append(target)
+        collisions = 0
+        for sequence, group in candidates.items():
+            if len(group) > 1:
+                # Remove every ambiguous spelling, including the first one.
+                # Keeping an arbitrary representative would corrupt relevance.
+                for target in group:
+                    exclude(target, "tokenizer_collision", f"Tokenizer collision between targets {group[0]!r} and {group[1]!r}",
+                            collision_group=collisions, token_length=len(sequence))
+                collisions += 1
+                continue
+            target = group[0]
             self.sequence_to_target[sequence] = target
             self.target_to_sequence[target] = sequence
+        self.filtering_summary = {
+            "policy": invalid_target_policy, "input_targets": len(unique_targets),
+            "kept_targets": len(self.target_to_sequence), "excluded_targets": len(self.excluded_targets),
+            "excluded_by_reason": dict(Counter(item["reason"] for item in self.excluded_targets.values())),
+            "collision_groups": collisions, "max_target_length": max_length,
+        }
         if not self.sequence_to_target:
-            raise ValueError("Cannot build a trie from an empty corpus")
+            raise ValueError(f"No usable targets remain for the corpus trie: {self.filtering_summary}")
         self.trie = Trie([[self.start_id, *sequence] for sequence in self.sequence_to_target])
+
+    def write_filter_report(self, output_dir: str | Path) -> None:
+        destination = Path(output_dir)
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination / "target_filtering.json").write_text(
+            json.dumps(self.filtering_summary, indent=2) + "\n", encoding="utf-8"
+        )
+        with (destination / "excluded_targets.jsonl").open("w", encoding="utf-8") as handle:
+            for target, details in self.excluded_targets.items():
+                # Escaping also makes isolated surrogates safe to audit.
+                handle.write(json.dumps({"target": target, **details}) + "\n")
 
     def canonical(self, sequence: Sequence[int]) -> tuple[int, ...]:
         tokens = list(sequence)

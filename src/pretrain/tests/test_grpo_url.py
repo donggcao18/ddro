@@ -18,7 +18,8 @@ from pretrain.tests.test_grpo import tiny_checkpoint
 from pretrain.train_grpo_vault import build_trainer, parse_args
 from scripts.bm25.the_vault.common import iter_json_records, write_jsonl
 from scripts.grpo.prepare_vault_url_grpo_data import main as prepare_main
-from utils.grpo_data import prepare_url_file
+from utils.grpo_data import filter_query_targets, prepare_url_file
+from utils.grpo_trainer import TargetIndex
 
 
 class DirectURLDataTests(unittest.TestCase):
@@ -132,6 +133,102 @@ class URLInferenceTests(unittest.TestCase):
         self.assertEqual(result["hit10"], 1.)
         self.assertEqual(result["num_queries"], 2)
         self.assertEqual(result["missing_positive_targets"], 0)
+
+
+class InvalidURLTargetTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.tokenizer, self.config = tiny_checkpoint(self.root / "sft")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def test_skip_excludes_all_collisions_bad_tokens_and_long_ids(self):
+        targets = ["alpha", "beta", "alpha alpha", "alpha  alpha", "alpha beta gamma", "absent",
+                   "alpha [PAD]", "alpha [EOS] beta", "alpha\nbeta", "alpha\ud800", "\ufffd"]
+        index = TargetIndex(self.tokenizer, self.config, targets, 3, invalid_target_policy="skip")
+        self.assertEqual(set(index.target_to_sequence), {"alpha", "beta"})
+        self.assertEqual(index.filtering_summary["excluded_targets"], 9)
+        self.assertEqual(index.filtering_summary["excluded_by_reason"]["tokenizer_collision"], 2)
+        self.assertEqual(index.excluded_targets["alpha beta gamma"]["token_length"], 4)
+        self.assertEqual(index.excluded_targets["alpha beta gamma"]["reason"], "overlong")
+        self.assertEqual(index.excluded_targets["alpha\ud800"]["reason"], "invalid_characters")
+        index.write_filter_report(self.root / "reports")
+        exclusions = list(iter_json_records(self.root / "reports/excluded_targets.jsonl"))
+        self.assertEqual({row["target"] for row in exclusions}, set(targets) - {"alpha", "beta"})
+        with self.assertRaisesRegex(ValueError, "No usable"):
+            TargetIndex(self.tokenizer, self.config, ["alpha alpha", "alpha  alpha"], 3, invalid_target_policy="skip")
+        long_target = " ".join(["alpha"] * 194)
+        long_index = TargetIndex(self.tokenizer, self.config, ["alpha", long_target], 128, invalid_target_policy="skip")
+        self.assertEqual(long_index.excluded_targets[long_target]["token_length"], 195)
+        self.assertEqual(set(long_index.target_to_sequence), {"alpha"})
+
+    def test_filtering_preserves_remaining_positives_and_counts_dropped_queries(self):
+        rows, stats = filter_query_targets([
+            {"prompt": "first", "positive_targets": ["alpha", "overlong"]},
+            {"prompt": "second", "positive_targets": ["overlong"]},
+            {"prompt": "third", "positive_targets": ["beta"]},
+        ], {"alpha", "beta"})
+        self.assertEqual(rows, [{"prompt": "first", "positive_targets": ["alpha"]},
+                                {"prompt": "third", "positive_targets": ["beta"]}])
+        self.assertEqual(stats["dropped_queries"], 1)
+        self.assertEqual(stats["removed_positive_labels"], 2)
+
+    def test_skip_mode_native_prepare_train_and_unfiltered_test_metrics(self):
+        bad = "alpha beta gamma"
+        surrogate = "alpha\ud800"
+        native = self.root / "native.jsonl"
+        write_jsonl(native, [
+            {"text": "find first", "url_based_id": "alpha", "positive_url_based_id": ["alpha", bad, "absent"]},
+            {"text": "find second", "url_based_id": "beta", "positive_url_based_id": ["beta"]},
+            {"text": "find third", "url_based_id": bad, "positive_url_based_id": [bad]},
+            {"text": "find fourth", "url_based_id": "alpha alpha", "positive_url_based_id": ["alpha alpha", "alpha  alpha"]},
+            {"text": "find validation", "url_based_id": surrogate, "positive_url_based_id": [surrogate]},
+        ], ensure_ascii=True)
+        with patch.object(sys, "argv", ["prepare", "--input-file", str(native), "--output-dir", str(self.root / "data"), "--validation-split", "0"]):
+            prepare_main()
+        write_jsonl(self.root / "validation.jsonl", [{"prompt": "find gamma", "positive_targets": ["beta", bad]}])
+        arguments = [
+            "train", "--checkpoint_path", str(self.root / "sft"),
+            "--train_file", str(self.root / "data/train.jsonl"), "--eval_file", str(self.root / "validation.jsonl"),
+            "--corpus_file", str(self.root / "data/corpus.jsonl"), "--output_dir", str(self.root / "trained"),
+            "--max_prompt_length", "16", "--max_target_length", "3", "--num_generations", "4",
+            "--max_steps", "1", "--save_steps", "1", "--eval_steps", "1", "--logging_steps", "1",
+            "--gradient_accumulation_steps", "1", "--invalid_target_policy", "skip",
+        ]
+        with patch.object(sys, "argv", arguments):
+            trainer = build_trainer(parse_args())
+        self.assertEqual(len(trainer.train_dataset), 2)
+        self.assertEqual(trainer.train_dataset[0]["positive_targets"], ["alpha"])
+        self.assertEqual(trainer.eval_dataset[0]["positive_targets"], ["beta"])
+        report = json.loads((self.root / "trained/query_filtering.json").read_text())
+        self.assertEqual(report["train"]["dropped_queries"], 3)
+        trainer.args.disable_tqdm = True
+        trainer.train()
+        trainer.save_model(str(self.root / "trained/final"))
+        test_rows = [
+            {"text": "find first", "url_based_id": "alpha", "positive_url_based_id": ["alpha", bad]},
+            {"text": "find second", "url_based_id": bad, "positive_url_based_id": [bad]},
+            {"text": "find third", "url_based_id": "alpha alpha", "positive_url_based_id": ["alpha alpha", "alpha  alpha"]},
+            {"text": "find fourth", "url_based_id": surrogate, "positive_url_based_id": [surrogate]},
+        ]
+        (self.root / "test.json").write_text(json.dumps(test_rows), encoding="utf-8")
+        args = SimpleNamespace(
+            model_path=str(self.root / "trained/final"), test_file=str(self.root / "test.json"),
+            corpus_file=str(self.root / "data/corpus.jsonl"), output_dir=str(self.root / "inference"),
+            batch_size=2, num_beams=10, max_prompt_length=16, max_target_length=3,
+            device="cpu", fp16=False, invalid_target_policy="skip",
+        )
+        with patch.dict(os.environ, RANK="0", WORLD_SIZE="1", LOCAL_RANK="0"):
+            metrics = run_inference(args)
+        self.assertEqual(metrics["num_queries"], 4)
+        self.assertEqual(metrics["corpus_targets"], 2)
+        self.assertEqual(metrics["queries_with_no_retrievable_positive"], 3)
+        self.assertEqual(metrics["hit10"], .25)
+        predictions = list(iter_json_records(self.root / "inference/predictions.jsonl"))
+        self.assertEqual(predictions[3]["positive_url_based_id"], [surrogate])
+        self.assertTrue((self.root / "inference/excluded_targets.jsonl").is_file())
 
 
 if __name__ == "__main__":

@@ -47,9 +47,10 @@ repeated normalized queries before splitting, and writes:
 
 You can also supply these formats directly without running preparation. The
 corpus must represent the **full retrieval universe**, including negative IDs,
-not just positives. Same-target documents share a retrieval action; distinct
-target strings that tokenize identically are rejected. Unmapped or missing
-positive targets and overlong targets are rejected, rather than silently dropped.
+not just positives. Same-target documents share a retrieval action. The generic
+Python entry points default to strict target validation. The URL launcher uses
+the documented skip policy below for unusable IDs. Unmapped positive IDs and
+train/validation query overlap remain data-validation errors.
 
 Validation labels must be appropriate to that split; the trainer does not infer
 new positives from held-out examples. Separate train/eval files are checked for
@@ -100,6 +101,7 @@ Its defaults are:
 | Output directory | `/mnt/beegfs/scratch/congthanh_le/scratch/east/ddro/outputs/vault-ruby-grpo-url` |
 | GPUs / precision | 4 / FP16 |
 | Prompt / target limits | 256 / 128 tokens |
+| Invalid target policy | `skip` for calibration, training, and inference |
 | Starting training queries per GPU | 16, then automatically calibrated |
 | Maximum training queries per GPU to probe | 32 |
 | Sampled trajectories per query | 8 |
@@ -154,6 +156,48 @@ The second step accounts for resident optimizer state. It reserves at least
 Probe weights are temporary; the SFT checkpoint is never modified. Probing
 starts fresh on each attempted batch and happens before launching distributed
 workers, so an OOM retry does not require recovering a failed DDP group.
+
+### Skipping unusable URL IDs
+
+The URL preset exports `GRPO_INVALID_TARGET_POLICY=skip`. The same tokenizer
+validation is applied during memory calibration, training, and test inference:
+
+- IDs exceeding `MAX_TARGET_LENGTH`, including EOS, are excluded in full.
+  A 195-token URL is skipped when the limit is 128; it is never truncated.
+- All members of each tokenizer-collision group are excluded; an arbitrary
+  spelling is not kept as a representative.
+- Unknown/PAD tokens, malformed EOS/BOS placement, tokenization errors, and
+  control/surrogate/replacement characters are excluded. Ordinary Unicode and
+  punctuation remain allowed when the tokenizer can represent them correctly.
+
+Training and internal validation remove excluded positives from each query.
+Queries with no usable positives left are dropped; a multi-positive query with
+at least one usable positive is retained. If every validation query is dropped,
+internal validation is disabled. The run fails clearly if no usable corpus or
+training query remains. Missing fields or structurally malformed input data are
+still errors; this policy concerns document-ID representability.
+
+Final test inference keeps the original queries and positive label sets. An
+excluded target cannot be predicted, but its query stays in the metric
+denominator. This prevents target filtering from silently improving scores by
+dropping difficult test cases. Metrics report missing targets and queries with
+no retrievable positives.
+
+Audit files:
+
+- `${OUTPUT_DIR}/target_filtering.json` and `excluded_targets.jsonl`: training
+  corpus counts, exclusion reasons, and exact excluded IDs.
+- `${OUTPUT_DIR}/query_filtering.json`: retained/dropped train and validation
+  query counts and removed positive-label counts.
+- `${OUTPUT_DIR}/calibration_target_filtering/`: the calibration target report.
+- `${INFERENCE_OUTPUT_DIR}/target_filtering.json` and `excluded_targets.jsonl`:
+  the inference catalog's target report.
+
+Use `GRPO_INVALID_TARGET_POLICY=error` to restore strict URL-launcher behavior.
+Direct Python training, calibration, or inference accepts
+`--invalid_target_policy skip`; its default is `error` unless the environment
+variable is set. Prepared URL files preserve malformed strings using JSON
+escaping so the tokenizer validation stage can audit them safely.
 
 This is a memory stress estimate, not a guarantee against changes in GPU
 occupancy or other runtime allocations. All training GPUs should have the same

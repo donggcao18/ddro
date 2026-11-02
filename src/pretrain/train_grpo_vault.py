@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -15,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from datasets import Dataset
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, TrainingArguments, set_seed
 
-from utils.grpo_data import load_corpus, load_queries, split_queries, validate_query_sets
+from utils.grpo_data import filter_query_targets, load_corpus, load_queries, split_queries, validate_query_sets
 from utils.grpo_trainer import GRPOSettings, QueryCollator, Seq2SeqGRPOTrainer, TargetIndex
 
 
@@ -29,6 +30,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validation_split", type=float, default=0.01)
     parser.add_argument("--max_prompt_length", type=int, default=256)
     parser.add_argument("--max_target_length", type=int, required=True, help="Decoder token limit, including EOS, excluding decoder start.")
+    parser.add_argument("--invalid_target_policy", choices=("error", "skip"),
+                        default=os.environ.get("GRPO_INVALID_TARGET_POLICY", "error"))
     parser.add_argument("--num_generations", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--epsilon", type=float, default=0.2)
@@ -80,13 +83,28 @@ def build_trainer(args: argparse.Namespace) -> Seq2SeqGRPOTrainer:
     if len(tokenizer) > model.get_input_embeddings().num_embeddings:
         raise ValueError("Tokenizer vocabulary exceeds the checkpoint embedding size")
     targets = load_corpus(args.corpus_file)
-    index = TargetIndex(tokenizer, model.config, targets, settings.max_target_length)
+    index = TargetIndex(tokenizer, model.config, targets, settings.max_target_length,
+                        invalid_target_policy=args.invalid_target_policy)
     train = load_queries(args.train_file)
     if args.eval_file:
         validation = load_queries(args.eval_file)
     else:
         train, validation = split_queries(train, args.validation_split, args.seed)
     validate_query_sets(train, validation, set(targets))
+    allowed_targets = set(index.target_to_sequence)
+    train, train_filtering = filter_query_targets(train, allowed_targets)
+    validation, validation_filtering = filter_query_targets(validation, allowed_targets)
+    query_filtering = {"train": train_filtering, "validation": validation_filtering}
+    if int(os.environ.get("RANK", "0")) == 0:
+        index.write_filter_report(args.output_dir)
+        (Path(args.output_dir) / "query_filtering.json").write_text(
+            json.dumps(query_filtering, indent=2) + "\n", encoding="utf-8"
+        )
+        print("Target filtering:", json.dumps(index.filtering_summary))
+        print("Query filtering:", json.dumps(query_filtering))
+    if not train:
+        raise ValueError("No training queries retain a usable positive target after filtering; see target/query filtering reports")
+    validate_query_sets(train, validation, allowed_targets)
     # Distinct text queries can become identical after tokenization/truncation.
     validation_encodings = {
         tuple(tokenizer(row["prompt"], truncation=True, max_length=args.max_prompt_length)["input_ids"])
@@ -145,8 +163,9 @@ def build_trainer(args: argparse.Namespace) -> Seq2SeqGRPOTrainer:
         manifest = {
             "arguments": vars(args), "grpo": asdict(settings),
             "train_queries": len(train), "validation_queries": len(validation),
-            "corpus_targets": len(targets),
-            "recall_k": min(settings.eval_num_beams, len(targets)),
+            "corpus_targets": len(allowed_targets),
+            "target_filtering": index.filtering_summary, "query_filtering": query_filtering,
+            "recall_k": min(settings.eval_num_beams, len(allowed_targets)),
             "reward": "1 iff completed target is in the query positive set; otherwise 0",
         }
         (destination / "grpo_run.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")

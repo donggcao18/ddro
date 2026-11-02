@@ -50,6 +50,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_beams", type=int, default=10)
     parser.add_argument("--max_prompt_length", type=int, default=256)
     parser.add_argument("--max_target_length", type=int, default=128)
+    parser.add_argument("--invalid_target_policy", choices=("error", "skip"),
+                        default=os.environ.get("GRPO_INVALID_TARGET_POLICY", "error"))
     parser.add_argument("--device", default="auto", help="auto, cpu, or cuda:N; auto binds torchrun workers to LOCAL_RANK.")
     parser.add_argument("--fp16", action="store_true")
     return parser.parse_args()
@@ -87,7 +89,10 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError("URL inference requires an encoder-decoder checkpoint")
         if len(tokenizer) > model.get_input_embeddings().num_embeddings:
             raise ValueError("Checkpoint/tokenizer vocabulary mismatch")
-        index = TargetIndex(tokenizer, model.config, sorted(catalog), args.max_target_length)
+        index = TargetIndex(tokenizer, model.config, sorted(catalog), args.max_target_length,
+                            invalid_target_policy=getattr(args, "invalid_target_policy", "error"))
+        original_catalog = catalog
+        catalog = set(index.target_to_sequence)
         model.to(device)
         model.eval()
         beams = min(args.num_beams, len(catalog))
@@ -100,6 +105,9 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
         )
         destination = Path(args.output_dir)
         destination.mkdir(parents=True, exist_ok=True)
+        if rank == 0:
+            index.write_filter_report(destination)
+            print("Target filtering:", json.dumps(index.filtering_summary), flush=True)
         shard_path = destination / f".predictions.rank{rank}.jsonl"
         sums = {name: 0.0 for name in METRIC_NAMES}
         local_count = 0
@@ -131,7 +139,7 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
                         "top_10_predictions": ranked,
                         **scores,
                     }
-                    handle.write(json.dumps(prediction, ensure_ascii=False) + "\n")
+                    handle.write(json.dumps(prediction, ensure_ascii=True) + "\n")
         totals = torch.tensor([local_count, *[sums[name] for name in METRIC_NAMES]], dtype=torch.float64, device=device)
         if world > 1:
             dist.all_reduce(totals, op=dist.ReduceOp.SUM)
@@ -142,7 +150,9 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
         metrics = {name: values[i + 1] / count for i, name in enumerate(METRIC_NAMES)}
         result = {
             **metrics, "num_queries": count, "corpus_targets": len(catalog),
+            "corpus_targets_before_filtering": len(original_catalog), "target_filtering": index.filtering_summary,
             "test_catalog_targets_added": len(set(test_catalog) - training_catalog),
+            "queries_with_no_retrievable_positive": sum(not (set(row["positive_targets"]) & catalog) for row in rows),
             "queries_with_missing_positive_targets": sum(bool(set(row["positive_targets"]) - catalog) for row in rows),
             "missing_positive_targets": len({target for row in rows for target in row["positive_targets"] if target not in catalog}),
             "model_path": str(args.model_path), "test_file": str(args.test_file),
@@ -151,7 +161,7 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
         if rank == 0:
             shards = [destination / f".predictions.rank{i}.jsonl" for i in range(world)]
             merged = heapq.merge(*(iter_json_records(path) for path in shards), key=lambda row: row["query_index"])
-            written = write_jsonl(destination / "predictions.jsonl", merged)
+            written = write_jsonl(destination / "predictions.jsonl", merged, ensure_ascii=True)
             if written != count:
                 raise RuntimeError(f"Prediction output count mismatch: {written} != {count}")
             (destination / "metrics.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")

@@ -26,9 +26,11 @@ def main() -> None:
     validate_query_sets(train, validation, set(targets))
     destination = Path(args.output_dir)
     destination.mkdir(parents=True, exist_ok=True)
-    write_jsonl(destination / "train.jsonl", train)
-    write_jsonl(destination / "validation.jsonl", validation)
-    write_jsonl(destination / "corpus.jsonl", ({"target": target} for target in targets))
+    # Preserve raw identifiers losslessly, even malformed Unicode. The model's
+    # target-index validation can then report/exclude them using the tokenizer.
+    write_jsonl(destination / "train.jsonl", train, ensure_ascii=True)
+    write_jsonl(destination / "validation.jsonl", validation, ensure_ascii=True)
+    write_jsonl(destination / "corpus.jsonl", ({"target": target} for target in targets), ensure_ascii=True)
     stats = {
         "input_file": args.input_file, "target_type": "url", "seed": args.seed,
         "query_field": "text", "positive_field": "positive_url_based_id",

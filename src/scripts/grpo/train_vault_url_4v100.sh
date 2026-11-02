@@ -17,6 +17,14 @@ NUM_GPUS="${NUM_GPUS:-4}"
 PRECISION="${PRECISION:-fp16}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-256}"
 MAX_TARGET_LENGTH="${MAX_TARGET_LENGTH:-128}"
+# Exclude unusable full IDs rather than truncating or changing their identity.
+# This policy is inherited by calibration, training, and final inference.
+GRPO_INVALID_TARGET_POLICY="${GRPO_INVALID_TARGET_POLICY:-skip}"
+if [[ "${GRPO_INVALID_TARGET_POLICY}" != skip && "${GRPO_INVALID_TARGET_POLICY}" != error ]]; then
+  echo "GRPO_INVALID_TARGET_POLICY must be skip or error." >&2
+  exit 2
+fi
+export GRPO_INVALID_TARGET_POLICY
 NUM_GENERATIONS="${NUM_GENERATIONS:-8}"
 # Start at the DDRO query batch, then calibrate capacity on the allocated GPUs.
 # 16 queries * 8 rollouts = 128 trajectories per GPU, not 16 DPO pairs.

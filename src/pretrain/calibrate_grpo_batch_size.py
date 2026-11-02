@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Callable
@@ -171,6 +172,8 @@ def main() -> None:
     parser.add_argument("--num_generations", type=int, default=8)
     parser.add_argument("--max_prompt_length", type=int, default=256)
     parser.add_argument("--max_target_length", type=int, default=128)
+    parser.add_argument("--invalid_target_policy", choices=("error", "skip"),
+                        default=os.environ.get("GRPO_INVALID_TARGET_POLICY", "error"))
     parser.add_argument("--start_batch_size", type=int, default=16)
     parser.add_argument("--max_batch_size", type=int, default=32)
     parser.add_argument("--reserve_gib", type=float, default=2.0)
@@ -189,7 +192,10 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.checkpoint_path, local_files_only=True)
     from transformers import AutoConfig
     config = AutoConfig.from_pretrained(args.checkpoint_path, local_files_only=True)
-    index = TargetIndex(tokenizer, config, load_corpus(args.corpus_file), args.max_target_length)
+    index = TargetIndex(tokenizer, config, load_corpus(args.corpus_file), args.max_target_length,
+                        invalid_target_policy=args.invalid_target_policy)
+    index.write_filter_report(Path(args.output_file).parent / "calibration_target_filtering")
+    print("Target filtering:", json.dumps(index.filtering_summary), flush=True)
     free_memory = [torch.cuda.mem_get_info(i)[0] for i in range(args.num_gpus)]
     ordinal = min(range(args.num_gpus), key=lambda i: free_memory[i])
     device = torch.device("cuda", ordinal)
@@ -216,6 +222,7 @@ def main() -> None:
         "reserve_gib": args.reserve_gib, "max_batch_size": args.max_batch_size,
         "prompt_tokens": args.max_prompt_length,
         "target_tokens": max(map(len, index.sequence_to_target)), "trials": trials,
+        "target_filtering": index.filtering_summary,
     }
     path = Path(args.output_file)
     path.parent.mkdir(parents=True, exist_ok=True)

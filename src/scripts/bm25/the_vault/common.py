@@ -120,13 +120,13 @@ def document_targets(row: dict[str, Any], target_type: str) -> list[str]:
     raise ValueError(f"Unsupported target type: {target_type!r}")
 
 
-def write_jsonl(path: str | Path, rows: Iterable[dict[str, Any]]) -> int:
+def write_jsonl(path: str | Path, rows: Iterable[dict[str, Any]], ensure_ascii: bool = False) -> int:
     """Write JSONL records and return the number written."""
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     count = 0
     with destination.open("w", encoding="utf-8") as handle:
         for row in rows:
-            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            handle.write(json.dumps(row, ensure_ascii=ensure_ascii) + "\n")
             count += 1
     return count
