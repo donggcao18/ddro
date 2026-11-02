@@ -149,6 +149,21 @@ class ObjectiveTests(unittest.TestCase):
         self.assertIsNotNone(scores.grad)
         self.assertTrue(scores.grad.eq(0).all())
 
+    def test_zero_surrogate_value_has_policy_gradient_for_variable_lengths(self):
+        scores = torch.tensor([[-.4, -.9, -.2], [-1.2, -.3, -.8], [-.7, -.2, -.5], [-.5, -.6, -.4]],
+                              requires_grad=True)
+        mask = torch.tensor([[True, True, False], [True, True, True], [True, False, False], [True, True, True]])
+        advantages = group_advantages(torch.tensor([1., 0., 1., 0.]), 4)
+        loss, _ = grpo_loss(scores, scores.detach(), advantages, mask, .2)
+        self.assertAlmostEqual(loss.item(), 0., places=6)
+        gradient, = torch.autograd.grad(loss, scores)
+        diagnostic = -(advantages * ((scores * mask).sum(1) / mask.sum(1))).mean()
+        diagnostic_gradient, = torch.autograd.grad(diagnostic, scores)
+        torch.testing.assert_close(gradient, diagnostic_gradient)
+        self.assertTrue(gradient[0, mask[0]].lt(0).all())
+        self.assertTrue(gradient[1, mask[1]].gt(0).all())
+        self.assertTrue(gradient[~mask].eq(0).all())
+
     def test_metric_definition(self):
         result = retrieval_metrics(type("Prediction", (), {"predictions": np.array([[1., .5], [.5, 1.]])})())
         self.assertEqual(result, {"mrr@10": .75, "recall@k": .75})
@@ -342,6 +357,41 @@ class TinyT5Tests(unittest.TestCase):
         resumed = self.trainer("beam-resumed", options + ["--max_steps", "3"])
         resumed.train(resume_from_checkpoint=str(self.root / "beam/checkpoint-2"))
         self.assertEqual(resumed.state.global_step, 3)
+
+    def test_zero_loss_update_increases_positive_target_probability(self):
+        trainer = self.trainer("gradient-audit", ["--do_sample", "false", "--num_generations", "3"])
+        inputs = trainer._prepare_inputs(trainer.data_collator([
+            {"prompt": "find first", "positive_targets": ["alpha"]},
+        ]))
+        sequences = torch.tensor([[0, 4, 1], [0, 5, 1], [0, 6, 1]], device=trainer.args.device)
+
+        def target_logps():
+            with torch.no_grad():
+                outputs = trainer.model(
+                    input_ids=inputs["input_ids"].repeat_interleave(3, 0),
+                    attention_mask=inputs["attention_mask"].repeat_interleave(3, 0),
+                    decoder_input_ids=sequences[:, :-1], use_cache=False,
+                )
+                return constrained_logps(outputs.logits, trainer.target_index.score_layout(sequences), 1.)[:, 0]
+
+        before = target_logps()
+        optimizer = torch.optim.SGD(trainer.model.parameters(), lr=.01)
+        with patch.object(trainer, "generate_sequences", return_value=sequences):
+            loss = trainer.compute_loss(trainer.model, inputs)
+        self.assertAlmostEqual(loss.item(), 0., places=6)
+        loss.backward()
+        self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in trainer.model.parameters()))
+        optimizer.step()
+        after = target_logps()
+        self.assertGreater(after[0].item(), before[0].item())
+        self.assertLess(after[1:].exp().sum().item(), before[1:].exp().sum().item())
+        trainer.log({"loss": loss.item()})
+        record = trainer.state.log_history[-1]
+        self.assertGreater(record["grpo/advantage_abs_mean"], 0)
+        advantages = group_advantages(torch.tensor([1., 0., 0.]), 3)
+        expected_pg_loss = -(advantages * before.cpu() / 2).mean().item()  # EOS has logp zero.
+        self.assertAlmostEqual(record["grpo/pg_loss"], expected_pg_loss, places=6)
+        self.assertFalse(trainer._rollout_metrics["pg_loss"])
 
     def test_training_evaluation_save_and_resume(self):
         trainer = self.trainer()

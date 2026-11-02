@@ -380,9 +380,17 @@ class Seq2SeqGRPOTrainer(Trainer):
                 reference_logps = constrained_logps(ref_outputs.logits, layout, self.grpo.scoring_temperature)
         loss, kl = grpo_loss(logps, old_logps, advantages, mask, self.grpo.epsilon,
                              self.grpo.beta, reference_logps)
+        # With one fresh scoring pass, ratio == 1 and mean(advantages) == 0.
+        # The surrogate value therefore cancels despite nonzero derivatives.
+        # Log a detached score-function diagnostic, whose gradient would match
+        # the unclipped policy term here, without changing the optimized loss.
+        with torch.no_grad():
+            trajectory_logps = (logps * mask).sum(1) / mask.sum(1).clamp_min(1)
+            pg_loss = -(advantages * trajectory_logps).mean()
         grouped = rewards.reshape(-1, group_size)
         means = grouped.mean(1)
         stats = {
+            "pg_loss": pg_loss, "advantage_abs_mean": advantages.abs().mean(),
             "reward": rewards.mean(), "mixed_reward_groups": ((means > 0) & (means < 1)).float().mean(),
             "all_zero_groups": means.eq(0).float().mean(), "all_one_groups": means.eq(1).float().mean(),
             "completion_length": mask.sum(1).float().mean(), "kl": kl.detach(),

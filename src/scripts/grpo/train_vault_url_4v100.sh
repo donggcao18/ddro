@@ -33,7 +33,8 @@ DO_SAMPLE="${DO_SAMPLE:-false}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
 AUTO_TUNE_BATCH_SIZE="${AUTO_TUNE_BATCH_SIZE:-1}"
 MAX_TRAIN_BATCH_SIZE="${MAX_TRAIN_BATCH_SIZE:-32}"
-BATCH_SIZE_RESERVE_GIB="${BATCH_SIZE_RESERVE_GIB:-2}"
+# Extra headroom for runtime/DDP variation with the frozen KL reference enabled.
+BATCH_SIZE_RESERVE_GIB="${BATCH_SIZE_RESERVE_GIB:-4}"
 # Evaluation expands each query into EVAL_NUM_BEAMS beams.
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-2}"
 # With batch 16, four GPUs give 64 queries / 512 rollouts without accumulation.
@@ -43,8 +44,8 @@ NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-2}"
 VALIDATION_SPLIT="${VALIDATION_SPLIT:-0.01}"
 # Conservative starting point for policy updates; tune after a pilot.
 LEARNING_RATE="${LEARNING_RATE:-1e-6}"
-# GRPO beta is a KL coefficient, not the DPO preference temperature.
-GRPO_BETA="${GRPO_BETA:-0.0}"
+# Regularize toward the frozen SFT checkpoint; GRPO_BETA=0 disables the reference.
+GRPO_BETA="${GRPO_BETA:-0.04}"
 EVAL_STEPS="${EVAL_STEPS:-2000}"
 SAVE_STEPS="${SAVE_STEPS:-2000}"
 SEED="${SEED:-42}"

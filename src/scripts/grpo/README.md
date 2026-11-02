@@ -94,8 +94,8 @@ Its defaults are:
 
 | Setting | URL GRPO preset |
 | --- | --- |
-| SFT checkpoint | `/home/users/congthanh_le/scratch/veil/CodeGR/outputs/DSI_Ruby_url__qg_t5_url_max_lr/checkpoint-161800` |
-| Training input (`TRAIN_INPUT_FILE`) | `/home/users/congthanh_le/scratch/veil/CodeGR/data/updated_url/Ruby_merged_multilabel_sft.jsonl` |
+| SFT checkpoint | `/home/users/congthanh_le/scratch/veil/CodeGR/outputs/DSI_Ruby_url__qg_t5_url_max_lr_sft_3_5/checkpoint-96600` |
+| Training input (`TRAIN_INPUT_FILE`) | `/home/users/congthanh_le/scratch/veil/CodeGR/data/updated_url/Ruby_merged_multilabel_dpo.jsonl` |
 | Test input (`TEST_INPUT_FILE`) | `/home/users/congthanh_le/scratch/veil/CodeGR/data/updated_url/Ruby_test_r32.0_multilabel.json` |
 | Prepared GRPO data | `${OUTPUT_DIR}/grpo_data` |
 | Output directory | `/mnt/beegfs/scratch/congthanh_le/scratch/east/ddro/outputs/vault-ruby-grpo-url` |
@@ -104,12 +104,13 @@ Its defaults are:
 | Invalid target policy | `skip` for calibration, training, and inference |
 | Starting training queries per GPU | 16, then automatically calibrated |
 | Maximum training queries per GPU to probe | 32 |
-| Sampled trajectories per query | 8 |
+| Training trajectories per query | 8 deterministic beam candidates (`DO_SAMPLE=false`) |
+| Calibration memory reserve | 4 GiB, or at least two parameter-sized buffers for DDP |
 | Gradient accumulation | 1 |
 | Effective full optimizer batch | `4 * calibrated_batch` queries, eight trajectories each |
 | Evaluation queries per GPU / beams per query | 2 / 10 |
 | Epochs / validation fraction | 2 / 0.01 |
-| Learning rate / KL beta | `1e-6` / `0.0` |
+| Learning rate / KL beta | `1e-6` / `0.04` (frozen SFT reference enabled) |
 | Evaluation / save interval | 2000 / 2000 optimizer steps |
 | DataLoader workers per process | 2 |
 | Post-training inference | enabled, on `${OUTPUT_DIR}/final` |
@@ -152,7 +153,8 @@ The probe runs on the least-free of the requested training GPUs. It uses full
 limit, cached generation, gradient checkpointing, backward, and two AdamW steps.
 It also includes Accelerate's FP32 output conversion for FP16 training.
 The second step accounts for resident optimizer state. It reserves at least
-`BATCH_SIZE_RESERVE_GIB=2` GiB (and at least two parameter-sized buffers for DDP).
+`BATCH_SIZE_RESERVE_GIB=4` GiB in the URL preset (and at least two parameter-sized
+buffers for DDP). The shared/structure-v6 preset defaults to 2 GiB.
 Probe weights are temporary; the SFT checkpoint is never modified. Probing
 starts fresh on each attempted batch and happens before launching distributed
 workers, so an OOM retry does not require recovering a failed DDP group.
@@ -365,7 +367,8 @@ versions could run this stage in FP32 and exhaust memory at a calibrated batch.
 If memory remains insufficient, reduce the per-device query batch (for example,
 `AUTO_TUNE_BATCH_SIZE=0 TRAIN_BATCH_SIZE=4 GRADIENT_ACCUMULATION_STEPS=4` preserves
 the effective query batch of batch 16 with accumulation 1). For a new run you can
-instead rerun calibration with `BATCH_SIZE_RESERVE_GIB=4` for more headroom.
+instead rerun calibration with a larger `BATCH_SIZE_RESERVE_GIB` for more headroom
+(the URL preset defaults to 4 GiB).
 
 ## Objective and diagnostics
 
@@ -378,8 +381,25 @@ detached current-policy scores because no update occurs between sampling and
 scoring; there is no stale rollout cache or multi-iteration replay. Consequently,
 ratios start at one and clipping does not activate in this initial version.
 The scalar policy loss can be zero even while its gradient is nonzero, because
-group-centered advantages sum to zero. Track reward, mixed groups, gradient
-norm, and held-out retrieval metrics when assessing learning.
+group-centered advantages sum to zero. This remains true with deterministic
+beam rollouts: changing candidate generation does not change that cancellation.
+`loss=0` alone does not diagnose a broken gradient or successful learning.
+Track reward, mixed groups, gradient norm, and held-out retrieval metrics.
+
+Two additional diagnostics are logged without changing the optimized loss:
+
+- `grpo/pg_loss`: `-mean(advantage * mean_valid_token_logp)` on the current
+  candidates. Its derivative matches the policy term in this single-iteration
+  regime, but it is logged detached. It can have either sign and need not
+  decrease across changing rollout groups; it is not a retrieval-quality metric.
+- `grpo/advantage_abs_mean`: average absolute normalized advantage. Zero means
+  no group-relative relevance signal in that logging window (KL may still act).
+
+Regression tests verify that a zero surrogate has the expected nonzero gradient
+for mixed reward groups with unequal sequence lengths, and that a real tiny-T5
+update increases an annotated positive target's probability while decreasing the
+combined probability of its negative candidates. This checks the implementation,
+not the retrieval performance of a GPU training run.
 
 Sampling has no top-k/top-p truncation, repetition penalty, or forced-token
 processors. Scoring uses exactly the same trie-normalized distribution and
@@ -387,8 +407,9 @@ temperature. Dropout is disabled, including T5 attention's functional dropout.
 The first EOS is included in the loss; decoder start and padding are excluded.
 The trie validates that every corpus ID can finish within the decoder limit.
 
-`beta=0` (default) loads only the policy. Setting `--beta` above zero adds a frozen
-copy of the initial SFT checkpoint for the sampled KL penalty, using the same
+`beta=0` (Python/shared-launcher default) loads only the policy. The URL preset
+defaults to `GRPO_BETA=0.04`, adding a frozen copy of the initial SFT checkpoint
+for the KL penalty, using the same
 constrained distribution. This reference is **not a reward model**. DeepSpeed,
 FSDP, vLLM, multiple optimization iterations per rollout, auxiliary SFT losses,
 partial-prefix rewards, and diversity rewards are outside this implementation.
