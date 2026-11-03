@@ -20,7 +20,7 @@ from utils.grpo_data import filter_query_targets, load_corpus, load_queries, spl
 from utils.grpo_trainer import GRPOSettings, QueryCollator, Seq2SeqGRPOTrainer, TargetIndex
 
 
-def parse_args() -> argparse.Namespace:
+def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint_path", required=True, help="Local SFT save_pretrained checkpoint.")
     parser.add_argument("--train_file", required=True, help="JSON/JSONL with prompt and positive_targets.")
@@ -65,15 +65,20 @@ def parse_args() -> argparse.Namespace:
     precision.add_argument("--bf16", action="store_true")
     parser.add_argument("--resume_from_checkpoint", nargs="?", const=True, default=None)
     parser.add_argument("--dry_run", action="store_true", help="Validate data/model and generate one query batch; do not optimize.")
-    return parser.parse_args()
+    return parser
 
 
-def build_trainer(args: argparse.Namespace) -> Seq2SeqGRPOTrainer:
+def parse_args() -> argparse.Namespace:
+    return make_parser().parse_args()
+
+
+def build_trainer(args: argparse.Namespace, *, settings: GRPOSettings | None = None,
+                  trainer_class: type = Seq2SeqGRPOTrainer, require_reference: bool = False) -> Seq2SeqGRPOTrainer:
     if args.max_prompt_length < 1 or args.learning_rate <= 0 or args.num_train_epochs <= 0:
         raise ValueError("Prompt length, learning rate, and training epochs must be positive")
     if min(args.logging_steps, args.save_steps, args.eval_steps) < 1:
         raise ValueError("Logging, save, and evaluation steps must be positive")
-    settings = GRPOSettings(
+    settings = settings or GRPOSettings(
         num_generations=args.num_generations, do_sample=args.do_sample == "true", temperature=args.temperature,
         max_target_length=args.max_target_length, epsilon=args.epsilon,
         beta=args.beta, eval_num_beams=args.eval_num_beams,
@@ -136,7 +141,8 @@ def build_trainer(args: argparse.Namespace) -> Seq2SeqGRPOTrainer:
         logging_steps=args.logging_steps, logging_first_step=True,
         eval_steps=args.eval_steps if has_eval else None,
         save_steps=args.save_steps, save_total_limit=args.save_total_limit,
-        load_best_model_at_end=has_eval, metric_for_best_model="mrr@10" if has_eval else None,
+        load_best_model_at_end=has_eval,
+        metric_for_best_model=getattr(args, "metric_for_best_model", "mrr@10") if has_eval else None,
         greater_is_better=True if has_eval else None,
         fp16=args.fp16, bf16=args.bf16,
         gradient_checkpointing=args.gradient_checkpointing,
@@ -150,7 +156,7 @@ def build_trainer(args: argparse.Namespace) -> Seq2SeqGRPOTrainer:
     training_kwargs[strategy_key] = "steps" if has_eval else "no"
     training_args = TrainingArguments(**training_kwargs)
     reference = None
-    if settings.beta:
+    if settings.beta or require_reference:
         reference = AutoModelForSeq2SeqLM.from_pretrained(checkpoint, local_files_only=True)
     if args.gradient_checkpointing:
         model.config.use_cache = False
@@ -163,14 +169,16 @@ def build_trainer(args: argparse.Namespace) -> Seq2SeqGRPOTrainer:
     )
     trainer_parameters = inspect.signature(Seq2SeqGRPOTrainer.__mro__[1].__init__).parameters
     trainer_kwargs["processing_class" if "processing_class" in trainer_parameters else "tokenizer"] = tokenizer
-    trainer = Seq2SeqGRPOTrainer(**trainer_kwargs)
+    trainer = trainer_class(**trainer_kwargs)
     if trainer.is_world_process_zero():
         destination = Path(args.output_dir)
         destination.mkdir(parents=True, exist_ok=True)
         manifest = {
             "implementation_version": 2,
             "arguments": vars(args), "grpo": asdict(settings),
-            "rollout_mode": "sampled_grpo" if settings.do_sample else "beam_selected_variant",
+            "objective": getattr(settings, "objective", "grpo"),
+            "rollout_mode": ("online_beam_negative_mining" if require_reference else
+                             "sampled_grpo" if settings.do_sample else "beam_selected_variant"),
             "scoring_temperature": settings.scoring_temperature,
             "update_monitor_parameter": trainer.update_monitor.parameter_name,
             "update_monitor_samples": len(trainer.update_monitor.indices),
@@ -178,11 +186,12 @@ def build_trainer(args: argparse.Namespace) -> Seq2SeqGRPOTrainer:
             "corpus_targets": len(allowed_targets),
             "target_filtering": index.filtering_summary, "query_filtering": query_filtering,
             "recall_k": min(settings.eval_num_beams, len(allowed_targets)),
-            "reward": "1 iff completed target is in the query positive set; otherwise 0",
+            "reward": ("annotated-positive preference supervision; no GRPO advantages" if require_reference else
+                       "1 iff completed target is in the query positive set; otherwise 0"),
         }
         (destination / "grpo_run.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(manifest, indent=2))
-        if not settings.do_sample:
+        if not settings.do_sample and not require_reference:
             print("Deterministic beam rollouts enabled: this selection-biased variant is not on-policy sampled GRPO. "
                   "Temperature is ignored; signed group advantages are retained.")
         if settings.ranking_loss_weight:

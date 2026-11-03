@@ -26,6 +26,7 @@ from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 from utils.grpo_data import load_corpus
 from utils.grpo_trainer import GRPOSettings, TargetIndex, completion_mask, token_logps, grpo_loss, listwise_ranking_loss
+from utils.coverage_trainer import CoverageSettings, OBJECTIVES, preference_loss
 
 
 def largest_fitting_batch(start: int, maximum: int, probe: Callable[[int], bool]) -> int:
@@ -80,7 +81,8 @@ def probe_once(args: argparse.Namespace, index: TargetIndex, device: torch.devic
             for name in ("dropout", "attention_dropout", "activation_dropout"):
                 if isinstance(getattr(module, name, None), float):
                     setattr(module, name, 0.0)
-        if args.beta:
+        preference_objective = getattr(args, "preference_objective", None)
+        if args.beta or preference_objective:
             reference = AutoModelForSeq2SeqLM.from_pretrained(args.checkpoint_path, local_files_only=True).to(device)
             reference.requires_grad_(False)
             reference.eval()
@@ -131,11 +133,16 @@ def probe_once(args: argparse.Namespace, index: TargetIndex, device: torch.devic
                 # full longest valid path for every backward row to probe memory.
                 sequences = torch.tensor([index.start_id, *longest], device=device).repeat(
                     batch_size * args.num_generations, 1)
+            scored_per_query = args.num_generations
+            if preference_objective:
+                scored_per_query = args.positives_per_query + args.negatives_per_query
+                sequences = torch.tensor([index.start_id, *longest], device=device).repeat(
+                    batch_size * scored_per_query, 1)
             mask = completion_mask(sequences[:, 1:], index.eos_id, index.pad_id)
             layout = index.score_layout(sequences)
             repeated = {
-                "input_ids": inputs.repeat_interleave(args.num_generations, 0),
-                "attention_mask": attention.repeat_interleave(args.num_generations, 0),
+                "input_ids": inputs.repeat_interleave(scored_per_query, 0),
+                "attention_mask": attention.repeat_interleave(scored_per_query, 0),
                 "decoder_input_ids": sequences[:, :-1],
                 "decoder_attention_mask": torch.cat((torch.ones_like(mask[:, :1]), mask[:, :-1]), 1),
                 "use_cache": False,
@@ -153,8 +160,24 @@ def probe_once(args: argparse.Namespace, index: TargetIndex, device: torch.devic
                         ref_logps = token_logps(ref_outputs.logits, layout, settings.scoring_temperature, settings.score_normalization)
                 # Artificial nonzero advantages exercise backward allocations;
                 # this is a capacity probe, not a source of training supervision.
-                loss, kl = grpo_loss(logps, logps.detach(), torch.ones(len(sequences), device=device),
-                                     mask, .2, args.beta, ref_logps)
+                if preference_objective:
+                    scores = (logps * mask).sum(1)
+                    ref_scores = (ref_logps * mask).sum(1)
+                    losses = [preference_loss(scores[i:i + scored_per_query], ref_scores[i:i + scored_per_query],
+                                             args.positives_per_query, scores.new_ones(args.positives_per_query),
+                                             preference_objective, args.preference_beta)
+                              for i in range(0, len(scores), scored_per_query)]
+                    loss, kl = torch.stack(losses).mean(), scores.new_zeros(())
+                    if args.sft_anchor_weight:
+                        labels = sequences[:, 1:].masked_fill(~mask, -100)
+                        positive_rows = torch.arange(len(scores), device=device).remainder(scored_per_query) < args.positives_per_query
+                        labels = labels.masked_fill(~positive_rows[:, None], -100)
+                        loss = loss + args.sft_anchor_weight * torch.nn.functional.cross_entropy(
+                            outputs.logits.float().reshape(-1, outputs.logits.shape[-1]), labels.reshape(-1))
+                    del scores, ref_scores, losses
+                else:
+                    loss, kl = grpo_loss(logps, logps.detach(), torch.ones(len(sequences), device=device),
+                                         mask, .2, args.beta, ref_logps)
                 if settings.ranking_loss_weight:
                     # Artificial distinct keys and alternating labels exercise
                     # ranking allocations despite forcing one longest path.
@@ -206,6 +229,11 @@ def main() -> None:
     parser.add_argument("--ranking_loss_weight", type=float, default=0.0)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--beta", type=float, default=0.0)
+    parser.add_argument("--preference_objective", choices=OBJECTIVES)
+    parser.add_argument("--positives_per_query", type=int, default=2)
+    parser.add_argument("--negatives_per_query", type=int, default=4)
+    parser.add_argument("--preference_beta", type=float, default=.1)
+    parser.add_argument("--sft_anchor_weight", type=float, default=.1)
     parser.add_argument("--fp16", action="store_true")
     args = parser.parse_args()
     if not torch.cuda.is_available() or torch.cuda.device_count() < args.num_gpus:
@@ -219,6 +247,12 @@ def main() -> None:
     GRPOSettings(num_generations=args.num_generations, do_sample=args.do_sample == "true",
                  temperature=args.temperature, beta=args.beta, score_normalization=args.score_normalization,
                  ranking_loss_weight=args.ranking_loss_weight)
+    if args.preference_objective:
+        CoverageSettings(objective=args.preference_objective, num_generations=args.num_generations,
+                         do_sample=args.do_sample == "true", beta=args.beta,
+                         ranking_loss_weight=args.ranking_loss_weight,
+                         positives_per_query=args.positives_per_query, negatives_per_query=args.negatives_per_query,
+                         preference_beta=args.preference_beta, sft_anchor_weight=args.sft_anchor_weight)
     if args.gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be positive")
     tokenizer = AutoTokenizer.from_pretrained(args.checkpoint_path, local_files_only=True)
@@ -252,6 +286,8 @@ def main() -> None:
         "batch_size": chosen, "num_generations": args.num_generations, "do_sample": args.do_sample == "true",
         "score_normalization": args.score_normalization, "ranking_loss_weight": args.ranking_loss_weight,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "preference_objective": args.preference_objective,
+        "scored_candidates_per_query": args.positives_per_query + args.negatives_per_query if args.preference_objective else args.num_generations,
         "gpu": ordinal, "gpu_name": torch.cuda.get_device_name(device),
         "reserve_gib": args.reserve_gib, "max_batch_size": args.max_batch_size,
         "prompt_tokens": args.max_prompt_length,

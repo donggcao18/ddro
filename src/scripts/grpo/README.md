@@ -1,5 +1,9 @@
 # Binary multi-positive GRPO for Vault
 
+For the three independent post-SFT preference experiments and coverage metrics,
+see [COVERAGE_EXPERIMENTS.md](COVERAGE_EXPERIMENTS.md). Run them together with
+`bash src/scripts/grpo/run_url_coverage_experiments_4v100.sh`.
+
 This path trains encoder-decoder T5/CodeT5 retrievers from an existing SFT
 checkpoint. Each query produces independently sampled, trie-constrained document
 IDs. A completed ID in the query's known positive set receives **1**, everything

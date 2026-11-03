@@ -48,10 +48,13 @@ class DirectURLDataTests(unittest.TestCase):
                     prepare_url_file(path)
 
     def test_hit_and_truncated_mrr_use_first_of_all_positives(self):
-        self.assertEqual(score_ranking(["negative", "positive-b", "positive-a"], ["positive-a", "positive-b"]),
+        legacy_names = ("hit1", "hit5", "hit10", "mrr1", "mrr5", "mrr10")
+        scores = score_ranking(["negative", "positive-b", "positive-a"], ["positive-a", "positive-b"])
+        self.assertEqual({key: scores[key] for key in legacy_names},
                          {"hit1": 0., "hit5": 1., "hit10": 1., "mrr1": 0., "mrr5": .5, "mrr10": .5})
         ranked = [f"negative-{i}" for i in range(6)] + ["positive"]
-        self.assertEqual(score_ranking(ranked, ["positive"]),
+        scores = score_ranking(ranked, ["positive"])
+        self.assertEqual({key: scores[key] for key in legacy_names},
                          {"hit1": 0., "hit5": 0., "hit10": 1., "mrr1": 0., "mrr5": 0., "mrr10": 1 / 7})
         self.assertTrue(all(value == 0 for value in score_ranking([], ["positive"]).values()))
         with self.assertRaises(ValueError):

@@ -10,7 +10,7 @@ import os
 import sys
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -21,23 +21,7 @@ from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 from scripts.bm25.the_vault.common import iter_json_records, write_jsonl
 from utils.grpo_data import load_corpus, prepare_url_file
 from utils.grpo_trainer import TargetIndex, beam_generation_config, resolve_score_normalization
-
-
-CUTOFFS = (1, 5, 10)
-METRIC_NAMES = tuple(f"hit{k}" for k in CUTOFFS) + tuple(f"mrr{k}" for k in CUTOFFS)
-
-
-def score_ranking(ranked: Sequence[str], positives: Sequence[str]) -> dict[str, float]:
-    """Hit@K and truncated reciprocal rank of the first positive, for one query."""
-    relevant = set(positives)
-    if not relevant:
-        raise ValueError("Cannot score a query with no positive URLs")
-    unique = list(dict.fromkeys(ranked))
-    first = next((i + 1 for i, target in enumerate(unique) if target in relevant), None)
-    return {
-        **{f"hit{k}": float(first is not None and first <= k) for k in CUTOFFS},
-        **{f"mrr{k}": 1.0 / first if first is not None and first <= k else 0.0 for k in CUTOFFS},
-    }
+from utils.retrieval_metrics import CUTOFFS, METRIC_NAMES, score_ranking
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,6 +36,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_target_length", type=int, default=128)
     parser.add_argument("--score_normalization", choices=("auto", "trie", "full_vocab"), default="auto",
                         help="auto reads checkpoint scoring metadata; use the same explicit rule for SFT comparisons.")
+    parser.add_argument("--catalog_mode", choices=("extend_test", "fixed"), default="extend_test",
+                        help="fixed searches exactly corpus_file, without extending it from test records.")
     parser.add_argument("--invalid_target_policy", choices=("error", "skip"),
                         default=os.environ.get("GRPO_INVALID_TARGET_POLICY", "error"))
     parser.add_argument("--device", default="auto", help="auto, cpu, or cuda:N; auto binds torchrun workers to LOCAL_RANK.")
@@ -84,7 +70,7 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
         # test records' own document URLs, never their positive label sets.
         rows, test_catalog = prepare_url_file(args.test_file, include_positive_targets_in_corpus=False)
         training_catalog = set(load_corpus(args.corpus_file))
-        catalog = training_catalog | set(test_catalog)
+        catalog = training_catalog if getattr(args, "catalog_mode", "extend_test") == "fixed" else training_catalog | set(test_catalog)
         tokenizer = AutoTokenizer.from_pretrained(args.model_path, local_files_only=True)
         model = AutoModelForSeq2SeqLM.from_pretrained(args.model_path, local_files_only=True)
         if not model.config.is_encoder_decoder:
@@ -149,7 +135,8 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
         result = {
             **metrics, "num_queries": count, "corpus_targets": len(catalog),
             "corpus_targets_before_filtering": len(original_catalog), "target_filtering": index.filtering_summary,
-            "test_catalog_targets_added": len(set(test_catalog) - training_catalog),
+            "test_catalog_targets_added": len(catalog - training_catalog),
+            "catalog_mode": getattr(args, "catalog_mode", "extend_test"),
             "queries_with_no_retrievable_positive": sum(not (set(row["positive_targets"]) & catalog) for row in rows),
             "queries_with_missing_positive_targets": sum(bool(set(row["positive_targets"]) - catalog) for row in rows),
             "missing_positive_targets": len({target for row in rows for target in row["positive_targets"] if target not in catalog}),

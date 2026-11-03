@@ -21,6 +21,7 @@ from torch import nn
 from transformers import GenerationConfig, Trainer, TrainerCallback
 
 from utils.trie import Trie
+from utils.retrieval_metrics import score_ranking
 
 
 @dataclass
@@ -402,6 +403,9 @@ def retrieval_metrics(prediction: Any) -> dict[str, float]:
     if scores.shape[1] >= 7:
         result.update({name: float(scores[:, i].mean()) for i, name in enumerate(
             ("hit@1", "hit@5", "hit@10", "mrr@1", "mrr@5"), 2)})
+    if scores.shape[1] >= 10:
+        result.update({name: float(scores[:, i].mean()) for i, name in enumerate(
+            ("recall@10", "ndcg@10", "relevant_count@10"), 7)})
     return result
 
 
@@ -600,6 +604,8 @@ class Seq2SeqGRPOTrainer(Trainer):
             scores.append([reciprocal, recall, hit1, float(first is not None and first <= 5),
                            float(first is not None and first <= 10), hit1,
                            1 / first if first is not None and first <= 5 else 0.])
+            coverage = score_ranking(ranked, positives)
+            scores[-1].extend([coverage["recall10"], coverage["ndcg10"], coverage["relevant_count10"]])
         predictions = torch.tensor(scores, dtype=torch.float32, device=sequences.device)
         # Dummy labels allow the standard Trainer evaluation loop to aggregate
         # per-query metrics, including distributed sampler padding removal.
