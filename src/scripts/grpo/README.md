@@ -98,7 +98,7 @@ Its defaults are:
 | Training input (`TRAIN_INPUT_FILE`) | `/home/users/congthanh_le/scratch/veil/CodeGR/data/updated_url/Ruby_merged_multilabel_dpo.jsonl` |
 | Test input (`TEST_INPUT_FILE`) | `/home/users/congthanh_le/scratch/veil/CodeGR/data/updated_url/Ruby_test_r32.0_multilabel.json` |
 | Prepared GRPO data | `${OUTPUT_DIR}/grpo_data` |
-| Output directory | `/mnt/beegfs/scratch/congthanh_le/scratch/east/ddro/outputs/vault-ruby-grpo-url` |
+| Output directory | `/mnt/beegfs/scratch/congthanh_le/scratch/east/ddro/outputs/vault-ruby-grpo-url-1e-5` |
 | GPUs / precision | 4 / FP16 |
 | Prompt / target limits | 256 / 128 tokens |
 | Invalid target policy | `skip` for calibration, training, and inference |
@@ -110,7 +110,9 @@ Its defaults are:
 | Effective full optimizer batch | `4 * calibrated_batch` queries, eight trajectories each |
 | Evaluation queries per GPU / beams per query | 2 / 10 |
 | Epochs / validation fraction | 2 / 0.01 |
-| Learning rate / KL beta | `1e-6` / `0.04` (frozen SFT reference enabled) |
+| Learning rate / KL beta | `1e-5` / `0.04` (frozen SFT reference enabled) |
+| Token score normalization | `trie`, shared by generation, scoring, validation, and inference |
+| Auxiliary ranking loss weight | `0.0` (disabled; exact-reward GRPO baseline) |
 | Evaluation / save interval | 2000 / 2000 optimizer steps |
 | DataLoader workers per process | 2 |
 | Post-training inference | enabled, on `${OUTPUT_DIR}/final` |
@@ -277,7 +279,8 @@ python src/pretrain/infer_grpo_vault_url.py \
   --test_file /data/Ruby_test_r32.0_multilabel.json \
   --corpus_file /models/url-grpo/grpo_data/corpus.jsonl \
   --output_dir /models/url-grpo/inference \
-  --batch_size 8 --num_beams 10 --max_target_length 128 --fp16
+  --batch_size 8 --num_beams 10 --max_target_length 128 \
+  --score_normalization trie --fp16
 ```
 
 ### Structure-v6 checkpoint
@@ -370,6 +373,62 @@ the effective query batch of batch 16 with accumulation 1). For a new run you ca
 instead rerun calibration with a larger `BATCH_SIZE_RESERVE_GIB` for more headroom
 (the URL preset defaults to 4 GiB).
 
+## Scoring consistency and optional ranking objective (implementation v2)
+
+Earlier versions used trie-normalized token probabilities in the policy loss,
+but beam search masked the full-vocabulary log probabilities without
+renormalizing. Those rules can reverse the ranking of the same complete IDs.
+New training defaults to `SCORE_NORMALIZATION=trie`, explicitly enabling
+`renormalize_logits=True` for beam generation, validation, and final inference.
+Teacher-forced policy and reference probabilities use that same normalization.
+Beam ranking uses the **sum** of token log probabilities (`length_penalty=0`).
+This fixes scoring consistency; the original GRPO policy loss still averages
+tokens within each trajectory and does not become a direct ranking loss.
+
+For a deterministic experiment using full-vocabulary scores consistently, set
+`DO_SAMPLE=false SCORE_NORMALIZATION=full_vocab`. That uses full-vocabulary
+probabilities in both loss scoring and decoding. Sampled GRPO requires `trie`
+because its trie-constrained samples follow that normalized distribution.
+Temperature is still ignored in beam mode. Sampling/evaluation temperatures
+may differ deliberately (sampling uses `TEMPERATURE`, evaluation uses 1).
+
+Each newly saved checkpoint and `final/` contains `grpo_config.json` with the
+scoring rule. Standalone inference's `--score_normalization auto` reads that
+sidecar first, then a parent run manifest. Legacy GRPO manifests without a rule
+select `full_vocab` to reproduce **old decoding**; SFT checkpoints without GRPO
+metadata default to `trie`. The URL launcher passes `SCORE_NORMALIZATION`
+explicitly. Use the same explicit value for every model being compared.
+
+Start a **new output directory** for v2 comparisons. The changed decoding rule
+can change results even without training, so reevaluate the SFT baseline and
+old policies with the same catalog, normalization, beams, and token limits.
+Old experimental results are not directly comparable to new trie-normalized
+results. Continuing a legacy checkpoint with corrected rollout scoring is a
+changed training setup, not an exact reproduction of its earlier trajectory.
+
+The binary verifier remains authoritative: completed IDs in any annotated
+positive set receive 1, and other outputs receive 0. No prefix/suffix similarity
+is converted into false partial relevance. To test direct ranking feedback,
+optionally set `RANKING_LOSS_WEIGHT=0.1` (an experimental starting value):
+
+```bash
+OUTPUT_DIR=/path/to/new-url-grpo-ranking-run \
+SCORE_NORMALIZATION=trie RANKING_LOSS_WEIGHT=0.1 \
+bash src/scripts/grpo/train_vault_url_4v100.sh
+```
+
+The additional term is multi-positive listwise cross-entropy over unique
+generated IDs, using their summed sequence scores. Its target distributes mass
+uniformly over annotated positives present in that candidate group. Repeated
+samples are deduplicated for this term. Only groups containing both a positive
+and a negative supply ranking supervision; all-wrong/all-correct groups get a
+connected zero term. There is **no positive injection** or extra SFT replay.
+The total objective is `GRPO_policy + beta * KL + weight * ranking_loss`.
+This is a hybrid objective, not pure GRPO; the default weight remains zero to
+isolate the scoring fix in a controlled experiment. It adds no reference model
+or generation beyond the existing rollout group. Calibration includes this
+path when enabled and accounts for resident gradient buffers with accumulation.
+
 ## Objective and diagnostics
 
 The objective uses group-centered rewards divided by group population std plus
@@ -392,8 +451,11 @@ losses, averaged over ranks and the logging window, like the other GRPO metrics.
 This is the unscaled objective, not divided by gradient accumulation steps.
 `grpo/total_loss` exposes that same value, `grpo/policy_loss` exposes the clipped
 policy term, and `grpo/kl_loss` exposes its weighted regularization term.
+`grpo/ranking_loss` and `grpo/weighted_ranking_loss` expose the optional auxiliary
+term, with `grpo/ranking_groups` indicating the eligible fraction.
 `grpo/kl` now uses the same trajectory-then-batch averaging as the optimized
-objective, so `total_loss = policy_loss + beta * kl` (up to floating-point error).
+objective, so `total_loss = policy_loss + beta * kl + weighted_ranking_loss`
+(up to floating-point error).
 Older versions logged token-weighted KL, which can differ for unequal lengths.
 The policy term can still be approximately zero, while a small nonzero KL term
 is now visible rather than rounded away. At the initial SFT policy, KL is zero.
@@ -409,6 +471,20 @@ Other diagnostics are logged without changing the optimized loss:
   decrease across changing rollout groups; it is not a retrieval-quality metric.
 - `grpo/advantage_abs_mean`: average absolute normalized advantage. Zero means
   no group-relative relevance signal in that logging window (KL may still act).
+- `grpo/sampled_update_rms`: actual parameter change over a fixed sample of up
+  to 256 entries in a trainable attention matrix, measured before/after each
+  optimizer step. The parameter name is recorded in `grpo_run.json`. A nonzero
+  value proves those entries changed, not that retrieval improved. A zero value
+  is inconclusive for the rest of the model and can occur at zero LR.
+- `grpo/optimizer_step_skipped`: fraction of optimizer steps skipped by AMP;
+  high values can explain nonzero gradients without useful weight updates.
+- `grpo/positive_rollouts_per_query` and `grpo/candidate_hit_any`: mean successful
+  rollout count and fraction of queries with any positive in the group.
+- `grpo/candidate_hit_at_1` and `grpo/candidate_mrr`: scores after sorting unique
+  generated candidates by their summed training-policy log probabilities. These
+  are training-candidate diagnostics, not held-out retrieval metrics.
+- `grpo/decision_token_fraction`: fraction of completion tokens with more than
+  one valid trie continuation. This exposes how much of a long ID is forced.
 
 Regression tests verify that a zero surrogate has the expected nonzero gradient
 for mixed reward groups with unequal sequence lengths, and that a real tiny-T5
@@ -417,15 +493,15 @@ combined probability of its negative candidates. This checks the implementation,
 not the retrieval performance of a GPU training run.
 
 Sampling has no top-k/top-p truncation, repetition penalty, or forced-token
-processors. Scoring uses exactly the same trie-normalized distribution and
-temperature. Dropout is disabled, including T5 attention's functional dropout.
+processors. Sample scoring uses exactly the same trie-normalized distribution
+and temperature. Dropout is disabled, including T5 attention's functional dropout.
 The first EOS is included in the loss; decoder start and padding are excluded.
 The trie validates that every corpus ID can finish within the decoder limit.
 
 `beta=0` (Python/shared-launcher default) loads only the policy. The URL preset
 defaults to `GRPO_BETA=0.04`, adding a frozen copy of the initial SFT checkpoint
-for the KL penalty, using the same
-constrained distribution. This reference is **not a reward model**. DeepSpeed,
+for the KL penalty, using the same selected scoring distribution as the policy.
+This reference is **not a reward model**. DeepSpeed,
 FSDP, vLLM, multiple optimization iterations per rollout, auxiliary SFT losses,
 partial-prefix rewards, and diversity rewards are outside this implementation.
 
@@ -438,9 +514,10 @@ during sampling. Monitor:
 - `grpo/duplicate_fraction`, `grpo/distinct_positives`
 - `grpo/completion_length`, `grpo/truncated_fraction`, `grpo/kl`
 
-Evaluation uses deterministic constrained beam search with raw sequence
-log-probability scores (`length_penalty=0`), reports `eval_mrr@10` and
-`eval_recall@k`, and selects the best checkpoint by MRR@10. K is
+Evaluation uses deterministic constrained beam search with summed sequence
+log-probability scores (`length_penalty=0`) in the selected normalization. It
+reports `eval_hit@1/5/10`, `eval_mrr@1/5/10`, and `eval_recall@k`, and selects the
+best checkpoint by MRR@10. Evaluation beams must cover min(10, corpus size). K is
 `min(eval_num_beams, corpus_target_count)` and is recorded in `grpo_run.json`.
 Recall counts all annotated positive target IDs, not document multiplicity.
 Changing decoding settings can affect comparisons to older evaluation scripts;
@@ -452,7 +529,9 @@ Tests (CPU, no network or downloaded checkpoints):
 python -m unittest discover -s src/pretrain/tests -p 'test_grpo*.py' -v
 ```
 
-Validation includes offline tiny-T5 training/evaluation, variable-length rollout
-probability checks, and resume equivalence to uninterrupted training. A separate
-two-process CPU DDP smoke run also passed. CUDA/FP16 and four-V100 execution must
-be validated on GPU hardware.
+Validation includes offline tiny-T5 training/evaluation, sampling and beam-score
+agreement with teacher forcing (shared prefixes and unequal lengths), unchanged
+reference weights, checkpoint/inference scoring metadata, different AdamW
+updates at different learning rates, gradient-accumulation equivalence, ranking
+gradients and duplicate handling, and resume equivalence. CUDA/FP16 and
+four-V100 execution must be validated on GPU hardware.

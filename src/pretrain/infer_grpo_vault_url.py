@@ -16,11 +16,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 import torch.distributed as dist
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, GenerationConfig
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 from scripts.bm25.the_vault.common import iter_json_records, write_jsonl
 from utils.grpo_data import load_corpus, prepare_url_file
-from utils.grpo_trainer import TargetIndex
+from utils.grpo_trainer import TargetIndex, beam_generation_config, resolve_score_normalization
 
 
 CUTOFFS = (1, 5, 10)
@@ -50,6 +50,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_beams", type=int, default=10)
     parser.add_argument("--max_prompt_length", type=int, default=256)
     parser.add_argument("--max_target_length", type=int, default=128)
+    parser.add_argument("--score_normalization", choices=("auto", "trie", "full_vocab"), default="auto",
+                        help="auto reads checkpoint scoring metadata; use the same explicit rule for SFT comparisons.")
     parser.add_argument("--invalid_target_policy", choices=("error", "skip"),
                         default=os.environ.get("GRPO_INVALID_TARGET_POLICY", "error"))
     parser.add_argument("--device", default="auto", help="auto, cpu, or cuda:N; auto binds torchrun workers to LOCAL_RANK.")
@@ -97,12 +99,8 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
         model.eval()
         beams = min(args.num_beams, len(catalog))
         returned = min(10, len(catalog))
-        generation = GenerationConfig(
-            decoder_start_token_id=index.start_id, pad_token_id=index.pad_id, eos_token_id=index.eos_id,
-            do_sample=False, num_beams=beams, num_return_sequences=returned,
-            max_new_tokens=args.max_target_length, length_penalty=0.0 if beams > 1 else 1.0,
-            use_cache=True,
-        )
+        normalization = resolve_score_normalization(args.model_path, getattr(args, "score_normalization", "auto"))
+        generation = beam_generation_config(index, args.max_target_length, beams, returned, normalization)
         destination = Path(args.output_dir)
         destination.mkdir(parents=True, exist_ok=True)
         if rank == 0:
@@ -157,6 +155,7 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
             "missing_positive_targets": len({target for row in rows for target in row["positive_targets"] if target not in catalog}),
             "model_path": str(args.model_path), "test_file": str(args.test_file),
             "num_beams": beams, "returned_predictions": returned, "world_size": world,
+            "score_normalization": normalization,
         }
         if rank == 0:
             shards = [destination / f".predictions.rank{i}.jsonl" for i in range(world)]

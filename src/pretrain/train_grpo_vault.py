@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train a T5/CodeT5 generative retriever with binary multi-positive GRPO."""
+"""Train a T5/CodeT5 retriever with multi-positive GRPO and optional candidate ranking."""
 
 from __future__ import annotations
 
@@ -36,6 +36,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--do_sample", type=str.lower, choices=("true", "false"), default="true",
                         help="true: independent samples; false: deterministic num_generations-beam training variant.")
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--score_normalization", choices=("trie", "full_vocab"), default="trie",
+                        help="Use the same token normalization in rollout scoring and beam decoding.")
+    parser.add_argument("--ranking_loss_weight", type=float, default=0.0,
+                        help="Optional multi-positive listwise auxiliary term; zero preserves pure GRPO.")
     parser.add_argument("--epsilon", type=float, default=0.2)
     parser.add_argument("--beta", type=float, default=0.0, help="Optional frozen-SFT KL penalty; zero loads no reference model.")
     parser.add_argument("--eval_num_beams", type=int, default=10)
@@ -73,6 +77,7 @@ def build_trainer(args: argparse.Namespace) -> Seq2SeqGRPOTrainer:
         num_generations=args.num_generations, do_sample=args.do_sample == "true", temperature=args.temperature,
         max_target_length=args.max_target_length, epsilon=args.epsilon,
         beta=args.beta, eval_num_beams=args.eval_num_beams,
+        score_normalization=args.score_normalization, ranking_loss_weight=args.ranking_loss_weight,
     )
     set_seed(args.seed)
     checkpoint = Path(args.checkpoint_path)
@@ -163,9 +168,12 @@ def build_trainer(args: argparse.Namespace) -> Seq2SeqGRPOTrainer:
         destination = Path(args.output_dir)
         destination.mkdir(parents=True, exist_ok=True)
         manifest = {
+            "implementation_version": 2,
             "arguments": vars(args), "grpo": asdict(settings),
             "rollout_mode": "sampled_grpo" if settings.do_sample else "beam_selected_variant",
             "scoring_temperature": settings.scoring_temperature,
+            "update_monitor_parameter": trainer.update_monitor.parameter_name,
+            "update_monitor_samples": len(trainer.update_monitor.indices),
             "train_queries": len(train), "validation_queries": len(validation),
             "corpus_targets": len(allowed_targets),
             "target_filtering": index.filtering_summary, "query_filtering": query_filtering,
@@ -177,6 +185,8 @@ def build_trainer(args: argparse.Namespace) -> Seq2SeqGRPOTrainer:
         if not settings.do_sample:
             print("Deterministic beam rollouts enabled: this selection-biased variant is not on-policy sampled GRPO. "
                   "Temperature is ignored; signed group advantages are retained.")
+        if settings.ranking_loss_weight:
+            print("Auxiliary multi-positive candidate ranking enabled: this run uses a hybrid objective.")
     return trainer
 
 

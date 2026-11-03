@@ -9,8 +9,8 @@ TARGET_TYPE=url
 WORK_DIR="${WORK_DIR:-/home/users/congthanh_le/scratch/veil/CodeGR/data/updated_url}"
 TRAIN_INPUT_FILE="${TRAIN_INPUT_FILE:-${WORK_DIR}/Ruby_merged_multilabel_dpo.jsonl}"
 TEST_INPUT_FILE="${TEST_INPUT_FILE:-${WORK_DIR}/Ruby_test_r32.0_multilabel.json}"
-CHECKPOINT_PATH="${CHECKPOINT_PATH:-/home/users/congthanh_le/scratch/veil/CodeGR/outputs/DSI_Ruby_url__qg_t5_url_max_lr_sft_3_5/checkpoint-96600}"
-OUTPUT_DIR="${OUTPUT_DIR:-/mnt/beegfs/scratch/congthanh_le/scratch/east/ddro/outputs/vault-ruby-grpo-url-1e-5}"
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-/home/users/congthanh_le/scratch/veil/CodeGR/outputs/DSI_Ruby_url__qg_t5_url_max_lr/checkpoint-160000}"
+OUTPUT_DIR="${OUTPUT_DIR:-/mnt/beegfs/scratch/congthanh_le/scratch/east/ddro/outputs/vault-ruby-grpo-url-full-sft}"
 GRPO_DATA_DIR="${GRPO_DATA_DIR:-${OUTPUT_DIR}/grpo_data}"
 GRPO_PYTHON_BIN="${GRPO_PYTHON_BIN:-${PYTHON_BIN:-python}}"
 NUM_GPUS="${NUM_GPUS:-4}"
@@ -28,6 +28,10 @@ export GRPO_INVALID_TARGET_POLICY
 NUM_GENERATIONS="${NUM_GENERATIONS:-8}"
 # Deterministic beam candidates by default; DO_SAMPLE=true restores sampled GRPO.
 DO_SAMPLE="${DO_SAMPLE:-false}"
+# Match token probabilities used for optimization, beam generation and inference.
+SCORE_NORMALIZATION="${SCORE_NORMALIZATION:-trie}"
+# Opt in to label-based ranking with e.g. RANKING_LOSS_WEIGHT=0.1.
+RANKING_LOSS_WEIGHT="${RANKING_LOSS_WEIGHT:-0.0}"
 # Start at the DDRO query batch, then calibrate capacity on the allocated GPUs.
 # 16 queries * 8 rollouts = 128 trajectories per GPU, not 16 DPO pairs.
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
@@ -110,6 +114,7 @@ if [[ "${RUN_INFERENCE}" == 1 ]]; then
     --corpus_file "${CORPUS_FILE}" --output_dir "${INFERENCE_OUTPUT_DIR}"
     --batch_size "${INFERENCE_BATCH_SIZE}" --num_beams "${INFERENCE_NUM_BEAMS}"
     --max_prompt_length "${MAX_PROMPT_LENGTH}" --max_target_length "${MAX_TARGET_LENGTH}"
+    --score_normalization "${SCORE_NORMALIZATION}"
   )
   if [[ "${PRECISION}" == fp16 ]]; then INFERENCE_ARGS+=(--fp16); fi
   echo "=== URL test inference: Hit@1/5/10 and MRR@1/5/10 ==="

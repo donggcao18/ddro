@@ -43,6 +43,16 @@ LEARNING_RATE="${LEARNING_RATE:-1e-6}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 GRPO_EPSILON="${GRPO_EPSILON:-0.2}"
 GRPO_BETA="${GRPO_BETA:-0.0}"
+SCORE_NORMALIZATION="${SCORE_NORMALIZATION:-trie}"
+RANKING_LOSS_WEIGHT="${RANKING_LOSS_WEIGHT:-0.0}"
+if [[ "${SCORE_NORMALIZATION}" != trie && "${SCORE_NORMALIZATION}" != full_vocab ]]; then
+  echo "SCORE_NORMALIZATION must be trie or full_vocab." >&2
+  exit 2
+fi
+if [[ "${DO_SAMPLE}" == true && "${SCORE_NORMALIZATION}" != trie ]]; then
+  echo "Sampled GRPO requires SCORE_NORMALIZATION=trie." >&2
+  exit 2
+fi
 EVAL_NUM_BEAMS="${EVAL_NUM_BEAMS:-10}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-0.5}"
@@ -133,6 +143,8 @@ if [[ "${RUN_DRY_RUN}" == 1 || "${RUN_TRAINING}" == 1 ]]; then
       --output_file "${BATCH_SIZE_REPORT}" --num_gpus "${NUM_GPUS}"
       --num_generations "${NUM_GENERATIONS}"
       --do_sample "${DO_SAMPLE}"
+      --score_normalization "${SCORE_NORMALIZATION}" --ranking_loss_weight "${RANKING_LOSS_WEIGHT}"
+      --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}"
       --max_prompt_length "${MAX_PROMPT_LENGTH}" --max_target_length "${MAX_TARGET_LENGTH}"
       --start_batch_size "${TRAIN_BATCH_SIZE}" --max_batch_size "${MAX_TRAIN_BATCH_SIZE}"
       --reserve_gib "${BATCH_SIZE_RESERVE_GIB}" --temperature "${TEMPERATURE}" --beta "${GRPO_BETA}"
@@ -154,6 +166,7 @@ if [[ "${RUN_DRY_RUN}" == 1 || "${RUN_TRAINING}" == 1 ]]; then
     --max_prompt_length "${MAX_PROMPT_LENGTH}" --max_target_length "${MAX_TARGET_LENGTH}"
     --num_generations "${NUM_GENERATIONS}" --temperature "${TEMPERATURE}"
     --do_sample "${DO_SAMPLE}"
+    --score_normalization "${SCORE_NORMALIZATION}" --ranking_loss_weight "${RANKING_LOSS_WEIGHT}"
     --epsilon "${GRPO_EPSILON}" --beta "${GRPO_BETA}" --eval_num_beams "${EVAL_NUM_BEAMS}"
     --per_device_train_batch_size "${TRAIN_BATCH_SIZE}"
     --per_device_eval_batch_size "${EVAL_BATCH_SIZE}"
@@ -181,6 +194,7 @@ if [[ "${RUN_DRY_RUN}" == 1 || "${RUN_TRAINING}" == 1 ]]; then
   echo "GPUs: ${NUM_GPUS}; precision: ${PRECISION}; prompt/target lengths: ${MAX_PROMPT_LENGTH}/${MAX_TARGET_LENGTH}"
   echo "Queries/GPU: ${TRAIN_BATCH_SIZE}; rollouts/query: ${NUM_GENERATIONS}; trajectories/GPU: $(( TRAIN_BATCH_SIZE * NUM_GENERATIONS ))"
   echo "Training do_sample: ${DO_SAMPLE} (false uses ${NUM_GENERATIONS} beams; temperature is ignored)"
+  echo "Score normalization (training and decoding): ${SCORE_NORMALIZATION}; ranking loss weight: ${RANKING_LOSS_WEIGHT}"
   echo "Accumulation: ${GRADIENT_ACCUMULATION_STEPS}; effective batch: ${QUERIES_PER_STEP} queries / ${ROLLOUTS_PER_STEP} rollouts per optimizer step"
   echo "Learning rate: ${LEARNING_RATE}; GRPO KL beta: ${GRPO_BETA}; epochs: ${NUM_TRAIN_EPOCHS}"
   echo "Evaluation/save interval: ${EVAL_STEPS}/${SAVE_STEPS}; output: ${OUTPUT_DIR}"

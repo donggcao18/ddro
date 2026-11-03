@@ -25,7 +25,7 @@ from accelerate.utils import convert_to_fp32
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 from utils.grpo_data import load_corpus
-from utils.grpo_trainer import GRPOSettings, TargetIndex, completion_mask, constrained_logps, grpo_loss
+from utils.grpo_trainer import GRPOSettings, TargetIndex, completion_mask, token_logps, grpo_loss, listwise_ranking_loss
 
 
 def largest_fitting_batch(start: int, maximum: int, probe: Callable[[int], bool]) -> int:
@@ -102,6 +102,8 @@ def probe_once(args: argparse.Namespace, index: TargetIndex, device: torch.devic
         settings = GRPOSettings(
             num_generations=args.num_generations, do_sample=args.do_sample == "true",
             temperature=args.temperature, max_target_length=len(longest), beta=args.beta,
+            score_normalization=getattr(args, "score_normalization", "trie"),
+            ranking_loss_weight=getattr(args, "ranking_loss_weight", 0.0),
         )
         generation = settings.rollout_generation_config(index)
 
@@ -111,6 +113,12 @@ def probe_once(args: argparse.Namespace, index: TargetIndex, device: torch.devic
 
         for _ in range(2):
             optimizer.zero_grad(set_to_none=True)
+            if getattr(args, "gradient_accumulation_steps", 1) > 1:
+                # Later accumulation microbatches generate while gradients from
+                # earlier microbatches are still resident. Probe that peak too.
+                for parameter in model.parameters():
+                    if parameter.requires_grad:
+                        parameter.grad = torch.zeros_like(parameter)
             model.eval()
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16, enabled=args.fp16):
                 sequences = model.generate(
@@ -137,16 +145,25 @@ def probe_once(args: argparse.Namespace, index: TargetIndex, device: torch.devic
                 # Accelerator's native-AMP wrapper converts ModelOutput tensors
                 # back to FP32. Include that allocation in the capacity estimate.
                 outputs = convert_to_fp32(model(**repeated))
-                logps = constrained_logps(outputs.logits, layout, settings.scoring_temperature)
+                logps = token_logps(outputs.logits, layout, settings.scoring_temperature, settings.score_normalization)
                 ref_logps = None
                 if reference is not None:
                     with torch.no_grad():
                         ref_outputs = convert_to_fp32(reference(**repeated))
-                        ref_logps = constrained_logps(ref_outputs.logits, layout, settings.scoring_temperature)
+                        ref_logps = token_logps(ref_outputs.logits, layout, settings.scoring_temperature, settings.score_normalization)
                 # Artificial nonzero advantages exercise backward allocations;
                 # this is a capacity probe, not a source of training supervision.
                 loss, kl = grpo_loss(logps, logps.detach(), torch.ones(len(sequences), device=device),
                                      mask, .2, args.beta, ref_logps)
+                if settings.ranking_loss_weight:
+                    # Artificial distinct keys and alternating labels exercise
+                    # ranking allocations despite forcing one longest path.
+                    rank_loss, _ = listwise_ranking_loss(
+                        (logps * mask).sum(1), torch.arange(len(sequences), device=device).remainder(2).float(),
+                        settings.num_generations, [(i % settings.num_generations,) for i in range(len(sequences))],
+                    )
+                    loss = loss + settings.ranking_loss_weight * rank_loss
+                    del rank_loss
             # Trainer.compute_loss returns before backward/optimizer.step; do
             # not keep otherwise-unused full-vocabulary outputs alive longer.
             del outputs, kl
@@ -185,6 +202,9 @@ def main() -> None:
     parser.add_argument("--max_batch_size", type=int, default=32)
     parser.add_argument("--reserve_gib", type=float, default=2.0)
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--score_normalization", choices=("trie", "full_vocab"), default="trie")
+    parser.add_argument("--ranking_loss_weight", type=float, default=0.0)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--beta", type=float, default=0.0)
     parser.add_argument("--fp16", action="store_true")
     args = parser.parse_args()
@@ -196,6 +216,11 @@ def main() -> None:
         raise ValueError("Require 1 <= start_batch_size <= max_batch_size and reserve_gib >= 0")
     if args.temperature <= 0 or args.beta < 0:
         raise ValueError("Require temperature > 0 and beta >= 0")
+    GRPOSettings(num_generations=args.num_generations, do_sample=args.do_sample == "true",
+                 temperature=args.temperature, beta=args.beta, score_normalization=args.score_normalization,
+                 ranking_loss_weight=args.ranking_loss_weight)
+    if args.gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be positive")
     tokenizer = AutoTokenizer.from_pretrained(args.checkpoint_path, local_files_only=True)
     from transformers import AutoConfig
     config = AutoConfig.from_pretrained(args.checkpoint_path, local_files_only=True)
@@ -225,6 +250,8 @@ def main() -> None:
     chosen = largest_fitting_batch(args.start_batch_size, args.max_batch_size, probe)
     result = {
         "batch_size": chosen, "num_generations": args.num_generations, "do_sample": args.do_sample == "true",
+        "score_normalization": args.score_normalization, "ranking_loss_weight": args.ranking_loss_weight,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "gpu": ordinal, "gpu_name": torch.cuda.get_device_name(device),
         "reserve_gib": args.reserve_gib, "max_batch_size": args.max_batch_size,
         "prompt_tokens": args.max_prompt_length,
