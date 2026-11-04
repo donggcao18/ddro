@@ -114,6 +114,14 @@ The stage log is `sft_baseline.log`; temporary predictions are under
 `sft_baseline/.predictions.rank*.jsonl` until merged into `predictions.jsonl`.
 Standalone inference accepts `--progress_interval` to change the interval.
 
+To reuse a completed baseline, set `RUN_BASELINE_INFERENCE=0` and
+`BASELINE_DIR=/path/to/previous-run/sft_baseline`. The script checks saved
+checkpoint/data/catalog/decoding provenance and copies the finished metrics and
+predictions into the new suite without running baseline model inference.
+The standalone TCA preset defaults to reusing your completed
+`url-coverage-20261103T185157Z/sft_baseline`; set `RUN_BASELINE_INFERENCE=1` to
+compute a new baseline. Validation and candidate inference remain enabled.
+
 `OUTPUT_ROOT` defaults to a timestamped directory. The suite refuses nonempty
 directories, preventing accidental overwrites. Individual training supports
 `--resume_from_checkpoint` through `train_coverage_vault.py`; the suite runner

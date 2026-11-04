@@ -8,6 +8,7 @@ from itertools import zip_longest
 from collections import Counter
 import json
 from pathlib import Path
+import shutil
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -19,6 +20,80 @@ from utils.retrieval_metrics import METRIC_NAMES
 
 EXPERIMENTS = ("multi_positive_dpo", "missed_positive_dpo", "multi_negative_dpo")
 AVAILABLE_EXPERIMENTS = (*EXPERIMENTS, "tca_grpo")
+
+
+def baseline_signature(args, metrics):
+    catalog = sorted(set(load_corpus(args.corpus_file)))
+    catalog_hash = sha256(json.dumps(catalog, ensure_ascii=True, separators=(",", ":")).encode()).hexdigest()
+    return {"checkpoint_path": str(Path(args.checkpoint_path).resolve()),
+            "test_sha256": fingerprint(args.test_input_file)["sha256"], "catalog_sha256": catalog_hash,
+            "max_prompt_length": args.max_prompt_length, "max_target_length": args.max_target_length,
+            "num_beams": min(args.num_beams, metrics["corpus_targets"]), "precision": args.precision,
+            "invalid_target_policy": args.invalid_target_policy, "score_normalization": "trie", "catalog_mode": "fixed"}
+
+
+def legacy_baseline_signature(source, metrics):
+    """Recover provenance for completed suites created before reuse metadata existed."""
+    root = source.parent
+    suite = json.loads((root / "suite_data.json").read_text(encoding="utf-8"))
+    manifests = sorted(root.glob("*/grpo_run.json"))
+    if not manifests:
+        raise ValueError("Legacy baseline needs its suite_data.json, data/corpus.jsonl and an experiment grpo_run.json")
+    arguments = json.loads(manifests[0].read_text(encoding="utf-8"))["arguments"]
+    catalog = sorted(set(load_corpus(root / "data/corpus.jsonl")))
+    return {"checkpoint_path": str(Path(metrics["model_path"]).resolve()),
+            "test_sha256": suite["test"]["sha256"],
+            "catalog_sha256": sha256(json.dumps(catalog, ensure_ascii=True, separators=(",", ":")).encode()).hexdigest(),
+            "max_prompt_length": arguments["max_prompt_length"], "max_target_length": arguments["max_target_length"],
+            "num_beams": metrics["num_beams"], "precision": "fp16" if arguments.get("fp16") else "fp32",
+            "invalid_target_policy": metrics["target_filtering"]["policy"],
+            "score_normalization": metrics["score_normalization"], "catalog_mode": metrics["catalog_mode"]}
+
+
+def baseline_artifacts(args):
+    """Record or reuse finished baseline inference; never run model generation."""
+    destination = Path(args.destination_dir)
+    source = Path(args.source_dir) if args.source_dir else destination
+    metrics = json.loads((source / "metrics.json").read_text(encoding="utf-8"))
+    missing_metrics = [name for name in METRIC_NAMES if name not in metrics]
+    if missing_metrics:
+        raise ValueError(f"Completed baseline is missing coverage metrics: {missing_metrics}")
+    predictions = source / "predictions.jsonl"
+    if not predictions.is_file():
+        raise ValueError("Baseline reuse requires completed predictions.jsonl, not temporary per-rank shards")
+    with predictions.open(encoding="utf-8") as handle:
+        if sum(bool(line.strip()) for line in handle) != metrics["num_queries"]:
+            raise ValueError("Baseline predictions are incomplete: row count does not match num_queries")
+    expected = baseline_signature(args, metrics)
+    for name in ("model_path", "num_beams", "score_normalization", "catalog_mode"):
+        actual = str(Path(metrics[name]).resolve()) if name == "model_path" else metrics[name]
+        wanted = expected["checkpoint_path"] if name == "model_path" else expected[name]
+        if actual != wanted:
+            raise ValueError(f"Baseline mismatch for {name}: {actual!r} != {wanted!r}")
+    if args.source_dir:
+        provenance = source / "baseline_provenance.json"
+        if provenance.is_file():
+            recorded = json.loads(provenance.read_text(encoding="utf-8"))
+            for name, key in (("metrics.json", "metrics_sha256"), ("predictions.jsonl", "predictions_sha256")):
+                if fingerprint(source / name)["sha256"] != recorded[key]:
+                    raise ValueError(f"Cached baseline {name} changed since its provenance was recorded")
+            previous = recorded["signature"]
+        else:
+            previous = legacy_baseline_signature(source, metrics)
+        mismatched = [name for name in expected if previous.get(name) != expected[name]]
+        if mismatched:
+            raise ValueError(f"Cannot reuse baseline: mismatched {', '.join(mismatched)}. Use RUN_BASELINE_INFERENCE=1 to recompute.")
+        if destination.exists() and any(destination.iterdir()):
+            raise ValueError("Baseline destination must be empty")
+        destination.mkdir(parents=True, exist_ok=True)
+        for name in ("metrics.json", "predictions.jsonl", "target_filtering.json", "excluded_targets.jsonl"):
+            if (source / name).is_file():
+                shutil.copy2(source / name, destination / name)
+    provenance = {"signature": expected, "reused_from": str(source.resolve()) if args.source_dir else None,
+                  "metrics_sha256": fingerprint(destination / "metrics.json")["sha256"],
+                  "predictions_sha256": fingerprint(destination / "predictions.jsonl")["sha256"]}
+    (destination / "baseline_provenance.json").write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
+    print(f"{'Reused' if args.source_dir else 'Recorded'} completed SFT baseline: {destination}", flush=True)
 
 
 def fingerprint(path):
@@ -124,8 +199,17 @@ def main():
     summary = subparsers.add_parser("summarize")
     summary.add_argument("--output_dir", required=True)
     summary.add_argument("--experiments", nargs="+", choices=AVAILABLE_EXPERIMENTS, default=list(EXPERIMENTS))
+    baseline = subparsers.add_parser("baseline")
+    baseline.add_argument("--source_dir", help="Existing completed sft_baseline directory; omit to record newly generated results.")
+    for name in ("destination_dir", "checkpoint_path", "test_input_file", "corpus_file"):
+        baseline.add_argument("--" + name, required=True)
+    baseline.add_argument("--max_prompt_length", type=int, default=256)
+    baseline.add_argument("--max_target_length", type=int, default=128)
+    baseline.add_argument("--num_beams", type=int, default=10)
+    baseline.add_argument("--precision", choices=("fp16", "fp32"), default="fp16")
+    baseline.add_argument("--invalid_target_policy", choices=("skip", "error"), default="skip")
     args = parser.parse_args()
-    (prepare if args.command == "prepare" else summarize)(args)
+    {"prepare": prepare, "summarize": summarize, "baseline": baseline_artifacts}[args.command](args)
 
 
 if __name__ == "__main__":

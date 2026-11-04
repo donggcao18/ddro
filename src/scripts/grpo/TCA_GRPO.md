@@ -134,8 +134,19 @@ batch divides 16; accumulation maintains 16 queries/GPU/update, 64 globally.
 The initial probe batch is 4, the cap 16. Memory calibration remains an estimate;
 evaluation and inference batches default independently to two queries/GPU.
 
-The runner prepares one inventory and evaluates SFT baseline test inference
-before calibration. Existing per-rank progress reports explain this stage.
+The runner prepares one inventory. By default the TCA preset reuses your
+completed SFT baseline from
+`/mnt/beegfs/scratch/congthanh_le/scratch/east/ddro/outputs/url-coverage-20261103T185157Z/sft_baseline`,
+skipping its repeated test decoding. Set `BASELINE_DIR` to another completed
+baseline directory if needed. Reuse verifies the checkpoint path, test-data
+hash, full inventory, prompt/target limits, precision, beams, filtering policy,
+and score convention. It copies the completed metrics/predictions into the new
+run so comparisons and SFT fallback remain available. It accepts older coverage
+suites using their saved data and training manifests; incomplete rank shards
+are not accepted. Set `RUN_BASELINE_INFERENCE=1` to regenerate the baseline.
+Training validation and final trained-candidate test inference still run.
+Existing processes do not pick up script changes; restart into a fresh output
+root if you want to skip an already-running baseline stage.
 `suite_data.json` now includes positive-label-count histograms for train,
 validation and test, so the prevalence of multi-positive queries is visible.
 
@@ -159,6 +170,10 @@ Examples:
 ```bash
 # Short end-to-end check, including baseline/candidate inference.
 MAX_STEPS=20 EVAL_STEPS=10 SAVE_STEPS=10 \
+bash src/scripts/grpo/run_url_tca_grpo_4v100.sh
+
+# Reuse another finished baseline, without baseline GPU decoding.
+BASELINE_DIR=/path/to/previous-run/sft_baseline \
 bash src/scripts/grpo/run_url_tca_grpo_4v100.sh
 
 # Use independent validation queries and an explicit corpus inventory.

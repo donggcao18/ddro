@@ -43,6 +43,8 @@ SEED="${SEED:-42}"
 RUN_DRY_RUN="${RUN_DRY_RUN:-1}"
 RUN_TRAINING="${RUN_TRAINING:-1}"
 RUN_INFERENCE="${RUN_INFERENCE:-${RUN_TRAINING}}"
+RUN_BASELINE_INFERENCE="${RUN_BASELINE_INFERENCE:-1}"
+BASELINE_DIR="${BASELINE_DIR:-}"
 PREPARE_ONLY="${PREPARE_ONLY:-0}"
 EXPERIMENTS="${EXPERIMENTS:-multi_positive_dpo missed_positive_dpo multi_negative_dpo}"
 DO_SAMPLE="${DO_SAMPLE:-false}"
@@ -55,7 +57,7 @@ fi
 for name in NUM_GPUS MAX_PROMPT_LENGTH MAX_TARGET_LENGTH NUM_GENERATIONS EVAL_NUM_BEAMS INFERENCE_BATCH_SIZE EVAL_BATCH_SIZE TRAIN_BATCH_SIZE MAX_TRAIN_BATCH_SIZE QUERIES_PER_GPU_PER_STEP POSITIVES_PER_QUERY NEGATIVES_PER_QUERY EVAL_STEPS SAVE_STEPS SAVE_TOTAL_LIMIT; do
   if ! [[ "${!name}" =~ ^[1-9][0-9]*$ ]]; then echo "${name} must be a positive integer." >&2; exit 2; fi
 done
-for name in RUN_DRY_RUN RUN_TRAINING RUN_INFERENCE PREPARE_ONLY AUTO_TUNE_BATCH_SIZE; do
+for name in RUN_DRY_RUN RUN_TRAINING RUN_INFERENCE RUN_BASELINE_INFERENCE PREPARE_ONLY AUTO_TUNE_BATCH_SIZE; do
   if [[ "${!name}" != 0 && "${!name}" != 1 ]]; then echo "${name} must be 0 or 1." >&2; exit 2; fi
 done
 read -r -a EXPERIMENT_NAMES <<< "${EXPERIMENTS}"
@@ -103,8 +105,19 @@ infer_model() {
     --max_prompt_length "${MAX_PROMPT_LENGTH}" --max_target_length "${MAX_TARGET_LENGTH}" "${PRECISION_ARGS[@]}"
 }
 if [[ "${RUN_INFERENCE}" == 1 ]]; then
-  echo "=== SFT baseline test inference (${NUM_GPUS} GPUs, ${EVAL_NUM_BEAMS} beams); training starts after this finishes ==="
-  infer_model "${CHECKPOINT_PATH}" "${OUTPUT_ROOT}/sft_baseline" 2>&1 | tee "${OUTPUT_ROOT}/sft_baseline.log"
+  BASELINE_ARGS=(src/pretrain/coverage_experiments.py baseline --destination_dir "${OUTPUT_ROOT}/sft_baseline"
+    --checkpoint_path "${CHECKPOINT_PATH}" --test_input_file "${TEST_INPUT_FILE}" --corpus_file "${DATA_DIR}/corpus.jsonl"
+    --max_prompt_length "${MAX_PROMPT_LENGTH}" --max_target_length "${MAX_TARGET_LENGTH}" --num_beams "${EVAL_NUM_BEAMS}"
+    --precision "${PRECISION}" --invalid_target_policy "${GRPO_INVALID_TARGET_POLICY}")
+  if [[ "${RUN_BASELINE_INFERENCE}" == 1 ]]; then
+    echo "=== SFT baseline test inference (${NUM_GPUS} GPUs, ${EVAL_NUM_BEAMS} beams); training starts after this finishes ==="
+    infer_model "${CHECKPOINT_PATH}" "${OUTPUT_ROOT}/sft_baseline" 2>&1 | tee "${OUTPUT_ROOT}/sft_baseline.log"
+  else
+    if [[ -z "${BASELINE_DIR}" ]]; then echo "Set BASELINE_DIR to completed SFT baseline results when RUN_BASELINE_INFERENCE=0." >&2; exit 2; fi
+    echo "=== Reusing completed SFT baseline: ${BASELINE_DIR}; skipping baseline decoding ==="
+    BASELINE_ARGS+=(--source_dir "${BASELINE_DIR}")
+  fi
+  "${PYTHON_BIN}" "${BASELINE_ARGS[@]}"
 fi
 if [[ "${RUN_TRAINING}" == 1 && "${AUTO_TUNE_BATCH_SIZE}" == 1 ]]; then
   echo "=== Calibrating preference-training memory and query batch size ==="
