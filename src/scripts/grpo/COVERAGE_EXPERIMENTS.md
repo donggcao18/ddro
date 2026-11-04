@@ -104,6 +104,16 @@ baseline: Hit/MRR, Recall, Precision, nDCG, and distinct relevant counts at
 SFT fallback test results reuse the baseline inference. No test-based winner is
 automatically selected.
 
+The suite runs SFT baseline test inference **before** memory calibration or
+training. A `Target filtering` message at this stage is not a training update.
+Inference prints a start message and per-GPU local query counts, throughput,
+and ETA after the first batch, approximately every 30 seconds after subsequent
+batches, and at completion. Reports are independent per rank, with no extra
+distributed synchronization. Prediction shards are flushed at these reports.
+The stage log is `sft_baseline.log`; temporary predictions are under
+`sft_baseline/.predictions.rank*.jsonl` until merged into `predictions.jsonl`.
+Standalone inference accepts `--progress_interval` to change the interval.
+
 `OUTPUT_ROOT` defaults to a timestamped directory. The suite refuses nonempty
 directories, preventing accidental overwrites. Individual training supports
 `--resume_from_checkpoint` through `train_coverage_vault.py`; the suite runner

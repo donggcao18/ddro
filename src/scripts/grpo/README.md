@@ -4,6 +4,9 @@ For the three independent post-SFT preference experiments and coverage metrics,
 see [COVERAGE_EXPERIMENTS.md](COVERAGE_EXPERIMENTS.md). Run them together with
 `bash src/scripts/grpo/run_url_coverage_experiments_4v100.sh`.
 
+For experiment 2 with token-level trajectory rewards, see [TCA_GRPO.md](TCA_GRPO.md)
+and run `bash src/scripts/grpo/run_url_tca_grpo_4v100.sh`.
+
 This path trains encoder-decoder T5/CodeT5 retrievers from an existing SFT
 checkpoint. Each query produces independently sampled, trie-constrained document
 IDs. A completed ID in the query's known positive set receives **1**, everything

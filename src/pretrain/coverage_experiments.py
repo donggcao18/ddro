@@ -5,6 +5,7 @@ import argparse
 import csv
 from hashlib import sha256
 from itertools import zip_longest
+from collections import Counter
 import json
 from pathlib import Path
 import sys
@@ -17,6 +18,7 @@ from utils.retrieval_metrics import METRIC_NAMES
 
 
 EXPERIMENTS = ("multi_positive_dpo", "missed_positive_dpo", "multi_negative_dpo")
+AVAILABLE_EXPERIMENTS = (*EXPERIMENTS, "tca_grpo")
 
 
 def fingerprint(path):
@@ -39,7 +41,7 @@ def prepare(args):
         train, validation = split_queries(train, args.validation_split, args.seed)
     # The inventory is fixed before all experiments. Test query text and test
     # relevance labels never enter training; only document URLs extend inventory.
-    _, test_catalog = prepare_url_file(args.test_input_file, include_positive_targets_in_corpus=False)
+    test_rows, test_catalog = prepare_url_file(args.test_input_file, include_positive_targets_in_corpus=False)
     catalog = sorted(set(catalog) | set(test_catalog))
     if args.corpus_file:
         catalog = load_corpus(args.corpus_file)
@@ -56,7 +58,9 @@ def prepare(args):
               "corpus": fingerprint(args.corpus_file) if args.corpus_file else None,
               "seed": args.seed, "validation_split": args.validation_split,
               "train_queries": len(train), "validation_queries": len(validation), "corpus_targets": len(catalog),
-              "experiments": list(EXPERIMENTS),
+              "experiments": list(getattr(args, "experiments", EXPERIMENTS)),
+              "positive_label_histograms": {name: dict(sorted(Counter(len(row["positive_targets"]) for row in rows).items()))
+                                            for name, rows in (("train", train), ("validation", validation), ("test", test_rows))},
               "inventory_rule": "explicit corpus, or training inventory plus validation/test record document URLs; no test-label-derived IDs"}
     (root / "suite_data.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2))
@@ -116,9 +120,10 @@ def main():
     preparation.add_argument("--validation_split", type=float, default=.01)
     preparation.add_argument("--seed", type=int, default=42)
     preparation.add_argument("--output_dir", required=True)
+    preparation.add_argument("--experiments", nargs="+", choices=AVAILABLE_EXPERIMENTS, default=list(EXPERIMENTS))
     summary = subparsers.add_parser("summarize")
     summary.add_argument("--output_dir", required=True)
-    summary.add_argument("--experiments", nargs="+", choices=EXPERIMENTS, default=list(EXPERIMENTS))
+    summary.add_argument("--experiments", nargs="+", choices=AVAILABLE_EXPERIMENTS, default=list(EXPERIMENTS))
     args = parser.parse_args()
     (prepare if args.command == "prepare" else summarize)(args)
 

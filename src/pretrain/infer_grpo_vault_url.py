@@ -8,6 +8,7 @@ import heapq
 import json
 import os
 import sys
+import time
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -42,12 +43,17 @@ def parse_args() -> argparse.Namespace:
                         default=os.environ.get("GRPO_INVALID_TARGET_POLICY", "error"))
     parser.add_argument("--device", default="auto", help="auto, cpu, or cuda:N; auto binds torchrun workers to LOCAL_RANK.")
     parser.add_argument("--fp16", action="store_true")
+    parser.add_argument("--progress_interval", type=float, default=30.,
+                        help="Seconds between per-rank progress reports; 0 keeps only first/final batch reports.")
     return parser.parse_args()
 
 
 def run_inference(args: argparse.Namespace) -> dict[str, Any]:
     if min(args.batch_size, args.max_prompt_length, args.max_target_length) < 1 or args.num_beams < 10:
         raise ValueError("Batch/token limits must be positive and num_beams must be >= 10 for Hit/MRR@10")
+    progress_interval = getattr(args, "progress_interval", 30.)
+    if not 0 <= progress_interval < float("inf"):
+        raise ValueError("progress_interval must be finite and nonnegative")
     rank = int(os.environ.get("RANK", "0"))
     world = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -96,6 +102,10 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
         sums = {name: 0.0 for name in METRIC_NAMES}
         local_count = 0
         indices = list(range(rank, len(rows), world))
+        started = last_report = time.monotonic()
+        print(f"[inference rank {rank}/{world}] Starting: device={device}, local queries={len(indices)}, "
+              f"total queries={len(rows)}, batch={args.batch_size}, beams={beams}, catalog={len(catalog)}, "
+              f"model={args.model_path}. Decoding first batch...", flush=True)
         with shard_path.open("w", encoding="utf-8") as handle:
             for offset in range(0, len(indices), args.batch_size):
                 positions = indices[offset:offset + args.batch_size]
@@ -124,6 +134,19 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
                         **scores,
                     }
                     handle.write(json.dumps(prediction, ensure_ascii=True) + "\n")
+                now = time.monotonic()
+                if offset == 0 or local_count == len(indices) or (progress_interval and now - last_report >= progress_interval):
+                    # Make the existing prediction shard useful for monitoring
+                    # without flushing every query on a shared filesystem.
+                    handle.flush()
+                    elapsed = max(now - started, 1e-9)
+                    rate = local_count / elapsed
+                    remaining = (len(indices) - local_count) / rate
+                    print(f"[inference rank {rank}/{world}] {local_count}/{len(indices)} local queries "
+                          f"({100 * local_count / len(indices):.1f}%); elapsed={elapsed:.1f}s; "
+                          f"rate={rate:.2f} queries/s; ETA={remaining:.1f}s", flush=True)
+                    last_report = now
+        print(f"[inference rank {rank}/{world}] Local decoding complete; aggregating metrics.", flush=True)
         totals = torch.tensor([local_count, *[sums[name] for name in METRIC_NAMES]], dtype=torch.float64, device=device)
         if world > 1:
             dist.all_reduce(totals, op=dist.ReduceOp.SUM)
@@ -145,6 +168,7 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
             "score_normalization": normalization,
         }
         if rank == 0:
+            print(f"[inference] Merging {world} prediction shard(s) into {destination / 'predictions.jsonl'}", flush=True)
             shards = [destination / f".predictions.rank{i}.jsonl" for i in range(world)]
             merged = heapq.merge(*(iter_json_records(path) for path in shards), key=lambda row: row["query_index"])
             written = write_jsonl(destination / "predictions.jsonl", merged, ensure_ascii=True)

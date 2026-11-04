@@ -170,14 +170,16 @@ def build_trainer(args: argparse.Namespace, *, settings: GRPOSettings | None = N
     trainer_parameters = inspect.signature(Seq2SeqGRPOTrainer.__mro__[1].__init__).parameters
     trainer_kwargs["processing_class" if "processing_class" in trainer_parameters else "tokenizer"] = tokenizer
     trainer = trainer_class(**trainer_kwargs)
+    objective = getattr(settings, "objective", "grpo")
+    preference_supervision = require_reference and objective != "tca_grpo"
     if trainer.is_world_process_zero():
         destination = Path(args.output_dir)
         destination.mkdir(parents=True, exist_ok=True)
         manifest = {
             "implementation_version": 2,
             "arguments": vars(args), "grpo": asdict(settings),
-            "objective": getattr(settings, "objective", "grpo"),
-            "rollout_mode": ("online_beam_negative_mining" if require_reference else
+            "objective": objective,
+            "rollout_mode": ("online_beam_negative_mining" if preference_supervision else
                              "sampled_grpo" if settings.do_sample else "beam_selected_variant"),
             "scoring_temperature": settings.scoring_temperature,
             "update_monitor_parameter": trainer.update_monitor.parameter_name,
@@ -186,12 +188,13 @@ def build_trainer(args: argparse.Namespace, *, settings: GRPOSettings | None = N
             "corpus_targets": len(allowed_targets),
             "target_filtering": index.filtering_summary, "query_filtering": query_filtering,
             "recall_k": min(settings.eval_num_beams, len(allowed_targets)),
-            "reward": ("annotated-positive preference supervision; no GRPO advantages" if require_reference else
-                       "1 iff completed target is in the query positive set; otherwise 0"),
+            "reward": getattr(settings, "reward_description", (
+                "annotated-positive preference supervision; no GRPO advantages" if preference_supervision else
+                "1 iff completed target is in the query positive set; otherwise 0")),
         }
         (destination / "grpo_run.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(manifest, indent=2))
-        if not settings.do_sample and not require_reference:
+        if not settings.do_sample and not preference_supervision:
             print("Deterministic beam rollouts enabled: this selection-biased variant is not on-policy sampled GRPO. "
                   "Temperature is ignored; signed group advantages are retained.")
         if settings.ranking_loss_weight:

@@ -101,7 +101,9 @@ def grpo_loss(
     reference_logps: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     ratio = (logps - old_logps).exp()
-    advantage = advantages[:, None]
+    advantage = advantages[:, None] if advantages.ndim == 1 else advantages
+    if advantage.shape not in {(logps.shape[0], 1), logps.shape}:
+        raise ValueError("Advantages must have one value per trajectory or one per token")
     surrogate = torch.minimum(ratio * advantage, ratio.clamp(1 - epsilon, 1 + epsilon) * advantage)
     kl = torch.zeros_like(logps)
     if beta:
