@@ -1,8 +1,8 @@
 {
   "checkpoint_path": "/home/users/congthanh_le/scratch/veil/CodeGR/outputs/DSI_JavaScript_url__qg_t5_max_lr/checkpoint-600000",
   "input_format": "multilabel",
-  "query_file": "/home/users/congthanh_le/scratch/veil/CodeGR/data/updated_url/Javascript_merged_multilabel.jsonl",
-  "infer_file": "/home/users/congthanh_le/scratch/veil/CodeGR/data/updated_url/Javascript_test_r32.0_multilabel.json",
+  "query_file": "/home/users/congthanh_le/scratch/veil/CodeGR/data/updated_url/JavaScript_merged_multilabel.jsonl",
+  "infer_file": "/home/users/congthanh_le/scratch/veil/CodeGR/data/updated_url/JavaScript_test_r32.0_multilabel.json",
   "output_dir": "/home/users/congthanh_le/scratch/east/ddro/outputs/vault-iterative-dpo-ema-v100-url-lr1e5-b64-Javascript",
   "target_type": "url_based_id",
   "queries_per_round": 10000,
