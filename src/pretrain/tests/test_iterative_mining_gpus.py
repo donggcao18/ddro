@@ -13,7 +13,9 @@ sys.path.insert(0, str(SRC))
 sys.path.insert(0, str(SRC / "scripts/bm25/the_vault"))
 from common import iter_json_records
 from pretrain.iterative_dpo_utils import atomic_json, atomic_jsonl, checkpoint_hash, file_hash, read_json
-from pretrain.mine_on_gpus import merge_stats, run_sharded, run_workers, split_batches, validate_cuda
+from pretrain.mine_on_gpus import (
+    PRE_NEGATIVE_SELECTION_MERGE_HASHES, merge_stats, run_sharded, run_workers, split_batches, validate_cuda,
+)
 from pretrain.train_iterative_ddro_vault import (
     generation_command, load_config, run_pipeline,
 )
@@ -41,6 +43,7 @@ class MiningGPUTest(unittest.TestCase):
         atomic_json(output.with_suffix(".stats.json"), {
             "queries_seen": len(rows), "queries_processed": len(rows), "model_pairs_written": len(pairs),
             "documents": 123, "num_beams": 10, "device": f"cuda:{job['rank']}",
+            "negative_selection": "before_chosen_or_beam_tail",
             "candidate_count_distribution": {"0": sum(int(row["query_key"]) % 3 == 0 for row in rows)},
         })
 
@@ -87,6 +90,9 @@ class MiningGPUTest(unittest.TestCase):
         self.assertEqual(result["metrics"]["hit@10"], 0.8)
         with self.assertRaisesRegex(ValueError, "metadata differs"):
             merge_stats([{"documents": 1}, {"documents": 2}], Path("out"), 2)
+        with self.assertRaisesRegex(ValueError, "metadata differs: negative_selection"):
+            merge_stats([{"negative_selection": "before_chosen_or_beam_tail"},
+                         {"negative_selection": "other"}], Path("out"), 2)
 
     def test_insufficient_visible_devices_fail_before_launch(self):
         with patch.dict(sys.modules, {"torch": SimpleNamespace(cuda=SimpleNamespace(device_count=lambda: 1))}):
@@ -118,9 +124,17 @@ class MiningGPUTest(unittest.TestCase):
             result = run_sharded(argv, 2, resume, lambda *_: None)
             self.assertEqual(result["queries_seen"], 7)
             self.assertEqual(result["documents"], 123)
+            self.assertEqual(result["negative_selection"], "before_chosen_or_beam_tail")
             keys = [row["query_key"] for row in iter_json_records(root / "preferences.jsonl")]
             self.assertEqual(keys, [str(i) for i in range(7) for _ in range(i % 3)])
             before = file_hash(root / "preferences.jsonl")
+            # Simulate completed workers from the preceding launcher. The
+            # changed merger can use their outputs without rerunning CUDA.
+            launcher_path = str(SRC / "pretrain/mine_on_gpus.py")
+            for marker in (root / "preferences.shards").glob("gpu-*/complete.json"):
+                saved = read_json(marker)
+                saved["identity"]["code"][launcher_path] = sorted(PRE_NEGATIVE_SELECTION_MERGE_HASHES)[0]
+                atomic_json(marker, saved)
             run_sharded(argv, 2, lambda *_: self.fail("Unexpected recomputation"), lambda *_: None)
             self.assertEqual(before, file_hash(root / "preferences.jsonl"))
             shard = root / "preferences.shards/gpu-001/preferences.jsonl"
@@ -223,6 +237,29 @@ class MiningGPUTest(unittest.TestCase):
             atomic_json(path, state)
             with self.assertRaisesRegex(ValueError, "Resume config"):
                 run_pipeline(cfg, resume=True, runner=worker)
+
+    def test_resume_after_failed_shard_merge_accepts_known_code_upgrade(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = load_config(fixture(root))
+
+            def fail(_):
+                raise ValueError("Unexpected mining counter: negative_selection")
+
+            with self.assertRaisesRegex(ValueError, "negative_selection"):
+                run_pipeline(cfg, runner=fail)
+            manifest = root / "run/run_manifest.json"
+            state = read_json(manifest)
+            code = state["identity"]["code"]
+            code[str(SRC / "pretrain/train_iterative_ddro_vault.py")] = (
+                "8338dafab3f2c41d62c1dc05f2b4ebe66f80d96cb2937d9f98550cb5f1a4cf16")
+            code[str(SRC / "pretrain/mine_on_gpus.py")] = sorted(PRE_NEGATIVE_SELECTION_MERGE_HASHES)[0]
+            self.assertNotIn("baseline", state["stages"])
+            atomic_json(manifest, state)
+
+            result = run_pipeline(cfg, resume=True, runner=FixtureWorker())
+            self.assertTrue(result["complete"])
+            self.assertIn("baseline", result["stages"])
 
     def test_processes_run_concurrently_and_worker_errors_are_reported(self):
         with tempfile.TemporaryDirectory() as tmp:

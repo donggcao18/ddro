@@ -31,9 +31,15 @@ max_target_length tokenizer_collision_groups allowed_collision_groups
 excluded_collision_targets excluded_collision_text_ids excluded_overlength_targets
 truncated_targets excluded_overlength_text_ids model_mining_excluded_targets
 model_mining_excluded_text_ids checkpoint num_beams negatives_per_query seed
-round_id policy_fingerprint length_penalty beam_early_stopping
+round_id policy_fingerprint length_penalty beam_early_stopping negative_selection
 """.split())
 OUTPUT_STATS = {"device", "output", "exclusions_output", "collision_exclusions_output"}
+# The preceding launcher wrote the same worker artifacts but failed to merge
+# the negative_selection field. Its completed shards are safe to reuse.
+PRE_NEGATIVE_SELECTION_MERGE_HASHES = {
+    "4cc72a1c0a794ab0e0c06662cd938187559ceae5afd68159dc9b87c356d00da2",
+    "e25264fd1d35e37fe3028628e33a95a6eb21f1538384baddd4f8ccf3c9565160",
+}
 
 
 def split_batches(rows: list[dict], batch_size: int, workers: int) -> list[list[dict]]:
@@ -169,6 +175,7 @@ def run_sharded(argv: list[str], workers: int, launcher=run_workers, device_chec
     policy_hash = checkpoint_hash(args.checkpoint_path)
     if args.checkpoint_fingerprint and args.checkpoint_fingerprint != policy_hash:
         raise ValueError("Mining policy checkpoint fingerprint changed")
+    launcher_path = str(Path(__file__))
     identity = {"args": vars(args), "workers": workers, "checkpoint": policy_hash,
                 "query_hash": file_hash(args.query_metadata), "document_hash": file_hash(args.document_metadata),
                 "code": {str(p): file_hash(p) for p in (
@@ -197,8 +204,15 @@ def run_sharded(argv: list[str], workers: int, launcher=run_workers, device_chec
                "keys": {row["query_key"] for row in shard},
                "identity": {**identity, "rank": rank, "shard_hash": file_hash(queries)}}
         jobs.append(job)
-        if job["marker"].exists() and read_json(job["marker"])["identity"] == job["identity"]:
-            assert_file_hashes(read_json(job["marker"])["artifacts"])
+        marker = read_json(job["marker"]) if job["marker"].exists() else None
+        saved = marker["identity"] if marker is not None else None
+        compatible = False
+        if saved is not None and saved["code"].get(launcher_path) in PRE_NEGATIVE_SELECTION_MERGE_HASHES:
+            compatible = {**saved, "code": {**saved["code"], launcher_path: identity["code"][launcher_path]}} == job["identity"]
+        if saved == job["identity"] or compatible:
+            assert_file_hashes(marker["artifacts"])
+            if compatible:
+                atomic_json(job["marker"], {**marker, "identity": job["identity"]})
             print(f"Mining GPU {rank}: reusing completed shard", flush=True)
         else:
             pending.append(job)

@@ -26,6 +26,7 @@ from pretrain.iterative_dpo_utils import (
 )
 from pretrain.update_dpo_reference import reference_identity
 from pretrain.checkpoint_retention import checkpoint_pruned, prune_round_checkpoints, resume_after_pruning
+from pretrain.mine_on_gpus import PRE_NEGATIVE_SELECTION_MERGE_HASHES
 
 
 DEFAULTS = {
@@ -70,6 +71,9 @@ MINING_COMPATIBLE_CONTROLLERS = EVALUATION_COMPATIBLE_CONTROLLERS | {
 }
 RUNTIME_KEYS = EVALUATION_SCHEDULE_KEYS | {"mining_num_gpus", "mining_batch_size", "keep_last_round_checkpoints"}
 ROUND_RESUME_COMPATIBLE_CONTROLLERS = MINING_COMPATIBLE_CONTROLLERS | {
+    # Controller before support for resuming the shard statistics fix (LF / CRLF).
+    "8338dafab3f2c41d62c1dc05f2b4ebe66f80d96cb2937d9f98550cb5f1a4cf16",
+    "1d6efbaee30527e4cf6bf6609991111ebb4979579a1f1b83b69ac0dec5e537d4",
     # Controller before optional checkpoint retention (LF / CRLF).
     "f0eeeb3fd73ab76a4f8c8327c3d3397e13767c960da86a3f78317f0281f550ca",
     "dcfc8d84703221614b46f77c136df42eaea0d4515aab1cf7d69efad92c527f94",
@@ -110,7 +114,7 @@ INFERENCE_COMPATIBLE_CODE = {
     str(SRC / "pretrain/mine_on_gpus.py"): {
         "fe6cbce8e6348979ba2978ca6eba98a9a82a92fe9e3aebf1a3c2b5b8744abea6",
         "6f232d6678897cec254830f4a1c4d264435c0df6ad57907db6d8300c349125fd",
-    },
+    } | PRE_NEGATIVE_SELECTION_MERGE_HASHES,
 }
 
 
