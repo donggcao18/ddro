@@ -69,6 +69,15 @@ ROUND_RESUME_COMPATIBLE_CONTROLLERS = MINING_COMPATIBLE_CONTROLLERS | {
     "a64a0b9ddd8bc57498cf729ccca88eadfb5e807a96ce0c1232a182f37cd33f84",
     "ef0d41ecb5391c9f3a5f65aaa4b1870cadd884cecc11798303bf39f4abc0a053",
 }
+PRE_CACHE_VAULT_TRAINERS = {
+    "fbc7e58d2839aa651bd8b33df516dcbecd49f837302c84d95677d4598ecbe152",
+    "d5013fda8f30f555a73963f8bca84dcad05a0526b261e89726c81de09570166a",
+}
+PRE_CACHE_CONTROLLERS = {
+    "8c56f70909846fe8174c1c357c7e858c44b035d032d64ce348efdb1119f4cd7b",
+    "b169d7fb60162607540180d1c3b7d4a73022fbbaf2b6490edefa1976fd5fff65",
+}
+STARTUP_HELPERS = (SRC / "pretrain/preference_cache.py", SRC / "pretrain/startup_diagnostics.py")
 
 
 def skipped_round_stage(name: str, start_round: int) -> bool:
@@ -87,7 +96,7 @@ def verify_start_checkpoint(path: str, fingerprint: str, role: str, round_id: in
 
 
 def accept_evaluation_resume_update(state: dict, identity: dict, start_round=0) -> None:
-    """Permit scheduling/mining concurrency changes, preserving committed training."""
+    """Permit compatible runtime upgrades while preserving committed training."""
     previous = state["identity"]
     previous_config = {k: v for k, v in previous["config"].items() if k not in RUNTIME_KEYS}
     current_config = {k: v for k, v in identity["config"].items() if k not in RUNTIME_KEYS}
@@ -105,13 +114,20 @@ def accept_evaluation_resume_update(state: dict, identity: dict, start_round=0) 
     if (previous_code.get(controller) in MINING_COMPATIBLE_CONTROLLERS
             and mining_launcher not in previous_code):
         allowed_code.add(mining_launcher)
+    trainer_path = str(SRC / "pretrain/train_ddro_vault.py")
+    startup_helpers = {str(path) for path in STARTUP_HELPERS}
+    if (previous_code.get(trainer_path) in PRE_CACHE_VAULT_TRAINERS
+            and startup_helpers.isdisjoint(previous_code)):
+        allowed_code.update(startup_helpers | {trainer_path})
+        # The controller changed to record these new trainer dependencies.
+        valid_controller = valid_controller or previous_code.get(controller) in PRE_CACHE_CONTROLLERS
     if (previous_config != current_config or not valid_controller
             or {k: v for k, v in previous_code.items() if k not in allowed_code}
             != {k: v for k, v in current_code.items() if k not in allowed_code}
             or {k: v for k, v in previous.items() if k not in {"code", "config"}}
             != {k: v for k, v in identity.items() if k not in {"code", "config"}}):
         raise ValueError("Resume config, source data, code, environment, or SFT checkpoint changed; "
-                         "only evaluation scheduling, mining_num_gpus, and the compatible controller upgrade may change")
+                         "only evaluation scheduling, mining_num_gpus, and compatible runtime upgrades may change")
     # Do not accept an upgrade over altered committed artifacts.
     for name, artifacts in state["stages"].items():
         if not skipped_round_stage(name, start_round):
@@ -373,6 +389,7 @@ def _run_pipeline(cfg, output, resume, prepare_only, runner, start_round=0):
     manifest_path = output / "run_manifest.json"
     sources = [cfg["query_file"], *cfg["corpus_files"], *cfg["structure_id_sources"]]
     code = [Path(__file__), SRC / "pretrain/train_ddro_vault.py",
+            *STARTUP_HELPERS,
             SRC / "pretrain/update_dpo_reference.py",
             SRC / "pretrain/iterative_dpo_utils.py", SRC / "data/data_prep/prepare_vault_dpo_metadata.py",
             MINING / "mine_model_confusion_negatives.py", MINING / "prepare_bm25.py", MINING / "common.py",
