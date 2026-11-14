@@ -28,9 +28,17 @@ from transformers import (
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
     EarlyStoppingCallback,
+    TrainerCallback,
     set_seed,
 )
 from trl import DPOConfig, DPOTrainer
+
+if __package__:
+    from .preference_cache import TokenizationCacheDataset
+    from .startup_diagnostics import StartupDiagnostics
+else:
+    from preference_cache import TokenizationCacheDataset
+    from startup_diagnostics import StartupDiagnostics
 
 
 PREFERENCE_COLUMNS = ("prompt", "chosen", "rejected")
@@ -38,6 +46,13 @@ PREFERENCE_COLUMNS = ("prompt", "chosen", "rejected")
 
 def positive_float(value: str) -> float:
     parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be greater than zero")
+    return parsed
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be greater than zero")
     return parsed
@@ -74,6 +89,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validation_split", type=unit_interval, default=0.01)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dataset_num_proc", type=int, default=8)
+    parser.add_argument("--dataset_cache_dir", help="Datasets cache directory shared by training ranks")
+    parser.add_argument(
+        "--tokenization_writer_batch_size", type=positive_int, default=1000,
+        help="Rows per Arrow write batch during TRL tokenization (default: 1000)",
+    )
+    parser.add_argument("--ddp_timeout", type=positive_int, default=1800, help="DDP timeout in seconds")
+    parser.add_argument(
+        "--startup_debug", type=int, default=0, metavar="SECONDS",
+        help="Log distributed startup stages and dump Python stacks every SECONDS until the first step",
+    )
 
     parser.add_argument("--max_prompt_length", type=int, default=128)
     parser.add_argument("--max_target_length", type=int, default=32)
@@ -220,7 +245,11 @@ def load_preference_datasets(args: argparse.Namespace) -> DatasetDict:
     if args.eval_file:
         data_files["validation"] = args.eval_file
 
-    datasets = load_dataset("json", data_files=data_files)
+    cache_dir = args.dataset_cache_dir
+    if cache_dir:
+        cache_dir = str(Path(cache_dir).expanduser().resolve())
+        print(f"Datasets cache root: {cache_dir}", flush=True)
+    datasets = load_dataset("json", data_files=data_files, cache_dir=cache_dir)
     datasets = DatasetDict(
         {
             name: clean_preference_dataset(split, name, args.dataset_num_proc)
@@ -372,13 +401,23 @@ def build_training_args(args: argparse.Namespace, has_eval: bool) -> DPOConfig:
         gradient_checkpointing=args.gradient_checkpointing,
         dataloader_num_workers=args.dataloader_num_workers,
         dataset_num_proc=args.dataset_num_proc,
+        ddp_timeout=args.ddp_timeout,
         remove_unused_columns=False,
         report_to=report_to,
     )
 
 
-def main() -> None:
-    args = parse_args()
+class StartupStepCallback(TrainerCallback):
+    def __init__(self, debug: StartupDiagnostics):
+        self.debug = debug
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self.debug.active:
+            self.debug.mark(f"First training step finished (global step {state.global_step})")
+            self.debug.stop()
+
+
+def train(args: argparse.Namespace, debug: StartupDiagnostics) -> None:
     if args.max_prompt_length <= 0 or args.max_target_length <= 0:
         raise ValueError("Token length limits must be greater than zero")
     if args.dataset_num_proc <= 0:
@@ -390,7 +429,9 @@ def main() -> None:
 
     checkpoint_path = validate_checkpoint(args.checkpoint_path)
     set_seed(args.seed)
+    debug.mark("Loading preference datasets")
     datasets = load_preference_datasets(args)
+    debug.mark("Preference datasets ready")
     tokenizer, config = load_tokenizer_and_config(
         checkpoint_path, args.trust_remote_code
     )
@@ -427,6 +468,9 @@ def main() -> None:
         )
     training_args = build_training_args(args, has_eval)
     callbacks = []
+    if args.startup_debug:
+        debug.probe(training_args.device)
+        callbacks.append(StartupStepCallback(debug))
     if has_eval and args.early_stopping_patience > 0:
         callbacks.append(
             EarlyStoppingCallback(
@@ -434,6 +478,11 @@ def main() -> None:
             )
         )
 
+    datasets = DatasetDict({
+        name: TokenizationCacheDataset.from_dataset(split, args.tokenization_writer_batch_size)
+        for name, split in datasets.items()
+    })
+    debug.mark("Initializing DPOTrainer")
     trainer = DPOTrainer(
         model=model,
         ref_model=reference_model,
@@ -444,7 +493,9 @@ def main() -> None:
         is_encoder_decoder=True,
         callbacks=callbacks,
     )
+    debug.mark("DPOTrainer initialized. Entering distributed training setup")
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+    debug.stop()
 
     # Keep checkpoints resumable in output_dir and place the portable inference
     # artifact in final/.  This has the same config/weights/tokenizer layout as SFT.
@@ -454,6 +505,12 @@ def main() -> None:
     tokenizer.save_pretrained(final_dir)
     trainer.save_state()
     print(f"Saved final Hugging Face DPO model to {final_dir}")
+
+
+def main() -> None:
+    args = parse_args()
+    with StartupDiagnostics(args.startup_debug) as debug:
+        train(args, debug)
 
 
 if __name__ == "__main__":

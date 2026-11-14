@@ -33,6 +33,10 @@ SEED="${SEED:-42}"
 RUN_DRY_RUN="${RUN_DRY_RUN:-1}"
 RUN_TRAINING="${RUN_TRAINING:-1}"
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
+DATASET_CACHE_DIR="${DATASET_CACHE_DIR:-${HF_DATASETS_CACHE:-}}"
+TOKENIZATION_WRITER_BATCH_SIZE="${TOKENIZATION_WRITER_BATCH_SIZE:-1000}"
+DDP_TIMEOUT="${DDP_TIMEOUT:-1800}"
+STARTUP_DEBUG="${STARTUP_DEBUG:-0}"
 
 if [[ -z "${CHECKPOINT_PATH}" || ! -d "${CHECKPOINT_PATH}" ]]; then
   echo "Set CHECKPOINT_PATH to an existing URL SFT checkpoint." >&2
@@ -72,6 +76,9 @@ TRAIN_ARGS=(
   --per_device_eval_batch_size "${EVAL_BATCH_SIZE}"
   --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}"
   --dataset_num_proc "${DATASET_NUM_PROC}"
+  --tokenization_writer_batch_size "${TOKENIZATION_WRITER_BATCH_SIZE}"
+  --ddp_timeout "${DDP_TIMEOUT}"
+  --startup_debug "${STARTUP_DEBUG}"
   --dataloader_num_workers "${DATALOADER_NUM_WORKERS}"
   --learning_rate "${LEARNING_RATE}"
   --beta "${DPO_BETA}"
@@ -81,9 +88,13 @@ TRAIN_ARGS=(
   --gradient_checkpointing
 )
 if [[ "${PRECISION}" == "fp16" ]]; then TRAIN_ARGS+=(--fp16); fi
+if [[ -n "${DATASET_CACHE_DIR}" ]]; then
+  TRAIN_ARGS+=(--dataset_cache_dir "${DATASET_CACHE_DIR}")
+fi
 if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then
   TRAIN_ARGS+=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
 fi
+TRAIN_ARGS+=("$@")
 
 echo "=== Vault URL BM25-only DPO ==="
 echo "Pairs: ${BM25_PAIRS} ($(wc -l < "${BM25_PAIRS}") rows)"
@@ -94,8 +105,11 @@ if [[ "${RUN_DRY_RUN}" == "1" ]]; then
 fi
 if [[ "${RUN_TRAINING}" == "1" ]]; then
   if (( NUM_GPUS > 1 )); then
-    "${DPO_PYTHON_BIN}" -m torch.distributed.run --standalone \
-      --nproc_per_node="${NUM_GPUS}" "${TRAIN_ARGS[@]}"
+    DISTRIBUTED_ARGS=(-m torch.distributed.run --standalone --nproc_per_node="${NUM_GPUS}")
+    if [[ "${STARTUP_DEBUG}" != "0" ]]; then
+      DISTRIBUTED_ARGS+=(--log-dir "${OUTPUT_DIR}/startup-logs" --tee 3)
+    fi
+    "${DPO_PYTHON_BIN}" -u "${DISTRIBUTED_ARGS[@]}" "${TRAIN_ARGS[@]}"
   else
     "${DPO_PYTHON_BIN}" "${TRAIN_ARGS[@]}"
   fi
