@@ -144,6 +144,8 @@ def stratified_sample(
     rng: random.Random,
     fill_shortfall: bool = False,
     rank_quotas: list[int] | None = None,
+    *,
+    candidate_id_field: str = "text_id",
 ) -> list[dict[str, Any]]:
     """Sample a configured quota from each BM25 rank band."""
     if count <= 0:
@@ -171,17 +173,17 @@ def stratified_sample(
             # configured bands cannot provide the full requested sample.
             return []
         for candidate in rng.sample(bucket, min(quota, len(bucket))):
-            if candidate["text_id"] not in selected_ids:
-                selected_ids.add(candidate["text_id"])
+            if candidate[candidate_id_field] not in selected_ids:
+                selected_ids.add(candidate[candidate_id_field])
                 selected.append(candidate)
 
     missing = count - len(selected)
     if missing > 0 and fill_shortfall:
         remaining = [
-            candidate for candidate in candidates if candidate["text_id"] not in selected_ids
+            candidate for candidate in candidates if candidate[candidate_id_field] not in selected_ids
         ]
         for candidate in rng.sample(remaining, min(missing, len(remaining))):
-            selected_ids.add(candidate["text_id"])
+            selected_ids.add(candidate[candidate_id_field])
             selected.append(candidate)
 
     selected.sort(key=lambda candidate: candidate["rank"])
