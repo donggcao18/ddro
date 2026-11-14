@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Train structure_id_v6 DPO directly from the reused BM25 preference pairs.
-# No model-confusion mining or hybrid combination is performed here.
+# Train URL-target DPO from BM25 preference pairs.
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
 cd "${REPO_ROOT}"
 
 WORK_DIR="${WORK_DIR:-/home/users/congthanh_le/scratch/east/ddro/data/vault_bm25}"
-BM25_PAIRS="${WORK_DIR}/dpo_pairs_url.jsonl"
+BM25_PAIRS="${TRAIN_FILE:-${WORK_DIR}/dpo_pairs_url.jsonl}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-/home/users/congthanh_le/scratch/veil/CodeGR/outputs/DSI_Ruby_url__qg_t5_url_max_lr/checkpoint-161800}"
 OUTPUT_DIR="${OUTPUT_DIR:-/mnt/beegfs/scratch/congthanh_le/scratch/east/ddro/outputs/vault-ruby-ddro-url-bm25}"
 DPO_PYTHON_BIN="${DPO_PYTHON_BIN:-python}"
@@ -17,7 +16,7 @@ DPO_PYTHON_BIN="${DPO_PYTHON_BIN:-python}"
 NUM_GPUS="${NUM_GPUS:-4}"
 PRECISION="${PRECISION:-fp16}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-256}"
-# Use the decoder target limit from the structure_id_v6 SFT checkpoint.
+# Use the decoder target limit from the URL SFT checkpoint.
 MAX_TARGET_LENGTH="${MAX_TARGET_LENGTH:-128}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-8}"
@@ -36,11 +35,11 @@ RUN_TRAINING="${RUN_TRAINING:-1}"
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
 
 if [[ -z "${CHECKPOINT_PATH}" || ! -d "${CHECKPOINT_PATH}" ]]; then
-  echo "Set CHECKPOINT_PATH to an existing structure_id_v6 SFT checkpoint." >&2
+  echo "Set CHECKPOINT_PATH to an existing URL SFT checkpoint." >&2
   exit 2
 fi
 if [[ -z "${MAX_TARGET_LENGTH}" ]]; then
-  echo "Set MAX_TARGET_LENGTH to the decoder limit used for structure_id_v6 SFT." >&2
+  echo "Set MAX_TARGET_LENGTH to the decoder limit used for URL SFT." >&2
   exit 2
 fi
 if [[ "${PRECISION}" != "fp16" && "${PRECISION}" != "fp32" ]]; then
@@ -86,7 +85,7 @@ if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then
   TRAIN_ARGS+=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
 fi
 
-echo "=== Vault structure_id_v6 BM25-only DPO ==="
+echo "=== Vault URL BM25-only DPO ==="
 echo "Pairs: ${BM25_PAIRS} ($(wc -l < "${BM25_PAIRS}") rows)"
 echo "GPUs: ${NUM_GPUS}; precision: ${PRECISION}; target length: ${MAX_TARGET_LENGTH}"
 echo "Batch/GPU: ${TRAIN_BATCH_SIZE}; accumulation: ${GRADIENT_ACCUMULATION_STEPS}"
